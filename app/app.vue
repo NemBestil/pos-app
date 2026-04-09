@@ -877,8 +877,9 @@ function hexToRgba(hex: string, alpha: number) {
           <p>
             Install the latest APK now, or postpone and continue with the current version.
           </p>
-          <p v-if="availableRelease" class="font-medium text-slate-800">
-            Current version {{ appVersion }}. New version {{ availableRelease.version }}.
+          <p v-if="availableRelease" class="space-y-1 font-medium">
+            <span class="block text-warning">Current version {{ appVersion }}.</span>
+            <span class="block text-primary">New version {{ availableRelease.version }}.</span>
           </p>
         </div>
       </template>
