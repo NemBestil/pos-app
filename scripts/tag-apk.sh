@@ -7,6 +7,12 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PACKAGE_JSON="$PROJECT_ROOT/package.json"
 
+# Check for uncommitted changes
+if [[ -n $(git status --porcelain) ]]; then
+    echo "❌ Error: There are uncommitted changes. Please commit or stash them first."
+    exit 1
+fi
+
 # Read current version from package.json
 CURRENT_VERSION=$(node -p "require('$PACKAGE_JSON').version")
 TAG="apk-$CURRENT_VERSION"
