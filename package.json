@@ -1,6 +1,6 @@
 {
   "name": "nembestil-pos3-app",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "private": true,
   "scripts": {
