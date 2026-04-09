@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">NemBestil POS</string>
+    <string name="title_activity_main">NemBestil POS</string>
+    <string name="package_name">com.nembestil.pos3.app</string>
+    <string name="custom_url_scheme">com.nembestil.pos3.app</string>
+</resources>

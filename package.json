@@ -1,0 +1,32 @@
+{
+  "name": "nembestil-pos3-app",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "android": "./scripts/android-run.sh",
+    "android:tablet": "./scripts/android-run.sh tablet",
+    "android:phone": "./scripts/android-run.sh phone",
+    "android:device": "./scripts/android-run.sh device",
+    "version:bump": "./scripts/bump-version.sh",
+    "assets:generate": "capacitor-assets generate --iconBackgroundColor '#ffffff' --splashBackgroundColor '#ffffff' --android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.3.0",
+    "@capacitor/core": "^8.3.0",
+    "@nuxt/ui": "^4.6.1",
+    "nuxt": "^4.4.2",
+    "tailwindcss": "^4.2.2",
+    "vue": "^3.5.32",
+    "vue-router": "^5.0.4"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^8.3.0"
+  }
+}

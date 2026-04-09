@@ -1,0 +1,103 @@
+apply plugin: 'com.android.application'
+
+def readReleaseSigningValue = { String name ->
+    def propertyValue = findProperty(name)
+    if (propertyValue != null && propertyValue.toString().trim()) {
+        return propertyValue.toString().trim()
+    }
+
+    def envValue = System.getenv(name)
+    if (envValue != null && envValue.toString().trim()) {
+        return envValue.toString().trim()
+    }
+
+    return null
+}
+
+def releaseSigning = [
+    storeFile: readReleaseSigningValue('ANDROID_RELEASE_STORE_FILE'),
+    storePassword: readReleaseSigningValue('ANDROID_RELEASE_STORE_PASSWORD'),
+    keyAlias: readReleaseSigningValue('ANDROID_RELEASE_KEY_ALIAS'),
+    keyPassword: readReleaseSigningValue('ANDROID_RELEASE_KEY_PASSWORD')
+]
+
+def hasReleaseSigning = releaseSigning.values().every { value -> value != null }
+
+android {
+    namespace = "com.nembestil.pos3.app"
+    compileSdk = rootProject.ext.compileSdkVersion
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseSigning.storeFile)
+                storePassword releaseSigning.storePassword
+                keyAlias releaseSigning.keyAlias
+                keyPassword releaseSigning.keyPassword
+            }
+        }
+    }
+    defaultConfig {
+        applicationId "com.nembestil.pos3.app"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 10000
+        versionName "1.0.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    buildTypes {
+        release {
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+gradle.taskGraph.whenReady { taskGraph ->
+    def buildingRelease = taskGraph.allTasks.any { task ->
+        task.project == project && task.name.toLowerCase().contains('release')
+    }
+
+    if (buildingRelease && !hasReleaseSigning) {
+        throw new GradleException(
+            'Release signing is not configured. Set ANDROID_RELEASE_STORE_FILE, ANDROID_RELEASE_STORE_PASSWORD, ANDROID_RELEASE_KEY_ALIAS, and ANDROID_RELEASE_KEY_PASSWORD.'
+        )
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+    implementation "androidx.webkit:webkit:$androidxWebkitVersion"
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}
