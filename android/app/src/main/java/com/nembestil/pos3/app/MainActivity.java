@@ -17,6 +17,7 @@ import java.util.stream.Collectors;
 public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(@Nullable Bundle savedInstanceState) {
+        registerPlugin(ApkUpdaterPlugin.class);
         super.onCreate(savedInstanceState);
         patchJSInjection();
     }

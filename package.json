@@ -14,6 +14,7 @@
     "android:phone": "./scripts/android-run.sh phone",
     "android:device": "./scripts/android-run.sh device",
     "version:bump": "./scripts/bump-version.sh",
+    "tag:apk": "./scripts/tag-apk.sh",
     "assets:generate": "capacitor-assets generate --iconBackgroundColor '#ffffff' --splashBackgroundColor '#ffffff' --android"
   },
   "dependencies": {

@@ -136,6 +136,15 @@ useHead(() => ({
 const showTopShellLogo = computed(() => screen.value !== 'launcher')
 
 const showLauncherBranding = computed(() => screen.value === 'launcher' && !!selectedInstallation.value)
+const {
+  availableRelease,
+  isUpdatePromptOpen,
+  isUpdateBusyOpen,
+  updateBusyMessage,
+  checkForUpdate,
+  postponeUpdate,
+  acceptUpdate
+} = useAppReleaseUpdate()
 
 onMounted(() => {
   installations.value = readInstallations()
@@ -149,6 +158,8 @@ onMounted(() => {
   window.setTimeout(() => {
     logoVisible.value = true
   }, 80)
+
+  void checkForUpdate()
 })
 
 function sanitizeInstallationId(value: string) {
@@ -847,5 +858,76 @@ function hexToRgba(hex: string, alpha: number) {
         </div>
       </main>
     </div>
+
+    <UModal
+      v-model:open="isUpdatePromptOpen"
+      :dismissible="false"
+      :close="false"
+      :ui="{
+        content: 'rounded-[1.75rem] border border-white/80 bg-white shadow-[0_24px_80px_rgba(15,23,42,0.18)]',
+        header: 'px-6 pt-6',
+        body: 'px-6 pb-4',
+        footer: 'px-6 pb-6 pt-0'
+      }"
+      title="Update available"
+      :description="availableRelease ? `App version ${availableRelease.version} is ready to install.` : ''"
+    >
+      <template #body>
+        <div class="space-y-3 text-sm leading-6 text-slate-600">
+          <p>
+            Install the latest APK now, or postpone and continue with the current version.
+          </p>
+          <p v-if="availableRelease" class="font-medium text-slate-800">
+            Current version {{ appVersion }}. New version {{ availableRelease.version }}.
+          </p>
+        </div>
+      </template>
+
+      <template #footer>
+        <div class="flex w-full flex-col gap-3 sm:flex-row sm:justify-end">
+          <button
+            type="button"
+            class="inline-flex min-h-12 items-center justify-center rounded-2xl border border-slate-200 px-5 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-50"
+            @click="postponeUpdate"
+          >
+            Postpone
+          </button>
+          <button
+            type="button"
+            class="inline-flex min-h-12 items-center justify-center rounded-2xl bg-slate-950 px-5 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800"
+            @click="acceptUpdate"
+          >
+            Upgrade now
+          </button>
+        </div>
+      </template>
+    </UModal>
+
+    <UModal
+      :open="isUpdateBusyOpen"
+      :dismissible="false"
+      :close="false"
+      :ui="{
+        content: 'rounded-[1.75rem] border border-white/80 bg-white shadow-[0_24px_80px_rgba(15,23,42,0.18)]',
+        header: 'px-6 pt-6',
+        body: 'px-6 pb-6'
+      }"
+      title="Please wait"
+      description="The app update is being prepared."
+    >
+      <template #body>
+        <div class="flex items-start gap-4">
+          <div class="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-600">
+            <Icon name="lucide:loader-circle" class="size-5 animate-spin" />
+          </div>
+          <div class="space-y-2">
+            <p class="text-sm font-medium text-slate-900">{{ updateBusyMessage }}</p>
+            <p class="text-sm leading-6 text-slate-600">
+              Do not close the app while the installer is being prepared.
+            </p>
+          </div>
+        </div>
+      </template>
+    </UModal>
   </UApp>
 </template>
