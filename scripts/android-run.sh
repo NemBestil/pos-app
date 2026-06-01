@@ -9,6 +9,9 @@ npm run generate
 echo "📲 Syncing with Capacitor..."
 npx cap sync
 
+echo "🩹 Patching Android project (symlinks + MainActivity)..."
+"$(dirname "$0")/android-patch.sh"
+
 # Function to get target ID from npx cap run android --list
 get_target() {
     local type=$1

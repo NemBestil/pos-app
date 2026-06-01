@@ -357,6 +357,10 @@ function openInstallation(url: string) {
 }
 
 function getInstallationBaseUrl(id: string) {
+  if (id === 'NGROK') {
+    return 'https://nbpos3.ngrok.dev'
+  }
+
   return `https://${id}.pos3.nemkasse.com`
 }
 

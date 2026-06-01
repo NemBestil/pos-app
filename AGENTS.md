@@ -24,6 +24,7 @@ Light app shell for the POS system, responsible for making the POS available on 
 - Composables: Shared logic in `app/composables`.
 - Platform Bridging: Use Capacitor for native features (printers, scanners, etc.).
 - Flow: Login Screen -> Webview/URL Load -> Capacitor Interop.
+- android/ is ephemeral: Place new Android source files in resources/, symlink it into android/... and apply changes to other android/-files using scripts/android-patch.sh.
 
 ## Fetching & API
 
