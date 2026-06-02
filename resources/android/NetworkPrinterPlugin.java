@@ -1,5 +1,7 @@
 package com.nembestil.pos3.app;
 
+import android.util.Base64;
+
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -29,15 +31,21 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-@CapacitorPlugin(name = "NetworkPrinterScanner")
-public class NetworkPrinterScannerPlugin extends Plugin {
+@CapacitorPlugin(name = "NetworkPrinter")
+public class NetworkPrinterPlugin extends Plugin {
 
+    // --- Scan settings ---------------------------------------------------
     private static final int MAX_CONCURRENT = 64;
-    private static final int REQUEST_TIMEOUT_MS = 2000;
+    private static final int SCAN_REQUEST_TIMEOUT_MS = 2000;
     // Cap the scan to a /24 (254 hosts) around the device when the real subnet is larger.
     private static final int MAX_HOST_BITS = 8;
     private static final int PROGRESS_INTERVAL_MS = 1000;
     private static final int MAX_RESPONSE_BYTES = 8192;
+
+    // --- Print / ping settings ------------------------------------------
+    private static final int PRINTER_PORT = 9100;
+    private static final int DEFAULT_PRINT_TIMEOUT_MS = 5000;
+    private static final int DEFAULT_PING_TIMEOUT_MS = 1500;
 
     private static final Pattern ETH_INFO_PATTERN = Pattern.compile(
         "Ethernet\\s+Information",
@@ -54,6 +62,15 @@ public class NetworkPrinterScannerPlugin extends Plugin {
 
     private final AtomicBoolean scanning = new AtomicBoolean(false);
     private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
+
+    // Capacitor invokes @PluginMethod on a single background HandlerThread, so a
+    // long print would block other plugin calls. Offload print/ping onto a cached
+    // pool so they can run concurrently and never block the bridge thread.
+    private final ExecutorService ioExecutor = Executors.newCachedThreadPool();
+
+    // ========================================================================
+    // Scan
+    // ========================================================================
 
     @PluginMethod
     public void scan(PluginCall call) {
@@ -181,8 +198,8 @@ public class NetworkPrinterScannerPlugin extends Plugin {
         // so we use a raw socket and read until close.
         Socket socket = new Socket();
         try {
-            socket.connect(new InetSocketAddress(ip, 80), REQUEST_TIMEOUT_MS);
-            socket.setSoTimeout(REQUEST_TIMEOUT_MS);
+            socket.connect(new InetSocketAddress(ip, 80), SCAN_REQUEST_TIMEOUT_MS);
+            socket.setSoTimeout(SCAN_REQUEST_TIMEOUT_MS);
 
             OutputStream out = socket.getOutputStream();
             out.write("GET /ip_info.htm\r\n".getBytes(StandardCharsets.ISO_8859_1));
@@ -297,5 +314,161 @@ public class NetworkPrinterScannerPlugin extends Plugin {
     private static class FoundPrinter {
         String ip;
         String mac;
+    }
+
+    // ========================================================================
+    // Print
+    // ========================================================================
+
+    @PluginMethod
+    public void print(PluginCall call) {
+        final String ip = call.getString("ip");
+        final String dataBase64 = call.getString("data");
+        if (ip == null || ip.isEmpty()) {
+            call.reject("Missing 'ip'");
+            return;
+        }
+        if (dataBase64 == null) {
+            call.reject("Missing 'data'");
+            return;
+        }
+        final int timeoutMs = call.getInt("timeoutMs", DEFAULT_PRINT_TIMEOUT_MS);
+
+        final byte[] payload;
+        try {
+            payload = Base64.decode(dataBase64, Base64.DEFAULT);
+        } catch (IllegalArgumentException e) {
+            call.reject("Invalid base64 in 'data'");
+            return;
+        }
+
+        ioExecutor.submit(() -> doPrint(ip, payload, timeoutMs, call));
+    }
+
+    private void doPrint(String ip, byte[] payload, int timeoutMs, PluginCall call) {
+        long started = System.currentTimeMillis();
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(ip, PRINTER_PORT), timeoutMs);
+            socket.setSoTimeout(timeoutMs);
+            socket.setTcpNoDelay(true);
+            // On close(), block until all buffered bytes are ACKed (or the timeout
+            // expires). This is what makes the resolved result a meaningful
+            // "delivery confirmed" signal.
+            int lingerSeconds = Math.max(1, (timeoutMs + 999) / 1000);
+            socket.setSoLinger(true, lingerSeconds);
+
+            OutputStream out = socket.getOutputStream();
+            out.write(payload);
+            out.flush();
+            // Send FIN so the printer knows the job is complete and can close
+            // its side. After this, read until EOF to confirm receipt.
+            socket.shutdownOutput();
+
+            InputStream is = socket.getInputStream();
+            byte[] sink = new byte[256];
+            try {
+                while (is.read(sink) > 0) {
+                    // Most ESC/POS printers send nothing back; drain anything they do.
+                }
+            } catch (Exception ignored) {
+                // Read timeout is acceptable — the bytes are already out the door.
+            }
+
+            JSObject result = new JSObject();
+            result.put("success", true);
+            result.put("bytesSent", payload.length);
+            result.put("durationMs", System.currentTimeMillis() - started);
+            call.resolve(result);
+        } catch (Exception e) {
+            JSObject result = new JSObject();
+            result.put("success", false);
+            result.put("bytesSent", 0);
+            result.put("durationMs", System.currentTimeMillis() - started);
+            result.put("error", e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            call.resolve(result);
+        } finally {
+            try {
+                socket.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    // ========================================================================
+    // Ping
+    // ========================================================================
+
+    @PluginMethod
+    public void ping(PluginCall call) {
+        final String ip = call.getString("ip");
+        if (ip == null || ip.isEmpty()) {
+            call.reject("Missing 'ip'");
+            return;
+        }
+        final int timeoutMs = call.getInt("timeoutMs", DEFAULT_PING_TIMEOUT_MS);
+
+        ioExecutor.submit(() -> doPing(ip, timeoutMs, call));
+    }
+
+    private void doPing(String ip, int timeoutMs, PluginCall call) {
+        long started = System.currentTimeMillis();
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(ip, PRINTER_PORT), timeoutMs);
+            long latency = System.currentTimeMillis() - started;
+            socket.close();
+
+            String mac = null;
+            String reportedIp = null;
+            Socket httpSocket = new Socket();
+            try {
+                httpSocket.connect(new InetSocketAddress(ip, 80), timeoutMs);
+                httpSocket.setSoTimeout(timeoutMs);
+                OutputStream out = httpSocket.getOutputStream();
+                out.write("GET /ip_info.htm\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                out.flush();
+
+                InputStream is = httpSocket.getInputStream();
+                ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                byte[] tmp = new byte[1024];
+                int total = 0;
+                int n;
+                while ((n = is.read(tmp)) > 0) {
+                    int allowed = Math.min(n, MAX_RESPONSE_BYTES - total);
+                    if (allowed > 0) {
+                        buf.write(tmp, 0, allowed);
+                        total += allowed;
+                    }
+                    if (total >= MAX_RESPONSE_BYTES) break;
+                }
+                String body = stripHttpPrologue(buf.toString("ISO-8859-1"));
+                Matcher macMatch = MAC_PATTERN.matcher(body);
+                Matcher ipMatch = IP_PATTERN.matcher(body);
+                if (macMatch.find()) mac = macMatch.group(1).toUpperCase().replace(':', '-');
+                if (ipMatch.find()) reportedIp = ipMatch.group(1);
+            } catch (Exception ignored) {
+                // metadata is optional; online is already confirmed
+            } finally {
+                try { httpSocket.close(); } catch (Exception ignored) {}
+            }
+
+            JSObject result = new JSObject();
+            result.put("online", true);
+            result.put("latencyMs", latency);
+            if (mac != null) result.put("mac", mac);
+            if (reportedIp != null) result.put("ip", reportedIp);
+            call.resolve(result);
+        } catch (Exception e) {
+            JSObject result = new JSObject();
+            result.put("online", false);
+            result.put("latencyMs", System.currentTimeMillis() - started);
+            call.resolve(result);
+        } finally {
+            try {
+                socket.close();
+            } catch (Exception ignored) {
+            }
+        }
     }
 }
