@@ -11,6 +11,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PACKAGE_PATH="com/nembestil/pos3/app"
 ANDROID_JAVA_DIR="$ROOT/android/app/src/main/java/$PACKAGE_PATH"
 RESOURCES_DIR="$ROOT/resources/android"
+ANDROID_RES_XML_DIR="$ROOT/android/app/src/main/res/xml"
 
 if [ ! -d "$ANDROID_JAVA_DIR" ]; then
     echo "❌ Android source dir not found: $ANDROID_JAVA_DIR"
@@ -88,4 +89,73 @@ if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "androidx.webkit:webkit" "$APP_BUILD_
     # that cap sync re-emits). Use a literal newline in the sed `a\` block.
     sed -i '' $'/implementation project(\':capacitor-android\')/a\\\n    implementation "androidx.webkit:webkit:$androidxWebkitVersion"\n' "$APP_BUILD_GRADLE"
     echo "🩹 Added androidx.webkit dependency to android/app/build.gradle"
+fi
+
+# PaymentTerminalDiscoveryPlugin acquires a Wi-Fi multicast lock so the Wi-Fi
+# stack doesn't filter out the Worldline broadcast frames. That needs an extra
+# permission. Idempotent: only inserted if missing.
+ANDROID_MANIFEST="$ROOT/android/app/src/main/AndroidManifest.xml"
+if [ -f "$ANDROID_MANIFEST" ] && ! grep -q "CHANGE_WIFI_MULTICAST_STATE" "$ANDROID_MANIFEST"; then
+    sed -i '' $'/<uses-permission android:name="android.permission.INTERNET" \\/>/a\\\n    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" \\/>\n' "$ANDROID_MANIFEST"
+    echo "🩹 Added CHANGE_WIFI_MULTICAST_STATE permission to AndroidManifest.xml"
+fi
+
+# ForwarderService runs as a foreground service with foregroundServiceType=dataSync.
+# That needs FOREGROUND_SERVICE + FOREGROUND_SERVICE_DATA_SYNC, and on Android 13+
+# POST_NOTIFICATIONS so the persistent notification can be shown. Both the
+# permissions and the <service> element are patched in idempotently via Python
+# because multi-line XML insertions are brittle in BSD sed.
+if [ -f "$ANDROID_MANIFEST" ]; then
+    python3 - "$ANDROID_MANIFEST" <<'PY'
+import sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+changed = False
+
+permissions = [
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+    "android.permission.POST_NOTIFICATIONS",
+]
+anchor = '<uses-permission android:name="android.permission.INTERNET" />'
+if anchor in text:
+    for perm in permissions:
+        line = f'<uses-permission android:name="{perm}" />'
+        if line not in text:
+            text = text.replace(anchor, anchor + "\n    " + line, 1)
+            changed = True
+            print(f"🩹 Added {perm} permission to AndroidManifest.xml")
+
+service_xml = (
+    '        <service\n'
+    '            android:name=".ForwarderService"\n'
+    '            android:exported="false"\n'
+    '            android:foregroundServiceType="dataSync" />\n'
+)
+if "ForwarderService" not in text and "</application>" in text:
+    text = text.replace("</application>", service_xml + "    </application>", 1)
+    changed = True
+    print("🩹 Registered ForwarderService in AndroidManifest.xml")
+
+if changed:
+    path.write_text(text)
+PY
+fi
+
+# Symlink XML resources from resources/android/xml into the res/xml directory.
+for src in "$RESOURCES_DIR/xml"/*.xml; do
+    [ -f "$src" ] || continue
+    base="$(basename "$src")"
+    target="$ANDROID_RES_XML_DIR/$base"
+    rel="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$src" "$ANDROID_RES_XML_DIR")"
+    ln -sfn "$rel" "$target"
+    echo "🔗 Linked: android/.../res/xml/$base -> $rel"
+done
+
+# Allow cleartext HTTP (needed for LAN IP connections via CapacitorHttp).
+# Idempotent: only inserted if the attribute is missing.
+if [ -f "$ANDROID_MANIFEST" ] && ! grep -q "networkSecurityConfig" "$ANDROID_MANIFEST"; then
+    sed -i '' 's|<application|<application android:networkSecurityConfig="@xml/network_security_config"|' "$ANDROID_MANIFEST"
+    echo "🩹 Added networkSecurityConfig to AndroidManifest.xml"
 fi
