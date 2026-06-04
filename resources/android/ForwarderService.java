@@ -5,8 +5,10 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
@@ -16,6 +18,7 @@ import android.net.NetworkRequest;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.util.Base64;
 import android.util.Log;
 
@@ -56,16 +59,18 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Persistent foreground service that owns:
- *   1. The LAN print forwarder SSE loop (was useAndroidLanPrintForwarder in JS).
- *   2. The payment terminal forwarder SSE loop (was useAndroidPaymentTerminalForwarder in JS).
+ *   1. The LAN print forwarder long-poll loop (was useAndroidLanPrintForwarder in JS).
+ *   2. The payment terminal forwarder long-poll loop (was useAndroidPaymentTerminalForwarder in JS).
  *
- * Both loops talk to the POS backend using cookies pulled from the WebView's
- * CookieManager so the existing auth on /api/_internal/* keeps working without
- * any extra plumbing.
+ * Both loops authenticate against /api/_internal/* using the androidsync
+ * Bearer token, so the forwarder keeps working even after the WebView signs
+ * out. The wire format is SSE-flavoured (text/event-stream) for convenience,
+ * but each request is one-shot: the server pushes a single event and closes
+ * the connection, which is long-polling semantics rather than a real stream.
  *
  * Lifecycle: started/stopped through ForwarderServicePlugin. While alive it
  * shows a persistent low-priority notification so Android won't kill the
- * process; the SSE loops keep running even when the WebView is backgrounded.
+ * process; the long-poll loops keep running even when the WebView is backgrounded.
  */
 public class ForwarderService extends Service {
 
@@ -87,8 +92,8 @@ public class ForwarderService extends Service {
     private static final int LAN_PRINTER_PORT = 9100;
     private static final int LAN_PING_TIMEOUT_MS = 1_500;
     private static final int LAN_PRINT_TIMEOUT_MS = 8_000;
-    private static final int SSE_CONNECT_TIMEOUT_MS = 5_000;
-    private static final int SSE_READ_TIMEOUT_MS = 35_000;
+    private static final int LONG_POLL_CONNECT_TIMEOUT_MS = 5_000;
+    private static final int LONG_POLL_READ_TIMEOUT_MS = 35_000;
     private static final int RETRY_AFTER_ERROR_MS = 3_000;
     private static final int LAN_PRINTERS_REFRESH_MS = 30_000;
     private static final int TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -126,10 +131,17 @@ public class ForwarderService extends Service {
     private ConnectivityManager.NetworkCallback networkCallback;
     private Network currentNetwork;
 
-    private final Object lanPrintLock = new Object();
-    private final Object paymentTerminalLock = new Object();
-    private volatile HttpURLConnection currentLanPrintConn;
-    private volatile HttpURLConnection currentPaymentTerminalConn;
+    /** True when the device is currently interactive. The forwarder advertises
+     *  this on every long-poll handshake so the server can prefer screen-on
+     *  tablets when dispatching jobs. Transitions take effect on the next
+     *  long-poll reconnect — we never interrupt an in-flight window. */
+    private final AtomicBoolean screenOn = new AtomicBoolean(true);
+    private BroadcastReceiver screenStateReceiver;
+
+    private final Object lanPrintLongPollLock = new Object();
+    private final Object paymentTerminalLongPollLock = new Object();
+    private volatile HttpURLConnection currentLanPrintLongPoll;
+    private volatile HttpURLConnection currentPaymentTerminalLongPoll;
 
     public static boolean isRunning() {
         return running.get();
@@ -158,7 +170,7 @@ public class ForwarderService extends Service {
         if (ACTION_NOTIFY_CONFIG_CHANGED.equals(action)) {
             Log.i(TAG, "Config change notified; restarting LAN print loop");
             lanPrintersDirty.set(true);
-            interruptLanPrintConn();
+            interruptLanPrintLongPoll();
             return START_STICKY;
         }
 
@@ -193,15 +205,16 @@ public class ForwarderService extends Service {
 
         if (running.compareAndSet(false, true)) {
             Log.i(TAG, "Starting forwarder loops baseUrl=" + baseUrl + " forwarderId=" + forwarderId);
+            registerScreenStateReceiver();
             startDiscoveryListener();
             startLanPrintLoop();
             startPaymentTerminalLoop();
             startHeartbeatLoop();
         } else {
             Log.i(TAG, "Forwarder already running; credentials refreshed");
-            // Reset the open SSE connections so they reconnect with the new token.
-            interruptLanPrintConn();
-            interruptPaymentTerminalConn();
+            // Reset the open long-poll connections so they reconnect with the new token.
+            interruptLanPrintLongPoll();
+            interruptPaymentTerminalLongPoll();
         }
         return START_STICKY;
     }
@@ -274,8 +287,9 @@ public class ForwarderService extends Service {
             return;
         }
         activeBaseUrl.set(null);
-        interruptLanPrintConn();
-        interruptPaymentTerminalConn();
+        interruptLanPrintLongPoll();
+        interruptPaymentTerminalLongPoll();
+        unregisterScreenStateReceiver();
         stopDiscoveryListener();
         Thread lan = lanPrintThread;
         Thread pay = paymentTerminalThread;
@@ -295,10 +309,10 @@ public class ForwarderService extends Service {
         // The stored credentials stay so that an automatic restart can recover.
     }
 
-    private void interruptLanPrintConn() {
-        synchronized (lanPrintLock) {
-            HttpURLConnection conn = currentLanPrintConn;
-            currentLanPrintConn = null;
+    private void interruptLanPrintLongPoll() {
+        synchronized (lanPrintLongPollLock) {
+            HttpURLConnection conn = currentLanPrintLongPoll;
+            currentLanPrintLongPoll = null;
             if (conn != null) {
                 try {
                     conn.disconnect();
@@ -308,10 +322,10 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void interruptPaymentTerminalConn() {
-        synchronized (paymentTerminalLock) {
-            HttpURLConnection conn = currentPaymentTerminalConn;
-            currentPaymentTerminalConn = null;
+    private void interruptPaymentTerminalLongPoll() {
+        synchronized (paymentTerminalLongPollLock) {
+            HttpURLConnection conn = currentPaymentTerminalLongPoll;
+            currentPaymentTerminalLongPoll = null;
             if (conn != null) {
                 try {
                     conn.disconnect();
@@ -322,7 +336,7 @@ public class ForwarderService extends Service {
     }
 
     // ========================================================================
-    // LAN print SSE loop
+    // LAN print long-poll loop
     // ========================================================================
 
     private void startLanPrintLoop() {
@@ -352,7 +366,7 @@ public class ForwarderService extends Service {
                     continue;
                 }
 
-                boolean handled = streamLanPrintJobs(reachable);
+                boolean handled = longPollLanPrintJob(reachable);
                 if (!handled) {
                     sleepQuietly(RETRY_AFTER_ERROR_MS);
                 }
@@ -371,8 +385,8 @@ public class ForwarderService extends Service {
             URL url = new URL(baseUrl + "/api/_internal/lan-printers");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
-            conn.setConnectTimeout(SSE_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(SSE_CONNECT_TIMEOUT_MS);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
             applyCookies(conn);
             conn.setRequestProperty("Accept", "application/json");
             int status = conn.getResponseCode();
@@ -426,7 +440,7 @@ public class ForwarderService extends Service {
         }
     }
 
-    private boolean streamLanPrintJobs(List<LanPrinter> printers) {
+    private boolean longPollLanPrintJob(List<LanPrinter> printers) {
         HttpURLConnection conn = null;
         try {
             JSONArray arr = new JSONArray();
@@ -438,13 +452,14 @@ public class ForwarderService extends Service {
             }
             JSONObject body = new JSONObject();
             body.put("printers", arr);
+            body.put("screenOn", screenOn.get());
 
             URL url = new URL(baseUrl + "/api/_internal/lan-print-forward");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
-            conn.setConnectTimeout(SSE_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(SSE_READ_TIMEOUT_MS);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Accept", "text/event-stream");
             applyCookies(conn);
@@ -454,8 +469,8 @@ public class ForwarderService extends Service {
                 out.write(payload);
             }
 
-            synchronized (lanPrintLock) {
-                currentLanPrintConn = conn;
+            synchronized (lanPrintLongPollLock) {
+                currentLanPrintLongPoll = conn;
             }
 
             int status = conn.getResponseCode();
@@ -469,7 +484,7 @@ public class ForwarderService extends Service {
                 ipByPrinterId.put(printer.printerId, printer.ip);
             }
 
-            consumeSseStream(conn, (event, data) -> {
+            readLongPollResponse(conn, (event, data) -> {
                 if ("print-job".equals(event)) {
                     handleLanPrintJob(data, ipByPrinterId);
                 }
@@ -477,13 +492,13 @@ public class ForwarderService extends Service {
             return true;
         } catch (Exception e) {
             if (running.get()) {
-                Log.w(TAG, "streamLanPrintJobs failed", e);
+                Log.w(TAG, "longPollLanPrintJob failed", e);
             }
             return false;
         } finally {
-            synchronized (lanPrintLock) {
-                if (currentLanPrintConn == conn) {
-                    currentLanPrintConn = null;
+            synchronized (lanPrintLongPollLock) {
+                if (currentLanPrintLongPoll == conn) {
+                    currentLanPrintLongPoll = null;
                 }
             }
             if (conn != null) {
@@ -553,7 +568,7 @@ public class ForwarderService extends Service {
     }
 
     // ========================================================================
-    // Payment terminal SSE loop
+    // Payment terminal long-poll loop
     // ========================================================================
 
     private void startPaymentTerminalLoop() {
@@ -571,7 +586,7 @@ public class ForwarderService extends Service {
                     continue;
                 }
 
-                boolean ok = streamPaymentTerminalRequests(terminalIds);
+                boolean ok = longPollPaymentTerminalRequest(terminalIds);
                 if (!ok) {
                     sleepQuietly(RETRY_AFTER_ERROR_MS);
                 }
@@ -583,7 +598,7 @@ public class ForwarderService extends Service {
         Log.i(TAG, "Payment terminal loop exited");
     }
 
-    private boolean streamPaymentTerminalRequests(List<String> terminalIds) {
+    private boolean longPollPaymentTerminalRequest(List<String> terminalIds) {
         HttpURLConnection conn = null;
         try {
             JSONArray arr = new JSONArray();
@@ -593,13 +608,14 @@ public class ForwarderService extends Service {
             JSONObject body = new JSONObject();
             body.put("forwarderId", forwarderId);
             body.put("terminalIds", arr);
+            body.put("screenOn", screenOn.get());
 
             URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
-            conn.setConnectTimeout(SSE_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(SSE_READ_TIMEOUT_MS);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Accept", "text/event-stream");
             applyCookies(conn);
@@ -609,8 +625,8 @@ public class ForwarderService extends Service {
                 out.write(payload);
             }
 
-            synchronized (paymentTerminalLock) {
-                currentPaymentTerminalConn = conn;
+            synchronized (paymentTerminalLongPollLock) {
+                currentPaymentTerminalLongPoll = conn;
             }
 
             int status = conn.getResponseCode();
@@ -619,7 +635,7 @@ public class ForwarderService extends Service {
                 return false;
             }
 
-            consumeSseStream(conn, (event, data) -> {
+            readLongPollResponse(conn, (event, data) -> {
                 if ("terminal-request".equals(event)) {
                     handleTerminalRequest(data);
                 }
@@ -627,13 +643,13 @@ public class ForwarderService extends Service {
             return true;
         } catch (Exception e) {
             if (running.get()) {
-                Log.w(TAG, "streamPaymentTerminalRequests failed", e);
+                Log.w(TAG, "longPollPaymentTerminalRequest failed", e);
             }
             return false;
         } finally {
-            synchronized (paymentTerminalLock) {
-                if (currentPaymentTerminalConn == conn) {
-                    currentPaymentTerminalConn = null;
+            synchronized (paymentTerminalLongPollLock) {
+                if (currentPaymentTerminalLongPoll == conn) {
+                    currentPaymentTerminalLongPoll = null;
                 }
             }
             if (conn != null) {
@@ -658,9 +674,9 @@ public class ForwarderService extends Service {
                 postTerminalError(jobId, "Forwarded terminal request missing url.");
                 return;
             }
-            // Run the actual terminal call in its own thread so the SSE stream can
-            // close right away and the next job can come in without waiting on the
-            // (possibly multi-minute) terminal interaction.
+            // Run the actual terminal call in its own thread so the long-poll
+            // can close right away and the next job can come in without waiting on
+            // the (possibly multi-minute) terminal interaction.
             final String finalJobId = jobId;
             final String finalUrl = url;
             final String finalMethod = method;
@@ -747,8 +763,8 @@ public class ForwarderService extends Service {
                 conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setDoOutput(true);
-                conn.setConnectTimeout(SSE_CONNECT_TIMEOUT_MS);
-                conn.setReadTimeout(SSE_CONNECT_TIMEOUT_MS);
+                conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+                conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
                 conn.setRequestProperty("Content-Type", "application/json");
                 applyCookies(conn);
                 JSONObject body = new JSONObject();
@@ -832,8 +848,8 @@ public class ForwarderService extends Service {
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
-            conn.setConnectTimeout(SSE_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(SSE_CONNECT_TIMEOUT_MS);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
             conn.setRequestProperty("Content-Type", "application/json");
             applyCookies(conn);
 
@@ -857,14 +873,19 @@ public class ForwarderService extends Service {
     }
 
     // ========================================================================
-    // SSE parsing
+    // Long-poll response parsing
     // ========================================================================
+    //
+    // The server replies with SSE framing (`event:` / `data:` lines, blank line
+    // separator) but exactly one event followed by `event: close` and a graceful
+    // socket close. We parse that as long-poll output: as soon as we receive the
+    // job event, we invoke the handler and return; the close event ends the loop.
 
-    private interface SseHandler {
+    private interface LongPollEventHandler {
         void onEvent(String event, String data);
     }
 
-    private void consumeSseStream(HttpURLConnection conn, SseHandler handler) throws Exception {
+    private void readLongPollResponse(HttpURLConnection conn, LongPollEventHandler handler) throws Exception {
         try (BufferedReader reader = new BufferedReader(
             new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
@@ -883,7 +904,7 @@ public class ForwarderService extends Service {
                         try {
                             handler.onEvent(currentEvent, dataStr);
                         } catch (Exception e) {
-                            Log.w(TAG, "SSE handler failed for event=" + currentEvent, e);
+                            Log.w(TAG, "Long-poll handler failed for event=" + currentEvent, e);
                         }
                     }
                 } else if (line.startsWith("event:")) {
@@ -1079,6 +1100,64 @@ public class ForwarderService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "Failed to register network callback", e);
             networkCallback = null;
+        }
+    }
+
+    private void registerScreenStateReceiver() {
+        try {
+            PowerManager pm = (PowerManager) getApplicationContext().getSystemService(Context.POWER_SERVICE);
+            screenOn.set(pm == null || pm.isInteractive());
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to read initial screen state", e);
+            screenOn.set(true);
+        }
+        screenStateReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+                if (action == null) {
+                    return;
+                }
+                boolean wasOn = screenOn.get();
+                boolean nowOn;
+                if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                    nowOn = true;
+                } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                    nowOn = false;
+                } else {
+                    return;
+                }
+                if (wasOn == nowOn) {
+                    return;
+                }
+                screenOn.set(nowOn);
+                Log.i(TAG, "Screen state changed: " + (nowOn ? "ON" : "OFF"));
+                // Deliberately do NOT interrupt the open long-polls: each
+                // window is at most 25s, so the new value is picked up on the
+                // next reconnect anyway, and bouncing the connection risks
+                // dropping a job the server was about to push.
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        try {
+            getApplicationContext().registerReceiver(screenStateReceiver, filter);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to register screen state receiver", e);
+            screenStateReceiver = null;
+        }
+    }
+
+    private void unregisterScreenStateReceiver() {
+        BroadcastReceiver receiver = screenStateReceiver;
+        screenStateReceiver = null;
+        if (receiver == null) {
+            return;
+        }
+        try {
+            getApplicationContext().unregisterReceiver(receiver);
+        } catch (Exception ignored) {
         }
     }
 
