@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, registerPlugin } from '@capacitor/core'
+import * as Sentry from '@sentry/capacitor'
 import packageJson from '../../package.json'
 
 interface GithubReleaseAsset {
@@ -46,6 +47,9 @@ export function useAppReleaseUpdate() {
     }
 
     isCheckingForUpdate.value = true
+    addUpdateBreadcrumb('Update check started', {
+      currentVersion
+    })
 
     try {
       const response = await CapacitorHttp.get({
@@ -57,6 +61,9 @@ export function useAppReleaseUpdate() {
       })
 
       if (response.status < 200 || response.status >= 300) {
+        addUpdateBreadcrumb('Update check returned non-success status', {
+          status: response.status
+        }, 'warning')
         return
       }
 
@@ -64,12 +71,23 @@ export function useAppReleaseUpdate() {
       const nextRelease = extractAvailableRelease(release)
 
       if (!nextRelease || compareVersions(nextRelease.version, currentVersion) <= 0) {
+        addUpdateBreadcrumb('No newer app release found', {
+          releaseVersion: nextRelease?.version ?? null,
+          currentVersion
+        })
         return
       }
 
       availableRelease.value = nextRelease
       isUpdatePromptOpen.value = true
-    } catch {
+      addUpdateBreadcrumb('New app release found', {
+        releaseVersion: nextRelease.version,
+        currentVersion
+      })
+    } catch (error) {
+      addUpdateBreadcrumb('Update check failed', {
+        error: getErrorMessage(error)
+      }, 'warning')
       availableRelease.value = null
       isUpdatePromptOpen.value = false
     } finally {
@@ -78,6 +96,9 @@ export function useAppReleaseUpdate() {
   }
 
   function postponeUpdate() {
+    addUpdateBreadcrumb('Update postponed', {
+      releaseVersion: availableRelease.value?.version ?? null
+    })
     isUpdatePromptOpen.value = false
   }
 
@@ -90,11 +111,17 @@ export function useAppReleaseUpdate() {
 
     isUpdatePromptOpen.value = false
     isUpdateBusyOpen.value = true
+    addUpdateBreadcrumb('Update accepted', {
+      releaseVersion: release.version
+    })
 
     try {
       const hasInstallPermission = await ensureInstallPermission()
 
       if (!hasInstallPermission) {
+        addUpdateBreadcrumb('Update install permission unavailable', {
+          releaseVersion: release.version
+        }, 'warning')
         await openExternalReleaseLink(release.downloadUrl)
         return
       }
@@ -105,7 +132,15 @@ export function useAppReleaseUpdate() {
         url: release.downloadUrl,
         fileName: release.fileName
       })
-    } catch {
+      addUpdateBreadcrumb('Update install started', {
+        releaseVersion: release.version,
+        fileName: release.fileName
+      })
+    } catch (error) {
+      addUpdateBreadcrumb('Update install failed, opening external link', {
+        releaseVersion: release.version,
+        error: getErrorMessage(error)
+      }, 'warning')
       await openExternalReleaseLink(release.downloadUrl)
     } finally {
       isUpdateBusyOpen.value = false
@@ -120,20 +155,29 @@ export function useAppReleaseUpdate() {
     const permissionStatus = await apkUpdater.canRequestPackageInstalls()
 
     if (permissionStatus.value) {
+      addUpdateBreadcrumb('Update install permission already granted')
       return true
     }
 
     updateBusyMessage.value = 'Allow app installs for this app, then return here to continue.'
+    addUpdateBreadcrumb('Opening update install permission settings')
 
     try {
       await apkUpdater.openInstallPermissionSettings()
-    } catch {
+    } catch (error) {
+      addUpdateBreadcrumb('Could not open update install permission settings', {
+        error: getErrorMessage(error)
+      }, 'warning')
       return false
     }
 
     await waitForAppReturn()
 
     const nextPermissionStatus = await apkUpdater.canRequestPackageInstalls()
+
+    addUpdateBreadcrumb('Update install permission rechecked', {
+      granted: nextPermissionStatus.value
+    })
 
     return nextPermissionStatus.value
   }
@@ -142,13 +186,22 @@ export function useAppReleaseUpdate() {
     if (isAndroidNative()) {
       try {
         await apkUpdater.openExternalUrl({ url })
+        addUpdateBreadcrumb('Opened update link externally', {
+          url
+        })
         return
-      } catch {
+      } catch (error) {
+        addUpdateBreadcrumb('Native external update link failed', {
+          error: getErrorMessage(error)
+        }, 'warning')
         window.open(url, '_blank', 'noopener,noreferrer')
         return
       }
     }
 
+    addUpdateBreadcrumb('Opened update link in browser', {
+      url
+    })
     window.open(url, '_blank', 'noopener,noreferrer')
   }
 
@@ -254,4 +307,43 @@ function waitForAppReturn(timeoutMs = 120000) {
     document.addEventListener('visibilitychange', handleVisibilityChange)
     window.addEventListener('focus', handleFocus)
   })
+}
+
+function addUpdateBreadcrumb(
+  message: string,
+  data?: Record<string, unknown>,
+  level: Sentry.SeverityLevel = 'info'
+) {
+  Sentry.addBreadcrumb({
+    category: 'app.update',
+    message,
+    level,
+    data: data ? scrubSentryData(data) : undefined
+  })
+}
+
+function scrubSentryData(data: Record<string, unknown>) {
+  return Object.fromEntries(
+    Object.entries(data).map(([key, value]) => {
+      if (key === 'url' && typeof value === 'string') {
+        return [key, stripUrlDetails(value)]
+      }
+
+      return [key, value]
+    })
+  )
+}
+
+function stripUrlDetails(url: string) {
+  try {
+    const parsedUrl = new URL(url)
+
+    return `${parsedUrl.origin}${parsedUrl.pathname}`
+  } catch {
+    return url
+  }
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }

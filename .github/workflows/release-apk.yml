@@ -47,12 +47,13 @@ jobs:
           set -euo pipefail
 
           TAG_NAME="${GITHUB_REF_NAME}"
-          if [[ ! "$TAG_NAME" =~ ^apk-([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "Tag must match apk-x.y.z. Got: $TAG_NAME"
+          if [[ ! "$TAG_NAME" =~ ^apk-([0-9]+\.[0-9]+\.[0-9]+)-(pre|full)$ ]]; then
+            echo "Tag must match apk-x.y.z-pre or apk-x.y.z-full. Got: $TAG_NAME"
             exit 1
           fi
 
           TAG_VERSION="${BASH_REMATCH[1]}"
+          TAG_SUFFIX="${BASH_REMATCH[2]}"
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           GRADLE_VERSION="$(sed -n 's/.*versionName "\([^\"]*\)".*/\1/p' android/app/build.gradle | head -n 1)"
 
@@ -67,6 +68,7 @@ jobs:
           fi
 
           echo "tag_version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          [[ "$TAG_SUFFIX" == "pre" ]] && echo "is_prerelease=true" >> "$GITHUB_OUTPUT" || echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: npm ci
@@ -133,6 +135,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: APK ${{ steps.version.outputs.tag_version }}
+          prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
           files: ${{ steps.asset.outputs.apk_path }}
           fail_on_unmatched_files: true

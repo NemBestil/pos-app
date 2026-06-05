@@ -1,15 +1,21 @@
 package com.nembestil.pos3.app;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothSocket;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -23,12 +29,14 @@ import android.util.Base64;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -92,6 +100,11 @@ public class ForwarderService extends Service {
     private static final int LAN_PRINTER_PORT = 9100;
     private static final int LAN_PING_TIMEOUT_MS = 1_500;
     private static final int LAN_PRINT_TIMEOUT_MS = 8_000;
+
+    // Bluetooth Classic SPP (Serial Port Profile) — the channel ESC/POS printers expose.
+    private static final UUID BLUETOOTH_SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+    private static final int BLUETOOTH_PRINT_TIMEOUT_MS = 8_000;
+    private static final int BLUETOOTH_PRINTERS_REFRESH_MS = 30_000;
     private static final int LONG_POLL_CONNECT_TIMEOUT_MS = 5_000;
     private static final int LONG_POLL_READ_TIMEOUT_MS = 35_000;
     private static final int RETRY_AFTER_ERROR_MS = 3_000;
@@ -118,11 +131,13 @@ public class ForwarderService extends Service {
 
     private final String forwarderId = UUID.randomUUID().toString();
     private final AtomicBoolean lanPrintersDirty = new AtomicBoolean(true);
+    private final AtomicBoolean bluetoothPrintersDirty = new AtomicBoolean(true);
 
     private volatile String baseUrl;
     private volatile String authToken;
 
     private Thread lanPrintThread;
+    private Thread bluetoothPrintThread;
     private Thread paymentTerminalThread;
     private Thread discoveryThread;
     private Thread heartbeatThread;
@@ -139,8 +154,10 @@ public class ForwarderService extends Service {
     private BroadcastReceiver screenStateReceiver;
 
     private final Object lanPrintLongPollLock = new Object();
+    private final Object bluetoothPrintLongPollLock = new Object();
     private final Object paymentTerminalLongPollLock = new Object();
     private volatile HttpURLConnection currentLanPrintLongPoll;
+    private volatile HttpURLConnection currentBluetoothPrintLongPoll;
     private volatile HttpURLConnection currentPaymentTerminalLongPoll;
 
     public static boolean isRunning() {
@@ -168,9 +185,11 @@ public class ForwarderService extends Service {
         }
 
         if (ACTION_NOTIFY_CONFIG_CHANGED.equals(action)) {
-            Log.i(TAG, "Config change notified; restarting LAN print loop");
+            Log.i(TAG, "Config change notified; restarting LAN and Bluetooth print loops");
             lanPrintersDirty.set(true);
+            bluetoothPrintersDirty.set(true);
             interruptLanPrintLongPoll();
+            interruptBluetoothPrintLongPoll();
             return START_STICKY;
         }
 
@@ -208,12 +227,14 @@ public class ForwarderService extends Service {
             registerScreenStateReceiver();
             startDiscoveryListener();
             startLanPrintLoop();
+            startBluetoothPrintLoop();
             startPaymentTerminalLoop();
             startHeartbeatLoop();
         } else {
             Log.i(TAG, "Forwarder already running; credentials refreshed");
             // Reset the open long-poll connections so they reconnect with the new token.
             interruptLanPrintLongPoll();
+            interruptBluetoothPrintLongPoll();
             interruptPaymentTerminalLongPoll();
         }
         return START_STICKY;
@@ -288,17 +309,23 @@ public class ForwarderService extends Service {
         }
         activeBaseUrl.set(null);
         interruptLanPrintLongPoll();
+        interruptBluetoothPrintLongPoll();
         interruptPaymentTerminalLongPoll();
         unregisterScreenStateReceiver();
         stopDiscoveryListener();
         Thread lan = lanPrintThread;
+        Thread bluetooth = bluetoothPrintThread;
         Thread pay = paymentTerminalThread;
         Thread heartbeat = heartbeatThread;
         lanPrintThread = null;
+        bluetoothPrintThread = null;
         paymentTerminalThread = null;
         heartbeatThread = null;
         if (lan != null) {
             lan.interrupt();
+        }
+        if (bluetooth != null) {
+            bluetooth.interrupt();
         }
         if (pay != null) {
             pay.interrupt();
@@ -313,6 +340,19 @@ public class ForwarderService extends Service {
         synchronized (lanPrintLongPollLock) {
             HttpURLConnection conn = currentLanPrintLongPoll;
             currentLanPrintLongPoll = null;
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void interruptBluetoothPrintLongPoll() {
+        synchronized (bluetoothPrintLongPollLock) {
+            HttpURLConnection conn = currentBluetoothPrintLongPoll;
+            currentBluetoothPrintLongPoll = null;
             if (conn != null) {
                 try {
                     conn.disconnect();
@@ -565,6 +605,297 @@ public class ForwarderService extends Service {
             } catch (Exception ignored) {
             }
         }
+    }
+
+    // ========================================================================
+    // Bluetooth print long-poll loop
+    // ========================================================================
+    //
+    // Mirrors the LAN loop, but the destination is a bonded (paired) Bluetooth
+    // printer reachable only from this tablet. We advertise the bonded printers
+    // we can actually reach, and deliver each job over a Bluetooth Classic SPP
+    // (RFCOMM) socket, which is what ESC/POS printers expose.
+
+    private void startBluetoothPrintLoop() {
+        bluetoothPrintThread = new Thread(this::runBluetoothPrintLoop, "ForwarderBluetoothPrint");
+        bluetoothPrintThread.setDaemon(true);
+        bluetoothPrintThread.start();
+    }
+
+    private void runBluetoothPrintLoop() {
+        long lastPrinterFetchAt = 0L;
+        List<BluetoothPrinter> bonded = new ArrayList<>();
+
+        while (running.get()) {
+            try {
+                if (!hasBluetoothConnectPermission()) {
+                    sleepQuietly(BLUETOOTH_PRINTERS_REFRESH_MS);
+                    continue;
+                }
+
+                long now = System.currentTimeMillis();
+                boolean dirty = bluetoothPrintersDirty.getAndSet(false);
+                if (dirty || bonded.isEmpty() || now - lastPrinterFetchAt > BLUETOOTH_PRINTERS_REFRESH_MS) {
+                    List<BluetoothPrinter> active = fetchActiveBluetoothPrinters();
+                    bonded = filterBondedBluetoothPrinters(active);
+                    lastPrinterFetchAt = System.currentTimeMillis();
+                    Log.i(TAG, "Bluetooth printers fetched: total=" + active.size() + " bonded=" + bonded.size());
+                }
+
+                if (bonded.isEmpty()) {
+                    sleepQuietly(BLUETOOTH_PRINTERS_REFRESH_MS);
+                    continue;
+                }
+
+                boolean handled = longPollBluetoothPrintJob(bonded);
+                if (!handled) {
+                    sleepQuietly(RETRY_AFTER_ERROR_MS);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Bluetooth print loop iteration failed", t);
+                sleepQuietly(RETRY_AFTER_ERROR_MS);
+            }
+        }
+        Log.i(TAG, "Bluetooth print loop exited");
+    }
+
+    private List<BluetoothPrinter> fetchActiveBluetoothPrinters() {
+        List<BluetoothPrinter> result = new ArrayList<>();
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(baseUrl + "/api/_internal/bluetooth-printers");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            applyCookies(conn);
+            conn.setRequestProperty("Accept", "application/json");
+            int status = conn.getResponseCode();
+            if (status < 200 || status >= 300) {
+                Log.w(TAG, "bluetooth-printers HTTP " + status);
+                return result;
+            }
+            String body = readAll(conn.getInputStream());
+            JSONArray arr = new JSONArray(body);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject obj = arr.getJSONObject(i);
+                BluetoothPrinter printer = new BluetoothPrinter();
+                printer.printerId = obj.optString("printerId", null);
+                String address = obj.optString("address", null);
+                printer.address = address == null ? null : address.toUpperCase();
+                if (printer.printerId != null && printer.address != null) {
+                    result.add(printer);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "fetchActiveBluetoothPrinters failed", e);
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+        return result;
+    }
+
+    private List<BluetoothPrinter> filterBondedBluetoothPrinters(List<BluetoothPrinter> printers) {
+        List<BluetoothPrinter> bonded = new ArrayList<>();
+        if (printers.isEmpty()) {
+            return bonded;
+        }
+        Set<String> bondedAddresses = getBondedAddresses();
+        for (BluetoothPrinter printer : printers) {
+            if (bondedAddresses.contains(printer.address)) {
+                bonded.add(printer);
+            }
+        }
+        return bonded;
+    }
+
+    private Set<String> getBondedAddresses() {
+        Set<String> addresses = new HashSet<>();
+        BluetoothAdapter adapter = resolveBluetoothAdapter();
+        if (adapter == null || !adapter.isEnabled() || !hasBluetoothConnectPermission()) {
+            return addresses;
+        }
+        try {
+            Set<BluetoothDevice> bonded = adapter.getBondedDevices();
+            if (bonded != null) {
+                for (BluetoothDevice device : bonded) {
+                    String address = device.getAddress();
+                    if (address != null) {
+                        addresses.add(address.toUpperCase());
+                    }
+                }
+            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "getBondedDevices denied", e);
+        }
+        return addresses;
+    }
+
+    private boolean longPollBluetoothPrintJob(List<BluetoothPrinter> printers) {
+        HttpURLConnection conn = null;
+        try {
+            JSONArray arr = new JSONArray();
+            for (BluetoothPrinter printer : printers) {
+                JSONObject obj = new JSONObject();
+                obj.put("printerId", printer.printerId);
+                obj.put("address", printer.address);
+                arr.put(obj);
+            }
+            JSONObject body = new JSONObject();
+            body.put("printers", arr);
+            body.put("screenOn", screenOn.get());
+
+            URL url = new URL(baseUrl + "/api/_internal/bluetooth-print-forward");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Accept", "text/event-stream");
+            applyCookies(conn);
+
+            byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
+            try (OutputStream out = conn.getOutputStream()) {
+                out.write(payload);
+            }
+
+            synchronized (bluetoothPrintLongPollLock) {
+                currentBluetoothPrintLongPoll = conn;
+            }
+
+            int status = conn.getResponseCode();
+            if (status < 200 || status >= 300) {
+                Log.w(TAG, "bluetooth-print-forward HTTP " + status);
+                return false;
+            }
+
+            Map<String, String> addressByPrinterId = new java.util.HashMap<>();
+            for (BluetoothPrinter printer : printers) {
+                addressByPrinterId.put(printer.printerId, printer.address);
+            }
+
+            readLongPollResponse(conn, (event, data) -> {
+                if ("print-job".equals(event)) {
+                    handleBluetoothPrintJob(data, addressByPrinterId);
+                }
+            });
+            return true;
+        } catch (Exception e) {
+            if (running.get()) {
+                Log.w(TAG, "longPollBluetoothPrintJob failed", e);
+            }
+            return false;
+        } finally {
+            synchronized (bluetoothPrintLongPollLock) {
+                if (currentBluetoothPrintLongPoll == conn) {
+                    currentBluetoothPrintLongPoll = null;
+                }
+            }
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void handleBluetoothPrintJob(String data, Map<String, String> addressByPrinterId) {
+        try {
+            JSONObject job = new JSONObject(data);
+            String jobId = job.optString("jobId", "");
+            String printerId = job.optString("printerId", null);
+            String addressFromJob = job.optString("target", null);
+            String payloadBase64 = job.optString("payloadBase64", null);
+            int timeoutMs = job.optInt("timeoutMs", BLUETOOTH_PRINT_TIMEOUT_MS);
+            if (payloadBase64 == null) {
+                Log.w(TAG, "Bluetooth print-job missing payloadBase64 jobId=" + jobId);
+                return;
+            }
+            String address = addressByPrinterId.getOrDefault(printerId, addressFromJob);
+            if (address == null || address.isEmpty()) {
+                Log.w(TAG, "Bluetooth print-job has no address jobId=" + jobId);
+                return;
+            }
+            byte[] bytes = Base64.decode(payloadBase64, Base64.DEFAULT);
+            sendBytesToBluetoothPrinter(address, bytes, timeoutMs, jobId);
+        } catch (Exception e) {
+            Log.w(TAG, "handleBluetoothPrintJob failed", e);
+        }
+    }
+
+    private void sendBytesToBluetoothPrinter(String address, byte[] bytes, int timeoutMs, String jobId) {
+        BluetoothAdapter adapter = resolveBluetoothAdapter();
+        if (adapter == null || !adapter.isEnabled()) {
+            Log.w(TAG, "Bluetooth adapter unavailable jobId=" + jobId);
+            return;
+        }
+        if (!hasBluetoothConnectPermission()) {
+            Log.w(TAG, "Bluetooth connect permission missing jobId=" + jobId);
+            return;
+        }
+        BluetoothSocket socket = null;
+        try {
+            BluetoothDevice device = adapter.getRemoteDevice(address);
+            // Discovery slows down (and can break) an outgoing RFCOMM connection.
+            // Cancelling needs BLUETOOTH_SCAN on newer Androids, so it's best-effort.
+            try {
+                adapter.cancelDiscovery();
+            } catch (Exception ignored) {
+            }
+            socket = device.createRfcommSocketToServiceRecord(BLUETOOTH_SPP_UUID);
+            socket.connect();
+
+            OutputStream out = socket.getOutputStream();
+            out.write(bytes);
+            out.flush();
+            // Give the printer a moment to drain its buffer before we close the socket.
+            try {
+                Thread.sleep(Math.min(Math.max(timeoutMs, 1), 400));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            Log.i(TAG, "Bluetooth print delivered jobId=" + jobId + " address=" + address + " bytes=" + bytes.length);
+        } catch (SecurityException e) {
+            Log.w(TAG, "Bluetooth print denied jobId=" + jobId + " address=" + address, e);
+        } catch (IOException e) {
+            Log.w(TAG, "Bluetooth print failed jobId=" + jobId + " address=" + address, e);
+        } finally {
+            if (socket != null) {
+                try {
+                    socket.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private BluetoothAdapter resolveBluetoothAdapter() {
+        try {
+            BluetoothManager manager =
+                (BluetoothManager) getApplicationContext().getSystemService(Context.BLUETOOTH_SERVICE);
+            return manager != null ? manager.getAdapter() : null;
+        } catch (Exception e) {
+            Log.w(TAG, "resolveBluetoothAdapter failed", e);
+            return null;
+        }
+    }
+
+    private boolean hasBluetoothConnectPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return true;
+        }
+        return ContextCompat.checkSelfPermission(getApplicationContext(), Manifest.permission.BLUETOOTH_CONNECT)
+            == PackageManager.PERMISSION_GRANTED;
+    }
+
+    // Container used internally for bonded Bluetooth printer entries.
+    private static class BluetoothPrinter {
+        String printerId;
+        String address;
     }
 
     // ========================================================================

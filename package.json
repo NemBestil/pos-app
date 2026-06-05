@@ -1,6 +1,6 @@
 {
   "name": "nembestil-pos3-app",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "private": true,
   "scripts": {
@@ -21,6 +21,8 @@
     "@capacitor/android": "^8.3.3",
     "@capacitor/core": "^8.3.3",
     "@nuxt/ui": "^4.7.1",
+    "@sentry/capacitor": "4.0.0",
+    "@sentry/vue": "10.43.0",
     "nuxt": "^4.4.5",
     "tailwindcss": "^4.3.0",
     "vue": "^3.5.34",

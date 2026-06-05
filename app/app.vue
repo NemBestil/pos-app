@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { CapacitorHttp } from '@capacitor/core'
+import * as Sentry from '@sentry/capacitor'
 import packageJson from '../package.json'
 
 type Screen = 'launcher' | 'wizard-input' | 'wizard-review' | 'manage'
@@ -152,6 +153,7 @@ onMounted(() => {
   if (installations.value.length > 0) {
     screen.value = 'launcher'
     selectedInstallationId.value = resolveInitialInstallationId(installations.value)
+    setSentryInstallationContext(selectedInstallation.value)
   }
 
   hasLoaded.value = true
@@ -160,6 +162,23 @@ onMounted(() => {
   }, 80)
 
   void checkForUpdate()
+
+  addSentryBreadcrumb('app.lifecycle', 'Shell loaded', {
+    screen: screen.value,
+    installationCount: installations.value.length,
+    selectedInstallationId: selectedInstallationId.value || null
+  })
+})
+
+watch(screen, (nextScreen, previousScreen) => {
+  addSentryBreadcrumb('app.screen', 'Screen changed', {
+    from: previousScreen,
+    to: nextScreen
+  })
+})
+
+watch(selectedInstallation, (installation) => {
+  setSentryInstallationContext(installation)
 })
 
 function sanitizeInstallationId(value: string) {
@@ -174,6 +193,7 @@ function onInstallationIdInput(event: Event) {
 }
 
 function startWizard(mode: WizardMode) {
+  addSentryBreadcrumb('app.installation', 'Wizard started', { mode })
   wizardMode.value = mode
   installationIdInput.value = ''
   installationIdTouched.value = false
@@ -196,6 +216,11 @@ async function verifyInstallation() {
   const id = sanitizedInstallationId.value
   const baseUrl = getInstallationBaseUrl(id)
 
+  addSentryBreadcrumb('app.installation', 'Installation verification started', {
+    installationId: id,
+    baseUrl
+  })
+
   try {
     const data = await fetchInstallationDetails(baseUrl)
 
@@ -210,7 +235,16 @@ async function verifyInstallation() {
     }
 
     screen.value = 'wizard-review'
-  } catch {
+    addSentryBreadcrumb('app.installation', 'Installation verification succeeded', {
+      installationId: id,
+      baseUrl
+    })
+  } catch (error) {
+    addSentryBreadcrumb('app.installation', 'Installation verification failed', {
+      installationId: id,
+      baseUrl,
+      error: getErrorMessage(error)
+    }, 'warning')
     fetchError.value = 'That installation could not be verified. Check the ID and try again.'
   } finally {
     isFetchingInstallation.value = false
@@ -218,11 +252,17 @@ async function verifyInstallation() {
 }
 
 function goBackFromWizard() {
+  addSentryBreadcrumb('app.navigation', 'Wizard back pressed', {
+    mode: wizardMode.value
+  })
   fetchError.value = ''
   screen.value = wizardMode.value === 'manage' ? 'manage' : 'wizard-input'
 }
 
 function goBackToInput() {
+  addSentryBreadcrumb('app.navigation', 'Review back pressed', {
+    mode: wizardMode.value
+  })
   screen.value = 'wizard-input'
 }
 
@@ -257,6 +297,12 @@ function confirmInstallation() {
 
   persistInstallations()
   selectedInstallationId.value = nextInstallation.id
+  setSentryInstallationContext(nextInstallation)
+  addSentryBreadcrumb('app.installation', existingInstallation ? 'Installation updated' : 'Installation added', {
+    installationId: nextInstallation.id,
+    mode: wizardMode.value,
+    isDefault: nextInstallation.isDefault
+  })
 
   if (wizardMode.value === 'manage') {
     candidateInstallation.value = null
@@ -275,12 +321,21 @@ async function openSelectedInstallation() {
 
   launcherError.value = ''
   isLaunchingInstallation.value = true
+  addSentryBreadcrumb('app.launch', 'Selected installation launch started', {
+    installationId: selectedInstallation.value.id,
+    baseUrl: selectedInstallation.value.baseUrl
+  })
 
   try {
     await fetchInstallationDetails(selectedInstallation.value.baseUrl)
     markInstallationAsLastUsed(selectedInstallation.value.id)
     openInstallation(selectedInstallation.value.baseUrl)
-  } catch {
+  } catch (error) {
+    addSentryBreadcrumb('app.launch', 'Selected installation launch failed', {
+      installationId: selectedInstallation.value.id,
+      baseUrl: selectedInstallation.value.baseUrl,
+      error: getErrorMessage(error)
+    }, 'warning')
     launcherError.value = 'This installation is not responding right now. Try again in a moment.'
   } finally {
     isLaunchingInstallation.value = false
@@ -288,10 +343,16 @@ async function openSelectedInstallation() {
 }
 
 function openManageScreen() {
+  addSentryBreadcrumb('app.navigation', 'Manage installations opened', {
+    installationCount: installations.value.length
+  })
   screen.value = 'manage'
 }
 
 function leaveManageScreen() {
+  addSentryBreadcrumb('app.navigation', 'Manage installations closed', {
+    installationCount: installations.value.length
+  })
   screen.value = hasInstallations.value ? 'launcher' : 'wizard-input'
 }
 
@@ -309,6 +370,10 @@ function removeInstallation(id: string) {
   installations.value = remainingInstallations
   persistInstallations()
   launcherError.value = ''
+  addSentryBreadcrumb('app.installation', 'Installation removed', {
+    installationId: id,
+    remainingInstallationCount: remainingInstallations.length
+  })
 
   if (selectedInstallationId.value === id) {
     selectedInstallationId.value = resolveInitialInstallationId(remainingInstallations)
@@ -331,6 +396,9 @@ function setDefaultInstallation(id: string) {
 
   selectedInstallationId.value = id
   persistInstallations()
+  addSentryBreadcrumb('app.installation', 'Default installation changed', {
+    installationId: id
+  })
 }
 
 function markInstallationAsLastUsed(id: string) {
@@ -350,9 +418,16 @@ function markInstallationAsLastUsed(id: string) {
   selectedInstallationId.value = id
   persistInstallations()
   localStorage.setItem(lastUsedStorageKey, id)
+  addSentryBreadcrumb('app.installation', 'Installation marked as last used', {
+    installationId: id
+  })
 }
 
 function openInstallation(url: string) {
+  addSentryBreadcrumb('app.launch', 'Handing off to POS webview', {
+    url,
+    installationId: selectedInstallationId.value || null
+  })
   window.location.assign(url)
 }
 
@@ -365,9 +440,18 @@ function getInstallationBaseUrl(id: string) {
 }
 
 async function fetchInstallationDetails(baseUrl: string) {
+  addSentryBreadcrumb('app.api', 'Installation details request started', {
+    url: `${baseUrl}/api/public/installation`
+  })
+
   const response = await CapacitorHttp.get({
     url: `${baseUrl}/api/public/installation`
   })
+
+  addSentryBreadcrumb('app.api', 'Installation details response received', {
+    url: `${baseUrl}/api/public/installation`,
+    status: response.status
+  }, response.status >= 400 ? 'warning' : 'info')
 
   if (response.status < 200 || response.status >= 300) {
     throw new Error('Installation lookup failed')
@@ -472,6 +556,63 @@ function hexToRgba(hex: string, alpha: number) {
   const blue = Number.parseInt(safeHex.slice(4, 6), 16)
 
   return `rgba(${red}, ${green}, ${blue}, ${alpha})`
+}
+
+function addSentryBreadcrumb(
+  category: string,
+  message: string,
+  data?: Record<string, unknown>,
+  level: Sentry.SeverityLevel = 'info'
+) {
+  Sentry.addBreadcrumb({
+    category,
+    message,
+    level,
+    data: data ? scrubSentryData(data) : undefined
+  })
+}
+
+function setSentryInstallationContext(installation: SavedInstallation | null) {
+  if (!installation) {
+    Sentry.setContext('installation', null)
+    Sentry.setTag('installation.id', '')
+    return
+  }
+
+  Sentry.setTag('installation.id', installation.id)
+  Sentry.setContext('installation', {
+    id: installation.id,
+    baseUrl: stripUrlDetails(installation.baseUrl),
+    isDefault: installation.isDefault,
+    organization: installation.organization.companyName,
+    store: installation.organization.storeName
+  })
+}
+
+function scrubSentryData(data: Record<string, unknown>) {
+  return Object.fromEntries(
+    Object.entries(data).map(([key, value]) => {
+      if ((key === 'url' || key === 'baseUrl') && typeof value === 'string') {
+        return [key, stripUrlDetails(value)]
+      }
+
+      return [key, value]
+    })
+  )
+}
+
+function stripUrlDetails(url: string) {
+  try {
+    const parsedUrl = new URL(url)
+
+    return `${parsedUrl.origin}${parsedUrl.pathname}`
+  } catch {
+    return url
+  }
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }
 </script>
 

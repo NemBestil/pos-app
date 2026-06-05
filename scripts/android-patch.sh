@@ -73,6 +73,7 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
 ${REG_LINES}        super.onCreate(savedInstanceState);
+        WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);
     }
 }
@@ -89,6 +90,14 @@ if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "androidx.webkit:webkit" "$APP_BUILD_
     # that cap sync re-emits). Use a literal newline in the sed `a\` block.
     sed -i '' $'/implementation project(\':capacitor-android\')/a\\\n    implementation "androidx.webkit:webkit:$androidxWebkitVersion"\n' "$APP_BUILD_GRADLE"
     echo "🩹 Added androidx.webkit dependency to android/app/build.gradle"
+fi
+
+# WebViewSentrySupport records WebView navigation/console/error breadcrumbs through
+# the Android SDK. The app module imports io.sentry directly, so keep the direct
+# dependency explicit even though @sentry/capacitor also bundles it.
+if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "io.sentry:sentry-android" "$APP_BUILD_GRADLE"; then
+    sed -i '' $'/implementation "androidx.webkit:webkit:\\$androidxWebkitVersion"/a\\\n    implementation "io.sentry:sentry-android:8.35.0"\n' "$APP_BUILD_GRADLE"
+    echo "🩹 Added Sentry Android dependency to android/app/build.gradle"
 fi
 
 # PaymentTerminalDiscoveryPlugin acquires a Wi-Fi multicast lock so the Wi-Fi
@@ -126,6 +135,21 @@ if anchor in text:
             text = text.replace(anchor, anchor + "\n    " + line, 1)
             changed = True
             print(f"🩹 Added {perm} permission to AndroidManifest.xml")
+
+# Bluetooth printing (BluetoothPrinterPlugin + ForwarderService Bluetooth loop).
+# BLUETOOTH_CONNECT is the runtime permission used from Android 12; the legacy
+# BLUETOOTH/BLUETOOTH_ADMIN permissions only matter on API <= 30.
+bluetooth_lines = [
+    '<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />',
+    '<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />',
+    '<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />',
+]
+if anchor in text:
+    for line in bluetooth_lines:
+        if line not in text:
+            text = text.replace(anchor, anchor + "\n    " + line, 1)
+            changed = True
+            print("🩹 Added Bluetooth permission to AndroidManifest.xml")
 
 service_xml = (
     '        <service\n'
