@@ -95,10 +95,6 @@ jobs:
           : "${ANDROID_RELEASE_KEY_ALIAS:?Missing secret ANDROID_RELEASE_KEY_ALIAS}"
           : "${ANDROID_RELEASE_KEY_PASSWORD:?Missing secret ANDROID_RELEASE_KEY_PASSWORD}"
 
-          KEYSTORE_PATH="$RUNNER_TEMP/android-release.keystore"
-          echo "$ANDROID_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
-          echo "ANDROID_RELEASE_STORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
-
           if [[ -n "${GOOGLE_SERVICES_JSON_BASE64:-}" ]]; then
             echo "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > android/app/google-services.json
           fi
@@ -106,7 +102,7 @@ jobs:
       - name: Build signed release APK
         working-directory: android
         env:
-          ANDROID_RELEASE_STORE_FILE: ${{ env.ANDROID_RELEASE_STORE_FILE }}
+          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
           ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
           ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
           ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
