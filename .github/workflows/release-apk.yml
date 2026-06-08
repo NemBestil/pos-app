@@ -47,8 +47,8 @@ jobs:
           set -euo pipefail
 
           TAG_NAME="${GITHUB_REF_NAME}"
-          if [[ ! "$TAG_NAME" =~ ^apk-([0-9]+\.[0-9]+\.[0-9]+)-(pre|full)$ ]]; then
-            echo "Tag must match apk-x.y.z-pre or apk-x.y.z-full. Got: $TAG_NAME"
+          if [[ ! "$TAG_NAME" =~ ^apk-([0-9]+\.[0-9]+\.[0-9]+)(-pre)?$ ]]; then
+            echo "Tag must match apk-x.y.z or apk-x.y.z-pre. Got: $TAG_NAME"
             exit 1
           fi
 
@@ -68,7 +68,7 @@ jobs:
           fi
 
           echo "tag_version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-          [[ "$TAG_SUFFIX" == "pre" ]] && echo "is_prerelease=true" >> "$GITHUB_OUTPUT" || echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          [[ "$TAG_SUFFIX" == "-pre" ]] && echo "is_prerelease=true" >> "$GITHUB_OUTPUT" || echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: npm ci

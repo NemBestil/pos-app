@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage: ./scripts/tag-apk.sh <pre|full>
-# Tags the current version with apk-x.y.z-pre or apk-x.y.z-full and pushes it.
+# Tags the current version with apk-x.y.z-pre (prerelease) or apk-x.y.z (full release) and pushes it.
 
 RELEASE_TYPE="${1:-}"
 if [[ "$RELEASE_TYPE" != "pre" && "$RELEASE_TYPE" != "full" ]]; then
@@ -21,7 +21,11 @@ fi
 
 # Read current version from package.json
 CURRENT_VERSION=$(node -p "require('$PACKAGE_JSON').version")
-TAG="apk-$CURRENT_VERSION-$RELEASE_TYPE"
+if [[ "$RELEASE_TYPE" == "pre" ]]; then
+    TAG="apk-$CURRENT_VERSION-pre"
+else
+    TAG="apk-$CURRENT_VERSION"
+fi
 
 echo "🏷️  Creating tag: $TAG"
 
