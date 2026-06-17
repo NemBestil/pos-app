@@ -1,29 +1,53 @@
 package com.nembestil.pos3.app;
 
 import android.Manifest;
-import android.app.Activity;
 import android.content.Context;
-import android.content.pm.PackageManager;
 import android.os.Build;
 
-import androidx.core.app.ActivityCompat;
-import androidx.core.content.ContextCompat;
-
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 /**
  * Thin Capacitor bridge for {@link ForwarderService}. The webview only ever
  * needs to ask "turn it on/off" and "what's the state" — everything else lives
  * in the service itself.
+ *
+ * The foreground service can't post its persistent notification without the
+ * POST_NOTIFICATIONS permission (Android 13+), so {@link #start} requests it and
+ * only brings the service up once it's granted. If the user declines, we resolve
+ * with running=false so the webview toggle stays inactive.
  */
-@CapacitorPlugin(name = "ForwarderService")
+@CapacitorPlugin(
+    name = "ForwarderService",
+    permissions = {
+        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS })
+    }
+)
 public class ForwarderServicePlugin extends Plugin {
 
-    private static final int NOTIFICATION_PERMISSION_REQUEST = 4711;
+    private static final String NOTIFICATIONS_ALIAS = "notifications";
+
+    // Forwarded to the WebView so it can drop its own copy of the (now dead)
+    // token and re-mint after the next login.
+    private final ForwarderService.TokenListener tokenListener =
+        () -> notifyListeners("tokenRejected", new JSObject());
+
+    @Override
+    public void load() {
+        ForwarderService.registerTokenListener(tokenListener);
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        ForwarderService.unregisterTokenListener(tokenListener);
+        super.handleOnDestroy();
+    }
 
     @PluginMethod
     public void start(PluginCall call) {
@@ -37,12 +61,36 @@ public class ForwarderServicePlugin extends Plugin {
             call.reject("Missing token");
             return;
         }
+        // POST_NOTIFICATIONS only exists (and is only enforced) from Android 13.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+            && getPermissionState(NOTIFICATIONS_ALIAS) != PermissionState.GRANTED) {
+            requestPermissionForAlias(NOTIFICATIONS_ALIAS, call, "startPermissionCallback");
+            return;
+        }
+        startForwarder(call);
+    }
+
+    @PermissionCallback
+    private void startPermissionCallback(PluginCall call) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+            && getPermissionState(NOTIFICATIONS_ALIAS) != PermissionState.GRANTED) {
+            // Declined: leave the forwarder off so the toggle stays inactive.
+            JSObject ret = new JSObject();
+            ret.put("running", false);
+            call.resolve(ret);
+            return;
+        }
+        startForwarder(call);
+    }
+
+    private void startForwarder(PluginCall call) {
         Context context = getContext();
         if (context == null) {
             call.reject("No Android context");
             return;
         }
-        maybeRequestNotificationPermission();
+        String baseUrl = call.getString("baseUrl");
+        String token = call.getString("token");
         ForwarderService.requestStart(context.getApplicationContext(), baseUrl, token);
         JSObject ret = new JSObject();
         ret.put("running", true);
@@ -85,24 +133,16 @@ public class ForwarderServicePlugin extends Plugin {
         call.resolve();
     }
 
-    private void maybeRequestNotificationPermission() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            return;
-        }
-        Activity activity = getActivity();
-        if (activity == null) {
-            return;
-        }
-        int granted = ContextCompat.checkSelfPermission(
-            activity, Manifest.permission.POST_NOTIFICATIONS
-        );
-        if (granted == PackageManager.PERMISSION_GRANTED) {
-            return;
-        }
-        ActivityCompat.requestPermissions(
-            activity,
-            new String[]{Manifest.permission.POST_NOTIFICATIONS},
-            NOTIFICATION_PERMISSION_REQUEST
-        );
+    /**
+     * Lets the webview decide whether to show its "why we need notifications"
+     * explainer before triggering the system prompt via {@link #start}.
+     */
+    @PluginMethod
+    public void checkNotificationPermission(PluginCall call) {
+        boolean granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+            || getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED;
+        JSObject ret = new JSObject();
+        ret.put("granted", granted);
+        call.resolve(ret);
     }
 }

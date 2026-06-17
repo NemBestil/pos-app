@@ -23,7 +23,9 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Base64;
 import android.util.Log;
@@ -85,6 +87,10 @@ public class ForwarderService extends Service {
     private static final String TAG = "ForwarderService";
     private static final String CHANNEL_ID = "nembestil_forwarder";
     private static final int NOTIFICATION_ID = 0x4E42; // "NB"
+    // A separate, higher-importance channel/id for the "your token died" heads-up.
+    // It must outlive the ongoing service notification, so it can't share an id.
+    private static final String ALERT_CHANNEL_ID = "nembestil_forwarder_alerts";
+    private static final int ALERT_NOTIFICATION_ID = 0x4E43;
 
     public static final String ACTION_START = "com.nembestil.pos3.app.action.START_FORWARDER";
     public static final String ACTION_STOP = "com.nembestil.pos3.app.action.STOP_FORWARDER";
@@ -129,9 +135,16 @@ public class ForwarderService extends Service {
     private static final CopyOnWriteArrayList<DiscoveryListener> discoveryListeners = new CopyOnWriteArrayList<>();
     private static final AtomicBoolean discoveryRunning = new AtomicBoolean(false);
 
+    // Listeners (the Capacitor plugin) that want to know when the server rejected
+    // our token, so the WebView can drop its own copy and re-mint after login.
+    private static final CopyOnWriteArrayList<TokenListener> tokenListeners = new CopyOnWriteArrayList<>();
+
     private final String forwarderId = UUID.randomUUID().toString();
     private final AtomicBoolean lanPrintersDirty = new AtomicBoolean(true);
     private final AtomicBoolean bluetoothPrintersDirty = new AtomicBoolean(true);
+    // Latches the first time the server rejects our token (401) so only one loop
+    // tears things down; cleared again whenever fresh credentials arrive.
+    private final AtomicBoolean tokenInvalidated = new AtomicBoolean(false);
 
     private volatile String baseUrl;
     private volatile String authToken;
@@ -219,6 +232,8 @@ public class ForwarderService extends Service {
         authToken = requestedToken;
         activeBaseUrl.set(baseUrl);
         prefs.edit().putString(PREFS_BASE_URL, baseUrl).putString(PREFS_TOKEN, authToken).apply();
+        // Fresh credentials — let the loops trust the server again.
+        tokenInvalidated.set(false);
 
         startForegroundWithNotification();
 
@@ -279,7 +294,7 @@ public class ForwarderService extends Service {
         NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("NemBestil POS")
             .setContentText("This tablet is handling printer and payment terminal traffic.")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_stat_forwarder)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE);
@@ -422,6 +437,7 @@ public class ForwarderService extends Service {
         List<LanPrinter> result = new ArrayList<>();
         HttpURLConnection conn = null;
         try {
+            final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/lan-printers");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
@@ -430,6 +446,9 @@ public class ForwarderService extends Service {
             applyCookies(conn);
             conn.setRequestProperty("Accept", "application/json");
             int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return result;
+            }
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "lan-printers HTTP " + status);
                 return result;
@@ -494,6 +513,7 @@ public class ForwarderService extends Service {
             body.put("printers", arr);
             body.put("screenOn", screenOn.get());
 
+            final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/lan-print-forward");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
@@ -514,6 +534,9 @@ public class ForwarderService extends Service {
             }
 
             int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return false;
+            }
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "lan-print-forward HTTP " + status);
                 return false;
@@ -663,6 +686,7 @@ public class ForwarderService extends Service {
         List<BluetoothPrinter> result = new ArrayList<>();
         HttpURLConnection conn = null;
         try {
+            final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/bluetooth-printers");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
@@ -671,6 +695,9 @@ public class ForwarderService extends Service {
             applyCookies(conn);
             conn.setRequestProperty("Accept", "application/json");
             int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return result;
+            }
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "bluetooth-printers HTTP " + status);
                 return result;
@@ -747,6 +774,7 @@ public class ForwarderService extends Service {
             body.put("printers", arr);
             body.put("screenOn", screenOn.get());
 
+            final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/bluetooth-print-forward");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
@@ -767,6 +795,9 @@ public class ForwarderService extends Service {
             }
 
             int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return false;
+            }
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "bluetooth-print-forward HTTP " + status);
                 return false;
@@ -941,6 +972,7 @@ public class ForwarderService extends Service {
             body.put("terminalIds", arr);
             body.put("screenOn", screenOn.get());
 
+            final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
@@ -961,6 +993,9 @@ public class ForwarderService extends Service {
             }
 
             int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return false;
+            }
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "payment-terminal-forward HTTP " + status);
                 return false;
@@ -1090,6 +1125,7 @@ public class ForwarderService extends Service {
         while (running.get() && System.currentTimeMillis() - startedAt <= RESPONSE_SUBMIT_MAX_MS) {
             HttpURLConnection conn = null;
             try {
+                final String usedToken = authToken;
                 URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward-response");
                 conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
@@ -1111,6 +1147,9 @@ public class ForwarderService extends Service {
                     out.write(body.toString().getBytes(StandardCharsets.UTF_8));
                 }
                 int status = conn.getResponseCode();
+                if (handledUnauthorized(status, usedToken)) {
+                    return;
+                }
                 if (status >= 200 && status < 300) {
                     Log.i(TAG, "Submitted terminal response jobId=" + jobId);
                     return;
@@ -1175,6 +1214,7 @@ public class ForwarderService extends Service {
             JSONObject body = new JSONObject();
             body.put("terminals", arr);
 
+            final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/payment-terminal-heartbeat");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
@@ -1188,6 +1228,9 @@ public class ForwarderService extends Service {
                 out.write(body.toString().getBytes(StandardCharsets.UTF_8));
             }
             int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return;
+            }
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "heartbeat HTTP " + status);
             }
@@ -1258,6 +1301,126 @@ public class ForwarderService extends Service {
         String token = authToken;
         if (token != null && !token.isEmpty()) {
             conn.setRequestProperty("Authorization", "Bearer " + token);
+        }
+    }
+
+    // ========================================================================
+    // Token rejection handling
+    // ========================================================================
+    //
+    // Every forwarder call authenticates with the androidsync Bearer token. Once
+    // the server rejects it (401 "Invalid or expired forwarder token") the token
+    // is dead for good — only an authenticated WebView can mint a new one. Rather
+    // than hammer every endpoint with a doomed token forever, the first loop to
+    // see a 401 clears the token, warns the operator, tells the WebView, and
+    // stops the service.
+
+    /**
+     * @return true when the status was a 401 for {@code usedToken} and the token
+     *     was invalidated — callers should bail out of their current request.
+     */
+    private boolean handledUnauthorized(int status, String usedToken) {
+        if (status != 401) {
+            return false;
+        }
+        handleUnauthorized(usedToken);
+        return true;
+    }
+
+    private void handleUnauthorized(String usedToken) {
+        String current = authToken;
+        if (usedToken == null || current == null || !usedToken.equals(current)) {
+            // The token was rotated between this request going out and the 401
+            // coming back (a refresh raced with us). The in-flight token is
+            // already gone, so don't punish the new one.
+            return;
+        }
+        if (!tokenInvalidated.compareAndSet(false, true)) {
+            // Another loop already noticed and is tearing things down.
+            return;
+        }
+        Log.w(TAG, "Forwarder token rejected by server (401); clearing it and stopping");
+
+        // Remove the token from the device so a sticky restart can't revive it.
+        authToken = null;
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().remove(PREFS_TOKEN).apply();
+
+        showTokenRejectedNotification();
+        notifyTokenRejected();
+
+        // Nothing left to do without a token — stop the loops and the service.
+        stopForwarder();
+        new Handler(Looper.getMainLooper()).post(() -> {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopSelf();
+        });
+    }
+
+    private void showTokenRejectedNotification() {
+        NotificationManager manager =
+            (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                ALERT_CHANNEL_ID,
+                "NemBestil forwarder alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            );
+            channel.setDescription("Warns when this tablet can no longer forward printer and payment terminal traffic.");
+            manager.createNotificationChannel(channel);
+        }
+
+        String message = "This tablet can no longer forward printer and payment terminal traffic. "
+            + "Open NemBestil POS and sign in to restore it.";
+
+        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        PendingIntent contentIntent = null;
+        if (launchIntent != null) {
+            launchIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                flags |= PendingIntent.FLAG_IMMUTABLE;
+            }
+            contentIntent = PendingIntent.getActivity(this, 1, launchIntent, flags);
+        }
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle("NemBestil POS – action needed")
+            .setContentText(message)
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(message))
+            .setSmallIcon(R.drawable.ic_stat_forwarder)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ERROR);
+        if (contentIntent != null) {
+            builder.setContentIntent(contentIntent);
+        }
+        manager.notify(ALERT_NOTIFICATION_ID, builder.build());
+    }
+
+    public interface TokenListener {
+        void onTokenRejected();
+    }
+
+    public static void registerTokenListener(TokenListener listener) {
+        tokenListeners.addIfAbsent(listener);
+    }
+
+    public static void unregisterTokenListener(TokenListener listener) {
+        tokenListeners.remove(listener);
+    }
+
+    private void notifyTokenRejected() {
+        for (TokenListener listener : tokenListeners) {
+            try {
+                listener.onTokenRejected();
+            } catch (Exception e) {
+                Log.w(TAG, "Token listener threw", e);
+            }
         }
     }
 
