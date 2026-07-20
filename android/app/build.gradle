@@ -16,8 +16,23 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            def keystoreBase64 = System.getenv("ANDROID_RELEASE_KEYSTORE_BASE64")
+            if (keystoreBase64) {
+                def keystoreFile = File.createTempFile("android-release", ".keystore")
+                keystoreFile.bytes = keystoreBase64.decodeBase64()
+                storeFile keystoreFile
+                storePassword System.getenv("ANDROID_RELEASE_STORE_PASSWORD")
+                keyAlias System.getenv("ANDROID_RELEASE_KEY_ALIAS")
+                keyPassword System.getenv("ANDROID_RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
