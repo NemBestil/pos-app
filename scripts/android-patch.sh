@@ -76,6 +76,14 @@ ${REG_LINES}        super.onCreate(savedInstanceState);
         WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);
     }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            AndroidFullscreenPlugin.applyCurrentState(this);
+        }
+    }
 }
 EOF
 

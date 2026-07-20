@@ -7,6 +7,7 @@ import com.getcapacitor.BridgeActivity;
 public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
+        registerPlugin(AndroidFullscreenPlugin.class);
         registerPlugin(BluetoothPrinterPlugin.class);
         registerPlugin(ForwarderServicePlugin.class);
         registerPlugin(NetworkPrinterPlugin.class);
@@ -14,5 +15,13 @@ public class MainActivity extends BridgeActivity {
         super.onCreate(savedInstanceState);
         WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            AndroidFullscreenPlugin.applyCurrentState(this);
+        }
     }
 }
