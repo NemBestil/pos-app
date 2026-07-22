@@ -12,6 +12,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(ForwarderServicePlugin.class);
         registerPlugin(NetworkPrinterPlugin.class);
         registerPlugin(PaymentTerminalDiscoveryPlugin.class);
+        registerPlugin(SecondaryDisplayPlugin.class);
         super.onCreate(savedInstanceState);
         WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);
