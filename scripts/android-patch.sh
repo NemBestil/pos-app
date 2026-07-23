@@ -117,11 +117,12 @@ if [ -f "$ANDROID_MANIFEST" ] && ! grep -q "CHANGE_WIFI_MULTICAST_STATE" "$ANDRO
     echo "🩹 Added CHANGE_WIFI_MULTICAST_STATE permission to AndroidManifest.xml"
 fi
 
-# ForwarderService runs as a foreground service with foregroundServiceType=dataSync.
-# That needs FOREGROUND_SERVICE + FOREGROUND_SERVICE_DATA_SYNC, and on Android 13+
-# POST_NOTIFICATIONS so the persistent notification can be shown. Both the
-# permissions and the <service> element are patched in idempotently via Python
-# because multi-line XML insertions are brittle in BSD sed.
+# ForwarderService maintains connections to local printers and payment terminals,
+# so it uses foregroundServiceType=connectedDevice. POST_NOTIFICATIONS is optional
+# for notification-drawer visibility and is not a prerequisite for starting the
+# service. The restart receiver restores a configured service after reboot/update.
+# Permissions and components are patched idempotently via Python because
+# multi-line XML insertions are brittle in BSD sed.
 if [ -f "$ANDROID_MANIFEST" ]; then
     python3 - "$ANDROID_MANIFEST" <<'PY'
 import sys, pathlib
@@ -132,7 +133,8 @@ changed = False
 
 permissions = [
     "android.permission.FOREGROUND_SERVICE",
-    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+    "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
     "android.permission.POST_NOTIFICATIONS",
 ]
 anchor = '<uses-permission android:name="android.permission.INTERNET" />'
@@ -143,6 +145,14 @@ if anchor in text:
             text = text.replace(anchor, anchor + "\n    " + line, 1)
             changed = True
             print(f"🩹 Added {perm} permission to AndroidManifest.xml")
+
+legacy_data_sync_permission = (
+    '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />\n'
+)
+if legacy_data_sync_permission in text:
+    text = text.replace(legacy_data_sync_permission, "")
+    changed = True
+    print("🩹 Removed FOREGROUND_SERVICE_DATA_SYNC permission from AndroidManifest.xml")
 
 # Bluetooth printing (BluetoothPrinterPlugin + ForwarderService Bluetooth loop).
 # BLUETOOTH_CONNECT is the runtime permission used from Android 12; the legacy
@@ -163,12 +173,35 @@ service_xml = (
     '        <service\n'
     '            android:name=".ForwarderService"\n'
     '            android:exported="false"\n'
-    '            android:foregroundServiceType="dataSync" />\n'
+    '            android:foregroundServiceType="connectedDevice" />\n'
 )
-if "ForwarderService" not in text and "</application>" in text:
+if 'android:foregroundServiceType="dataSync"' in text:
+    text = text.replace(
+        'android:foregroundServiceType="dataSync"',
+        'android:foregroundServiceType="connectedDevice"',
+    )
+    changed = True
+    print("🩹 Changed ForwarderService type to connectedDevice in AndroidManifest.xml")
+elif "ForwarderService" not in text and "</application>" in text:
     text = text.replace("</application>", service_xml + "    </application>", 1)
     changed = True
     print("🩹 Registered ForwarderService in AndroidManifest.xml")
+
+receiver_xml = (
+    '        <receiver\n'
+    '            android:name=".ForwarderRestartReceiver"\n'
+    '            android:enabled="true"\n'
+    '            android:exported="false">\n'
+    '            <intent-filter>\n'
+    '                <action android:name="android.intent.action.BOOT_COMPLETED" />\n'
+    '                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />\n'
+    '            </intent-filter>\n'
+    '        </receiver>\n'
+)
+if "ForwarderRestartReceiver" not in text and "</application>" in text:
+    text = text.replace("</application>", receiver_xml + "    </application>", 1)
+    changed = True
+    print("🩹 Registered ForwarderRestartReceiver in AndroidManifest.xml")
 
 if changed:
     path.write_text(text)
@@ -205,7 +238,7 @@ for densdir in "$RESOURCES_DIR/drawable"/drawable-*; do
     done
 done
 
-# Allow cleartext HTTP (needed for LAN IP connections via CapacitorHttp).
+# Allow cleartext HTTP for native and CapacitorHttp LAN-device connections.
 # Idempotent: only inserted if the attribute is missing.
 if [ -f "$ANDROID_MANIFEST" ] && ! grep -q "networkSecurityConfig" "$ANDROID_MANIFEST"; then
     sed -i '' 's|<application|<application android:networkSecurityConfig="@xml/network_security_config"|' "$ANDROID_MANIFEST"

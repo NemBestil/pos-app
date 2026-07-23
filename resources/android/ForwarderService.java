@@ -122,6 +122,7 @@ public class ForwarderService extends Service {
     // Worldline UDP discovery
     private static final int DISCOVERY_PORT = 8000;
     private static final int DISCOVERY_BUFFER_SIZE = 64 * 1024;
+    private static final int DISCOVERY_RESTART_DELAY_MS = 1_000;
     private static final String MULTICAST_LOCK_TAG = "ForwarderServiceDiscovery";
     private static final long HEARTBEAT_INTERVAL_MS = 15_000;
 
@@ -154,10 +155,10 @@ public class ForwarderService extends Service {
     private Thread paymentTerminalThread;
     private Thread discoveryThread;
     private Thread heartbeatThread;
-    private DatagramSocket discoverySocket;
+    private volatile DatagramSocket discoverySocket;
     private WifiManager.MulticastLock multicastLock;
-    private ConnectivityManager.NetworkCallback networkCallback;
-    private Network currentNetwork;
+    private volatile ConnectivityManager.NetworkCallback networkCallback;
+    private volatile Network currentNetwork;
 
     /** True when the device is currently interactive. The forwarder advertises
      *  this on every long-poll handshake so the server can prefer screen-on
@@ -169,6 +170,9 @@ public class ForwarderService extends Service {
     private final Object lanPrintLongPollLock = new Object();
     private final Object bluetoothPrintLongPollLock = new Object();
     private final Object paymentTerminalLongPollLock = new Object();
+    private final Object paymentTerminalSignal = new Object();
+    private final Object discoveryThreadLock = new Object();
+    private final Object networkCallbackLock = new Object();
     private volatile HttpURLConnection currentLanPrintLongPoll;
     private volatile HttpURLConnection currentBluetoothPrintLongPoll;
     private volatile HttpURLConnection currentPaymentTerminalLongPoll;
@@ -189,8 +193,10 @@ public class ForwarderService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? ACTION_START : intent.getAction();
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         if (ACTION_STOP.equals(action)) {
             Log.i(TAG, "Stop requested");
+            prefs.edit().remove(PREFS_BASE_URL).remove(PREFS_TOKEN).apply();
             stopForwarder();
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -211,7 +217,6 @@ public class ForwarderService extends Service {
 
         // When Android restarts the service on its own (START_STICKY with null
         // intent), the extras are gone — fall back to the last-known values.
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         if (requestedBaseUrl == null || requestedBaseUrl.isEmpty()) {
             requestedBaseUrl = prefs.getString(PREFS_BASE_URL, null);
         }
@@ -231,7 +236,10 @@ public class ForwarderService extends Service {
         baseUrl = stripTrailingSlash(requestedBaseUrl);
         authToken = requestedToken;
         activeBaseUrl.set(baseUrl);
-        prefs.edit().putString(PREFS_BASE_URL, baseUrl).putString(PREFS_TOKEN, authToken).apply();
+        prefs.edit()
+            .putString(PREFS_BASE_URL, baseUrl)
+            .putString(PREFS_TOKEN, authToken)
+            .apply();
         // Fresh credentials — let the loops trust the server again.
         tokenInvalidated.set(false);
 
@@ -307,7 +315,7 @@ public class ForwarderService extends Service {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             );
         } else {
             startForeground(NOTIFICATION_ID, notification);
@@ -326,6 +334,7 @@ public class ForwarderService extends Service {
         interruptLanPrintLongPoll();
         interruptBluetoothPrintLongPoll();
         interruptPaymentTerminalLongPoll();
+        signalPaymentTerminalLoop();
         unregisterScreenStateReceiver();
         stopDiscoveryListener();
         Thread lan = lanPrintThread;
@@ -348,7 +357,8 @@ public class ForwarderService extends Service {
         if (heartbeat != null) {
             heartbeat.interrupt();
         }
-        // The stored credentials stay so that an automatic restart can recover.
+        // Unexpected shutdowns keep the stored credentials so Android can
+        // restore the service. An explicit stop removes them before this runs.
     }
 
     private void interruptLanPrintLongPoll() {
@@ -942,30 +952,49 @@ public class ForwarderService extends Service {
     private void runPaymentTerminalLoop() {
         while (running.get()) {
             try {
-                List<String> terminalIds = getReachableTerminalIds();
-                if (terminalIds.isEmpty()) {
-                    sleepQuietly(LAN_PRINTERS_REFRESH_MS);
+                List<DiscoveredTerminal> terminals = getDiscoveredTerminals();
+                if (currentNetwork == null || terminals.isEmpty()) {
+                    waitForPaymentTerminalSignal(LAN_PRINTERS_REFRESH_MS);
                     continue;
                 }
 
-                boolean ok = longPollPaymentTerminalRequest(terminalIds);
+                boolean ok = longPollPaymentTerminalRequest(terminals);
                 if (!ok) {
-                    sleepQuietly(RETRY_AFTER_ERROR_MS);
+                    waitForPaymentTerminalSignal(RETRY_AFTER_ERROR_MS);
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "payment terminal loop iteration failed", t);
-                sleepQuietly(RETRY_AFTER_ERROR_MS);
+                waitForPaymentTerminalSignal(RETRY_AFTER_ERROR_MS);
             }
         }
         Log.i(TAG, "Payment terminal loop exited");
     }
 
-    private boolean longPollPaymentTerminalRequest(List<String> terminalIds) {
+    private void waitForPaymentTerminalSignal(long timeoutMs) {
+        synchronized (paymentTerminalSignal) {
+            if (!running.get()) {
+                return;
+            }
+            try {
+                paymentTerminalSignal.wait(timeoutMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void signalPaymentTerminalLoop() {
+        synchronized (paymentTerminalSignal) {
+            paymentTerminalSignal.notifyAll();
+        }
+    }
+
+    private boolean longPollPaymentTerminalRequest(List<DiscoveredTerminal> terminals) {
         HttpURLConnection conn = null;
         try {
             JSONArray arr = new JSONArray();
-            for (String id : terminalIds) {
-                arr.put(id);
+            for (DiscoveredTerminal terminal : terminals) {
+                arr.put(terminal.terminalId);
             }
             JSONObject body = new JSONObject();
             body.put("forwarderId", forwarderId);
@@ -975,6 +1004,12 @@ public class ForwarderService extends Service {
             final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward");
             conn = (HttpURLConnection) url.openConnection();
+            synchronized (paymentTerminalLongPollLock) {
+                if (currentNetwork == null) {
+                    return false;
+                }
+                currentPaymentTerminalLongPoll = conn;
+            }
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
             conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
@@ -986,10 +1021,6 @@ public class ForwarderService extends Service {
             byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
             try (OutputStream out = conn.getOutputStream()) {
                 out.write(payload);
-            }
-
-            synchronized (paymentTerminalLongPollLock) {
-                currentPaymentTerminalLongPoll = conn;
             }
 
             int status = conn.getResponseCode();
@@ -1031,26 +1062,44 @@ public class ForwarderService extends Service {
         try {
             JSONObject job = new JSONObject(data);
             String jobId = job.optString("jobId", "");
-            String url = job.optString("url", null);
+            String paymentTerminalId = job.optString("paymentTerminalId", "");
+            String forwardedUrl = job.optString("url", null);
             String method = job.optString("method", "POST");
             int timeoutMs = job.optInt("timeoutMs", TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS);
             JSONObject headers = job.optJSONObject("headers");
             String requestBody = job.isNull("body") ? null : job.optString("body", null);
-            if (url == null) {
+            if (paymentTerminalId.isEmpty()) {
+                postTerminalError(jobId, "Forwarded terminal request missing paymentTerminalId.");
+                return;
+            }
+            if (forwardedUrl == null) {
                 postTerminalError(jobId, "Forwarded terminal request missing url.");
+                return;
+            }
+            URL parsedForwardedUrl = new URL(forwardedUrl);
+            String path = parsedForwardedUrl.getFile();
+            if (path == null || !path.startsWith("/") || path.startsWith("//")) {
+                postTerminalError(jobId, "Forwarded terminal request url has an invalid path.");
                 return;
             }
             // Run the actual terminal call in its own thread so the long-poll
             // can close right away and the next job can come in without waiting on
             // the (possibly multi-minute) terminal interaction.
             final String finalJobId = jobId;
-            final String finalUrl = url;
+            final String finalPaymentTerminalId = paymentTerminalId;
+            final String finalPath = path;
             final String finalMethod = method;
             final int finalTimeoutMs = timeoutMs;
             final JSONObject finalHeaders = headers;
             final String finalBody = requestBody;
             Thread worker = new Thread(() -> dispatchTerminalRequest(
-                finalJobId, finalUrl, finalMethod, finalHeaders, finalBody, finalTimeoutMs
+                finalJobId,
+                finalPaymentTerminalId,
+                finalPath,
+                finalMethod,
+                finalHeaders,
+                finalBody,
+                finalTimeoutMs
             ), "ForwarderTerminalJob-" + jobId);
             worker.setDaemon(true);
             worker.start();
@@ -1061,16 +1110,32 @@ public class ForwarderService extends Service {
 
     private void dispatchTerminalRequest(
         String jobId,
-        String url,
+        String paymentTerminalId,
+        String path,
         String method,
         JSONObject headers,
         String body,
         int timeoutMs
     ) {
-        Log.i(TAG, "dispatch terminal request jobId=" + jobId + " " + method + " " + url);
         HttpURLConnection conn = null;
         try {
-            conn = (HttpURLConnection) new URL(url).openConnection();
+            DiscoveredTerminal terminal = discoveredTerminals.get(paymentTerminalId);
+            if (terminal == null) {
+                throw new IOException(
+                    "Payment terminal " + paymentTerminalId + " is not discovered on the current Wi-Fi network."
+                );
+            }
+            Network wifiNetwork = currentNetwork;
+            if (wifiNetwork == null) {
+                throw new IOException("The terminal Wi-Fi network is not available.");
+            }
+            URL url = new URL("http", terminal.ipAddress, terminal.port, path);
+            Log.i(
+                TAG,
+                "dispatch terminal request jobId=" + jobId + " terminal=" + paymentTerminalId
+                    + " " + method + " " + url
+            );
+            conn = (HttpURLConnection) wifiNetwork.openConnection(url);
             conn.setRequestMethod(method);
             conn.setConnectTimeout(5_000);
             conn.setReadTimeout(Math.max(timeoutMs, TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS));
@@ -1187,6 +1252,11 @@ public class ForwarderService extends Service {
     private void runHeartbeatLoop() {
         while (running.get()) {
             try {
+                if (networkCallback == null) {
+                    registerNetworkCallback();
+                }
+                acquireMulticastLock();
+                startDiscoveryThreadIfNeeded();
                 postDiscoveryHeartbeat();
             } catch (Throwable t) {
                 Log.w(TAG, "heartbeat iteration failed", t);
@@ -1208,6 +1278,7 @@ public class ForwarderService extends Service {
                 JSONObject obj = new JSONObject();
                 obj.put("terminalId", terminal.terminalId);
                 obj.put("ipAddress", terminal.ipAddress);
+                obj.put("port", terminal.port);
                 obj.put("lastSeenAt", formatIsoUtc(terminal.lastSeenAtMs));
                 arr.put(obj);
             }
@@ -1507,28 +1578,11 @@ public class ForwarderService extends Service {
         return discoveredTerminals.size();
     }
 
-    /** Snapshot of every terminal ever announced while the service has been running. */
+    /** Snapshot of terminals announced on the current Wi-Fi network. */
     public static List<DiscoveredTerminal> getDiscoveredTerminals() {
         List<DiscoveredTerminal> snapshot = new ArrayList<>(discoveredTerminals.values());
         snapshot.sort(Comparator.comparing(t -> t.terminalId));
         return snapshot;
-    }
-
-    /**
-     * Terminals this tablet has seen at least once while attached to the
-     * current network. Deliberately not time-filtered: Android throttles
-     * Wi-Fi multicast on lock screen / in Doze, so UDP heartbeats stop arriving
-     * even though the terminal is still happily on the LAN. Being optimistic
-     * here lets the cashier keep paying — if the terminal really is gone, the
-     * HTTP call to it will surface the failure. The {@code networkChanged}
-     * callback below resets this set whenever we actually move networks.
-     */
-    public List<String> getReachableTerminalIds() {
-        List<String> ids = new ArrayList<>();
-        for (DiscoveredTerminal terminal : discoveredTerminals.values()) {
-            ids.add(terminal.terminalId);
-        }
-        return ids;
     }
 
     private void startDiscoveryListener() {
@@ -1538,9 +1592,7 @@ public class ForwarderService extends Service {
         discoveredTerminals.clear();
         acquireMulticastLock();
         registerNetworkCallback();
-        discoveryThread = new Thread(this::runDiscoveryListener, "ForwarderDiscovery");
-        discoveryThread.setDaemon(true);
-        discoveryThread.start();
+        startDiscoveryThreadIfNeeded();
     }
 
     private void stopDiscoveryListener() {
@@ -1552,48 +1604,111 @@ public class ForwarderService extends Service {
         if (s != null && !s.isClosed()) {
             s.close();
         }
-        Thread t = discoveryThread;
-        discoveryThread = null;
+        Thread t;
+        synchronized (discoveryThreadLock) {
+            t = discoveryThread;
+            discoveryThread = null;
+        }
         if (t != null) {
             t.interrupt();
         }
         unregisterNetworkCallback();
         releaseMulticastLock();
         discoveredTerminals.clear();
+        signalPaymentTerminalLoop();
+    }
+
+    private void startDiscoveryThreadIfNeeded() {
+        synchronized (discoveryThreadLock) {
+            Thread current = discoveryThread;
+            if (!discoveryRunning.get() || (current != null && current.isAlive())) {
+                return;
+            }
+            Thread next = new Thread(this::runDiscoveryListener, "ForwarderDiscovery");
+            next.setDaemon(true);
+            discoveryThread = next;
+            next.start();
+        }
+    }
+
+    private void resetDiscoveryForNetworkChange(String reason) {
+        Log.i(TAG, reason + "; resetting terminal discovery");
+        discoveredTerminals.clear();
+        interruptPaymentTerminalLongPoll();
+        signalPaymentTerminalLoop();
+        restartDiscoveryTransport();
+    }
+
+    private void restartDiscoveryTransport() {
+        releaseMulticastLock();
+        acquireMulticastLock();
+        DatagramSocket socket = discoverySocket;
+        if (socket != null && !socket.isClosed()) {
+            socket.close();
+        }
+        startDiscoveryThreadIfNeeded();
     }
 
     private void registerNetworkCallback() {
-        try {
-            ConnectivityManager cm =
-                (ConnectivityManager) getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) {
+        synchronized (networkCallbackLock) {
+            if (!discoveryRunning.get() || networkCallback != null) {
                 return;
             }
-            NetworkRequest request = new NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build();
-            networkCallback = new ConnectivityManager.NetworkCallback() {
-                @Override
-                public void onAvailable(Network network) {
-                    Network previous = currentNetwork;
-                    currentNetwork = network;
-                    if (previous != null && !previous.equals(network)) {
-                        Log.i(TAG, "Active network changed; resetting discovered terminals");
-                        discoveredTerminals.clear();
-                    }
+            try {
+                ConnectivityManager cm =
+                    (ConnectivityManager) getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm == null) {
+                    return;
                 }
+                NetworkRequest request = new NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .build();
+                ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {
+                    @Override
+                    public void onAvailable(Network network) {
+                        Network previous = currentNetwork;
+                        currentNetwork = network;
+                        if (previous == null) {
+                            resetDiscoveryForNetworkChange("Wi-Fi network became available");
+                        } else if (!previous.equals(network)) {
+                            resetDiscoveryForNetworkChange("Wi-Fi network changed");
+                        }
+                    }
 
-                @Override
-                public void onLost(Network network) {
-                    if (network.equals(currentNetwork)) {
-                        currentNetwork = null;
+                    @Override
+                    public void onLost(Network network) {
+                        if (network.equals(currentNetwork)) {
+                            currentNetwork = null;
+                            resetDiscoveryForNetworkChange("Wi-Fi network was lost");
+                        }
                     }
-                }
-            };
-            cm.registerNetworkCallback(request, networkCallback);
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to register network callback", e);
+                };
+                cm.registerNetworkCallback(request, callback);
+                networkCallback = callback;
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to register network callback", e);
+                networkCallback = null;
+            }
+        }
+    }
+
+    private void unregisterNetworkCallback() {
+        synchronized (networkCallbackLock) {
+            ConnectivityManager.NetworkCallback callback = networkCallback;
             networkCallback = null;
+            currentNetwork = null;
+            if (callback == null) {
+                return;
+            }
+            try {
+                ConnectivityManager cm =
+                    (ConnectivityManager) getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    cm.unregisterNetworkCallback(callback);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to unregister network callback", e);
+            }
         }
     }
 
@@ -1655,26 +1770,11 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void unregisterNetworkCallback() {
-        ConnectivityManager.NetworkCallback cb = networkCallback;
-        networkCallback = null;
-        currentNetwork = null;
-        if (cb == null) {
-            return;
-        }
+    private synchronized void acquireMulticastLock() {
         try {
-            ConnectivityManager cm =
-                (ConnectivityManager) getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm != null) {
-                cm.unregisterNetworkCallback(cb);
+            if (multicastLock != null && multicastLock.isHeld()) {
+                return;
             }
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to unregister network callback", e);
-        }
-    }
-
-    private void acquireMulticastLock() {
-        try {
             WifiManager wifi =
                 (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wifi == null) {
@@ -1688,7 +1788,7 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void releaseMulticastLock() {
+    private synchronized void releaseMulticastLock() {
         if (multicastLock != null) {
             try {
                 if (multicastLock.isHeld()) {
@@ -1702,34 +1802,53 @@ public class ForwarderService extends Service {
 
     private void runDiscoveryListener() {
         try {
-            DatagramSocket s = new DatagramSocket(null);
-            s.setReuseAddress(true);
-            s.setBroadcast(true);
-            s.bind(new InetSocketAddress(DISCOVERY_PORT));
-            discoverySocket = s;
-            Log.i(TAG, "Worldline discovery listening on 0.0.0.0:" + DISCOVERY_PORT);
-
-            byte[] buf = new byte[DISCOVERY_BUFFER_SIZE];
             while (discoveryRunning.get()) {
-                DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                DatagramSocket socket = null;
                 try {
-                    s.receive(packet);
+                    socket = new DatagramSocket(null);
+                    socket.setReuseAddress(true);
+                    socket.setBroadcast(true);
+                    Network wifiNetwork = currentNetwork;
+                    if (wifiNetwork != null) {
+                        wifiNetwork.bindSocket(socket);
+                    }
+                    socket.bind(new InetSocketAddress(DISCOVERY_PORT));
+                    discoverySocket = socket;
+                    Log.i(
+                        TAG,
+                        "Worldline discovery listening on Wi-Fi at 0.0.0.0:" + DISCOVERY_PORT
+                    );
+
+                    byte[] buffer = new byte[DISCOVERY_BUFFER_SIZE];
+                    while (discoveryRunning.get() && !socket.isClosed()) {
+                        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                        socket.receive(packet);
+                        handleDiscoveryPacket(packet.getData(), packet.getLength());
+                    }
                 } catch (Exception e) {
                     if (!discoveryRunning.get()) {
                         return;
                     }
-                    Log.w(TAG, "UDP receive failed", e);
-                    continue;
+                    Log.w(TAG, "Worldline discovery transport failed; restarting", e);
+                } finally {
+                    if (discoverySocket == socket) {
+                        discoverySocket = null;
+                    }
+                    if (socket != null && !socket.isClosed()) {
+                        socket.close();
+                    }
                 }
-                handleDiscoveryPacket(packet.getData(), packet.getLength());
+                if (discoveryRunning.get()) {
+                    sleepQuietly(DISCOVERY_RESTART_DELAY_MS);
+                }
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             Log.e(TAG, "Discovery listener crashed", e);
         } finally {
-            DatagramSocket s = discoverySocket;
-            discoverySocket = null;
-            if (s != null && !s.isClosed()) {
-                s.close();
+            synchronized (discoveryThreadLock) {
+                if (discoveryThread == Thread.currentThread()) {
+                    discoveryThread = null;
+                }
             }
         }
     }
@@ -1739,11 +1858,21 @@ public class ForwarderService extends Service {
         if (terminal == null) {
             return;
         }
-        boolean isNew = !discoveredTerminals.containsKey(terminal.terminalId);
+        DiscoveredTerminal previous = discoveredTerminals.get(terminal.terminalId);
+        boolean isNew = previous == null;
+        boolean endpointChanged = previous != null
+            && (!previous.ipAddress.equals(terminal.ipAddress) || previous.port != terminal.port);
         discoveredTerminals.put(terminal.terminalId, terminal);
         if (isNew) {
             Log.i(TAG, "Discovered Worldline terminal: "
-                + terminal.terminalId + " (" + terminal.ipAddress + ")");
+                + terminal.terminalId + " (" + terminal.ipAddress + ":" + terminal.port + ")");
+        } else if (endpointChanged) {
+            Log.i(TAG, "Worldline terminal endpoint changed: "
+                + terminal.terminalId + " (" + previous.ipAddress + ":" + previous.port
+                + " -> " + terminal.ipAddress + ":" + terminal.port + ")");
+        }
+        if (isNew || endpointChanged) {
+            signalPaymentTerminalLoop();
         }
         for (DiscoveryListener listener : discoveryListeners) {
             try {
@@ -1820,6 +1949,25 @@ public class ForwarderService extends Service {
     // ========================================================================
 
     public static void requestStart(Context context, String baseUrl, String token) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(PREFS_BASE_URL, stripTrailingSlash(baseUrl))
+            .putString(PREFS_TOKEN, token)
+            .apply();
+        startService(context, baseUrl, token);
+    }
+
+    public static void requestStartIfConfigured(Context context) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String baseUrl = prefs.getString(PREFS_BASE_URL, null);
+        String token = prefs.getString(PREFS_TOKEN, null);
+        if (baseUrl == null || baseUrl.isEmpty() || token == null || token.isEmpty()) {
+            return;
+        }
+        startService(context, baseUrl, token);
+    }
+
+    private static void startService(Context context, String baseUrl, String token) {
         Intent intent = new Intent(context, ForwarderService.class);
         intent.setAction(ACTION_START);
         intent.putExtra(EXTRA_BASE_URL, baseUrl);
@@ -1832,6 +1980,11 @@ public class ForwarderService extends Service {
     }
 
     public static void requestStop(Context context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .remove(PREFS_BASE_URL)
+            .remove(PREFS_TOKEN)
+            .apply();
         Intent intent = new Intent(context, ForwarderService.class);
         intent.setAction(ACTION_STOP);
         try {

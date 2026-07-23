@@ -1,37 +1,24 @@
 package com.nembestil.pos3.app;
 
-import android.Manifest;
 import android.content.Context;
-import android.os.Build;
 
 import com.getcapacitor.JSObject;
-import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
-import com.getcapacitor.annotation.Permission;
-import com.getcapacitor.annotation.PermissionCallback;
 
 /**
  * Thin Capacitor bridge for {@link ForwarderService}. The webview only ever
  * needs to ask "turn it on/off" and "what's the state" — everything else lives
  * in the service itself.
  *
- * The foreground service can't post its persistent notification without the
- * POST_NOTIFICATIONS permission (Android 13+), so {@link #start} requests it and
- * only brings the service up once it's granted. If the user declines, we resolve
- * with running=false so the webview toggle stays inactive.
+ * Android does not require POST_NOTIFICATIONS permission to start a foreground
+ * service. The service therefore starts independently of notification-drawer
+ * visibility and remains visible in Android's active-apps UI.
  */
-@CapacitorPlugin(
-    name = "ForwarderService",
-    permissions = {
-        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS })
-    }
-)
+@CapacitorPlugin(name = "ForwarderService")
 public class ForwarderServicePlugin extends Plugin {
-
-    private static final String NOTIFICATIONS_ALIAS = "notifications";
 
     // Forwarded to the WebView so it can drop its own copy of the (now dead)
     // token and re-mint after the next login.
@@ -59,25 +46,6 @@ public class ForwarderServicePlugin extends Plugin {
         }
         if (token == null || token.isEmpty()) {
             call.reject("Missing token");
-            return;
-        }
-        // POST_NOTIFICATIONS only exists (and is only enforced) from Android 13.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-            && getPermissionState(NOTIFICATIONS_ALIAS) != PermissionState.GRANTED) {
-            requestPermissionForAlias(NOTIFICATIONS_ALIAS, call, "startPermissionCallback");
-            return;
-        }
-        startForwarder(call);
-    }
-
-    @PermissionCallback
-    private void startPermissionCallback(PluginCall call) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-            && getPermissionState(NOTIFICATIONS_ALIAS) != PermissionState.GRANTED) {
-            // Declined: leave the forwarder off so the toggle stays inactive.
-            JSObject ret = new JSObject();
-            ret.put("running", false);
-            call.resolve(ret);
             return;
         }
         startForwarder(call);
@@ -134,15 +102,16 @@ public class ForwarderServicePlugin extends Plugin {
     }
 
     /**
-     * Lets the webview decide whether to show its "why we need notifications"
-     * explainer before triggering the system prompt via {@link #start}.
+     * Kept for hosted frontend versions that still treat notification
+     * permission as a foreground-service prerequisite. Modern Android does not
+     * require that permission to start the service, so compatibility clients
+     * should proceed as though the prerequisite is satisfied.
      */
     @PluginMethod
     public void checkNotificationPermission(PluginCall call) {
-        boolean granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
-            || getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED;
         JSObject ret = new JSObject();
-        ret.put("granted", granted);
+        ret.put("granted", true);
         call.resolve(ret);
     }
+
 }
