@@ -5,7 +5,9 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
 import android.content.Context;
+import android.content.Intent;
 import android.os.Build;
+import android.provider.Settings;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PermissionState;
@@ -45,6 +47,12 @@ public class BluetoothPrinterPlugin extends Plugin {
             return;
         }
         resolveBondedPrinters(call);
+    }
+
+    @PluginMethod
+    public void openSettings(PluginCall call) {
+        getActivity().startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
+        call.resolve();
     }
 
     @PermissionCallback

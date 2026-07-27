@@ -238,6 +238,21 @@ for densdir in "$RESOURCES_DIR/drawable"/drawable-*; do
     done
 done
 
+# Regenerate launcher icons and splash screens from resources/icon.png. `npx cap
+# sync` restores the stock Capacitor icons, so this has to re-run afterwards. The
+# source checksum is stamped inside android/ (which is ephemeral) so the ~10s
+# generation only happens when the tree was regenerated or icon.png changed.
+ICON_SOURCE="$ROOT/resources/icon.png"
+ICON_STAMP="$ANDROID_RES_DIR/.icon-source-hash"
+if [ -f "$ICON_SOURCE" ]; then
+    icon_hash="$(shasum -a 256 "$ICON_SOURCE" | cut -d' ' -f1)"
+    if [ ! -f "$ICON_STAMP" ] || [ "$(cat "$ICON_STAMP")" != "$icon_hash" ]; then
+        echo "🎨 Generating launcher icons and splash screens from resources/icon.png"
+        (cd "$ROOT" && npm run --silent assets:generate)
+        echo "$icon_hash" > "$ICON_STAMP"
+    fi
+fi
+
 # Allow cleartext HTTP for native and CapacitorHttp LAN-device connections.
 # Idempotent: only inserted if the attribute is missing.
 if [ -f "$ANDROID_MANIFEST" ] && ! grep -q "networkSecurityConfig" "$ANDROID_MANIFEST"; then
