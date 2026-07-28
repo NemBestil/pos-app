@@ -21,6 +21,7 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        ForwarderService.setAppFocused(hasFocus);
         if (hasFocus) {
             AndroidFullscreenPlugin.applyCurrentState(this);
         }

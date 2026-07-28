@@ -21,12 +21,16 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.Uri;
 import android.net.wifi.WifiManager;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.text.TextUtils;
 import android.util.Base64;
 import android.util.Log;
 
@@ -50,9 +54,12 @@ import java.net.Socket;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.text.DateFormat;
+import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.Currency;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -71,11 +78,11 @@ import java.util.concurrent.atomic.AtomicReference;
  * Persistent foreground service that owns:
  *   1. The LAN print forwarder long-poll loop (was useAndroidLanPrintForwarder in JS).
  *   2. The payment terminal forwarder long-poll loop (was useAndroidPaymentTerminalForwarder in JS).
+ *   3. The feature-gated takeaway order broadcast long-poll loop.
  *
  * Both loops authenticate against /api/_internal/* using the androidsync
  * Bearer token, so the forwarder keeps working even after the WebView signs
- * out. The wire format is SSE-flavoured (text/event-stream) for convenience,
- * but each request is one-shot: the server pushes a single event and closes
+ * out. Each request is one-shot: the server pushes a single event and closes
  * the connection, which is long-polling semantics rather than a real stream.
  *
  * Lifecycle: started/stopped through ForwarderServicePlugin. While alive it
@@ -91,17 +98,25 @@ public class ForwarderService extends Service {
     // It must outlive the ongoing service notification, so it can't share an id.
     private static final String ALERT_CHANNEL_ID = "nembestil_forwarder_alerts";
     private static final int ALERT_NOTIFICATION_ID = 0x4E43;
+    private static final String TAKEAWAY_CHANNEL_ID = "nembestil_takeaway_orders";
+    private static final int TAKEAWAY_NOTIFICATION_ID_BASE = 0x540000;
+    public static final String EXTRA_OPEN_TAKEAWAY_ORDERS = "openTakeawayOrders";
+    public static final String EXTRA_TAKEAWAY_ORDER_ID = "takeawayOrderId";
 
     public static final String ACTION_START = "com.nembestil.pos3.app.action.START_FORWARDER";
     public static final String ACTION_STOP = "com.nembestil.pos3.app.action.STOP_FORWARDER";
     public static final String ACTION_NOTIFY_CONFIG_CHANGED =
         "com.nembestil.pos3.app.action.NOTIFY_FORWARDER_CONFIG_CHANGED";
+    public static final String ACTION_UPDATE_TAKEAWAY_STATE =
+        "com.nembestil.pos3.app.action.UPDATE_TAKEAWAY_STATE";
     public static final String EXTRA_BASE_URL = "baseUrl";
     public static final String EXTRA_TOKEN = "token";
+    public static final String EXTRA_TAKEAWAY_ENABLED = "takeawayEnabled";
 
     private static final String PREFS_NAME = "forwarder_service_prefs";
     private static final String PREFS_BASE_URL = "baseUrl";
     private static final String PREFS_TOKEN = "token";
+    private static final String PREFS_TAKEAWAY_ENABLED = "takeawayEnabled";
 
     private static final int LAN_PRINTER_PORT = 9100;
     private static final int LAN_PING_TIMEOUT_MS = 1_500;
@@ -128,6 +143,7 @@ public class ForwarderService extends Service {
 
     private static final AtomicBoolean running = new AtomicBoolean(false);
     private static final AtomicReference<String> activeBaseUrl = new AtomicReference<>(null);
+    private static final AtomicBoolean appFocused = new AtomicBoolean(false);
 
     // Discovery state lives in static fields so the Capacitor plugin (running
     // in the same process) can subscribe and query without holding a reference
@@ -139,6 +155,8 @@ public class ForwarderService extends Service {
     // Listeners (the Capacitor plugin) that want to know when the server rejected
     // our token, so the WebView can drop its own copy and re-mint after login.
     private static final CopyOnWriteArrayList<TokenListener> tokenListeners = new CopyOnWriteArrayList<>();
+    private static final CopyOnWriteArrayList<TakeawayOrderListener> takeawayOrderListeners =
+        new CopyOnWriteArrayList<>();
 
     private final String forwarderId = UUID.randomUUID().toString();
     private final AtomicBoolean lanPrintersDirty = new AtomicBoolean(true);
@@ -146,6 +164,7 @@ public class ForwarderService extends Service {
     // Latches the first time the server rejects our token (401) so only one loop
     // tears things down; cleared again whenever fresh credentials arrive.
     private final AtomicBoolean tokenInvalidated = new AtomicBoolean(false);
+    private final AtomicBoolean takeawayEnabled = new AtomicBoolean(false);
 
     private volatile String baseUrl;
     private volatile String authToken;
@@ -155,6 +174,7 @@ public class ForwarderService extends Service {
     private Thread paymentTerminalThread;
     private Thread discoveryThread;
     private Thread heartbeatThread;
+    private Thread takeawayOrderThread;
     private volatile DatagramSocket discoverySocket;
     private WifiManager.MulticastLock multicastLock;
     private volatile ConnectivityManager.NetworkCallback networkCallback;
@@ -171,11 +191,16 @@ public class ForwarderService extends Service {
     private final Object bluetoothPrintLongPollLock = new Object();
     private final Object paymentTerminalLongPollLock = new Object();
     private final Object paymentTerminalSignal = new Object();
+    private final Object takeawayOrderLongPollLock = new Object();
+    private final Object takeawayOrderSignal = new Object();
     private final Object discoveryThreadLock = new Object();
     private final Object networkCallbackLock = new Object();
     private volatile HttpURLConnection currentLanPrintLongPoll;
     private volatile HttpURLConnection currentBluetoothPrintLongPoll;
     private volatile HttpURLConnection currentPaymentTerminalLongPoll;
+    private volatile HttpURLConnection currentTakeawayOrderLongPoll;
+    private volatile String takeawayOrderCursor;
+    private final String takeawayOrderStartedAt = formatIsoUtc(System.currentTimeMillis());
 
     public static boolean isRunning() {
         return running.get();
@@ -212,6 +237,18 @@ public class ForwarderService extends Service {
             return START_STICKY;
         }
 
+        if (ACTION_UPDATE_TAKEAWAY_STATE.equals(action)) {
+            boolean enabled = intent != null && intent.getBooleanExtra(EXTRA_TAKEAWAY_ENABLED, false);
+            takeawayEnabled.set(enabled);
+            prefs.edit().putBoolean(PREFS_TAKEAWAY_ENABLED, enabled).apply();
+            if (enabled) {
+                signalTakeawayOrderLoop();
+            } else {
+                interruptTakeawayOrderLongPoll();
+            }
+            return running.get() ? START_STICKY : START_NOT_STICKY;
+        }
+
         String requestedBaseUrl = intent != null ? intent.getStringExtra(EXTRA_BASE_URL) : null;
         String requestedToken = intent != null ? intent.getStringExtra(EXTRA_TOKEN) : null;
 
@@ -235,6 +272,7 @@ public class ForwarderService extends Service {
 
         baseUrl = stripTrailingSlash(requestedBaseUrl);
         authToken = requestedToken;
+        takeawayEnabled.set(prefs.getBoolean(PREFS_TAKEAWAY_ENABLED, false));
         activeBaseUrl.set(baseUrl);
         prefs.edit()
             .putString(PREFS_BASE_URL, baseUrl)
@@ -253,12 +291,14 @@ public class ForwarderService extends Service {
             startBluetoothPrintLoop();
             startPaymentTerminalLoop();
             startHeartbeatLoop();
+            startTakeawayOrderLoop();
         } else {
             Log.i(TAG, "Forwarder already running; credentials refreshed");
             // Reset the open long-poll connections so they reconnect with the new token.
             interruptLanPrintLongPoll();
             interruptBluetoothPrintLongPoll();
             interruptPaymentTerminalLongPoll();
+            interruptTakeawayOrderLongPoll();
         }
         return START_STICKY;
     }
@@ -292,10 +332,7 @@ public class ForwarderService extends Service {
         PendingIntent contentIntent = null;
         if (launchIntent != null) {
             launchIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                flags |= PendingIntent.FLAG_IMMUTABLE;
-            }
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
             contentIntent = PendingIntent.getActivity(this, 0, launchIntent, flags);
         }
 
@@ -334,17 +371,21 @@ public class ForwarderService extends Service {
         interruptLanPrintLongPoll();
         interruptBluetoothPrintLongPoll();
         interruptPaymentTerminalLongPoll();
+        interruptTakeawayOrderLongPoll();
         signalPaymentTerminalLoop();
+        signalTakeawayOrderLoop();
         unregisterScreenStateReceiver();
         stopDiscoveryListener();
         Thread lan = lanPrintThread;
         Thread bluetooth = bluetoothPrintThread;
         Thread pay = paymentTerminalThread;
         Thread heartbeat = heartbeatThread;
+        Thread takeaway = takeawayOrderThread;
         lanPrintThread = null;
         bluetoothPrintThread = null;
         paymentTerminalThread = null;
         heartbeatThread = null;
+        takeawayOrderThread = null;
         if (lan != null) {
             lan.interrupt();
         }
@@ -356,6 +397,9 @@ public class ForwarderService extends Service {
         }
         if (heartbeat != null) {
             heartbeat.interrupt();
+        }
+        if (takeaway != null) {
+            takeaway.interrupt();
         }
         // Unexpected shutdowns keep the stored credentials so Android can
         // restore the service. An explicit stop removes them before this runs.
@@ -391,6 +435,19 @@ public class ForwarderService extends Service {
         synchronized (paymentTerminalLongPollLock) {
             HttpURLConnection conn = currentPaymentTerminalLongPoll;
             currentPaymentTerminalLongPoll = null;
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void interruptTakeawayOrderLongPoll() {
+        synchronized (takeawayOrderLongPollLock) {
+            HttpURLConnection conn = currentTakeawayOrderLongPoll;
+            currentTakeawayOrderLongPoll = null;
             if (conn != null) {
                 try {
                     conn.disconnect();
@@ -1318,6 +1375,352 @@ public class ForwarderService extends Service {
     }
 
     // ========================================================================
+    // Takeaway order long-poll loop
+    // ========================================================================
+
+    private void startTakeawayOrderLoop() {
+        takeawayOrderThread = new Thread(this::runTakeawayOrderLoop, "ForwarderTakeawayOrders");
+        takeawayOrderThread.setDaemon(true);
+        takeawayOrderThread.start();
+    }
+
+    private void runTakeawayOrderLoop() {
+        while (running.get()) {
+            if (!takeawayEnabled.get()) {
+                waitForTakeawayOrderSignal();
+                continue;
+            }
+
+            try {
+                if (!longPollTakeawayOrder()) {
+                    sleepQuietly(RETRY_AFTER_ERROR_MS);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Takeaway order loop iteration failed", t);
+                sleepQuietly(RETRY_AFTER_ERROR_MS);
+            }
+        }
+        Log.i(TAG, "Takeaway order loop exited");
+    }
+
+    private void waitForTakeawayOrderSignal() {
+        synchronized (takeawayOrderSignal) {
+            if (!running.get() || takeawayEnabled.get()) {
+                return;
+            }
+            try {
+                takeawayOrderSignal.wait();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void signalTakeawayOrderLoop() {
+        synchronized (takeawayOrderSignal) {
+            takeawayOrderSignal.notifyAll();
+        }
+    }
+
+    private boolean longPollTakeawayOrder() {
+        HttpURLConnection conn = null;
+        try {
+            JSONObject body = new JSONObject();
+            String cursor = takeawayOrderCursor;
+            if (cursor != null && !cursor.isEmpty()) {
+                body.put("cursor", cursor);
+            } else {
+                body.put("startedAt", takeawayOrderStartedAt);
+            }
+
+            final String usedToken = authToken;
+            URL url = new URL(baseUrl + "/api/_internal/takeaway-orders");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Accept", "application/json");
+            applyCookies(conn);
+
+            synchronized (takeawayOrderLongPollLock) {
+                currentTakeawayOrderLongPoll = conn;
+            }
+
+            try (OutputStream out = conn.getOutputStream()) {
+                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+            int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return false;
+            }
+            if (status < 200 || status >= 300) {
+                Log.w(TAG, "takeaway-orders HTTP " + status);
+                return false;
+            }
+
+            JSONObject response = new JSONObject(readAll(conn.getInputStream()));
+            String responseCursor = response.optString("cursor", "");
+            if (!responseCursor.isEmpty()) {
+                takeawayOrderCursor = responseCursor;
+            }
+
+            JSONObject event = response.optJSONObject("event");
+            if (event != null) {
+                handleTakeawayOrderEvent(event);
+            }
+            return true;
+        } catch (Exception e) {
+            if (running.get() && takeawayEnabled.get()) {
+                Log.w(TAG, "Takeaway order long poll failed", e);
+            }
+            return false;
+        } finally {
+            synchronized (takeawayOrderLongPollLock) {
+                if (currentTakeawayOrderLongPoll == conn) {
+                    currentTakeawayOrderLongPoll = null;
+                }
+            }
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void handleTakeawayOrderEvent(JSONObject event) {
+        if (!"created".equals(event.optString("type", ""))) {
+            JSONObject updatedOrder = event.optJSONObject("order");
+            if (updatedOrder != null) {
+                cancelTakeawayOrderNotification(updatedOrder.optString("id", ""));
+            }
+            notifyTakeawayOrder(event);
+            return;
+        }
+
+        JSONObject order = event.optJSONObject("order");
+        if (order == null) {
+            return;
+        }
+
+        boolean showAndroidNotification = shouldShowAndroidTakeawayNotification();
+        try {
+            event.put("notificationMode", showAndroidNotification ? "android" : "web");
+        } catch (Exception e) {
+            Log.w(TAG, "Could not attach takeaway notification mode", e);
+        }
+        notifyTakeawayOrder(event);
+
+        if (showAndroidNotification) {
+            showTakeawayOrderNotification(
+                order,
+                event.optString("notificationActionToken", "")
+            );
+        } else {
+            playTakeawayNotificationSound();
+        }
+    }
+
+    private boolean shouldShowAndroidTakeawayNotification() {
+        return !screenOn.get() || !appFocused.get();
+    }
+
+    private void playTakeawayNotificationSound() {
+        try {
+            Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+            Ringtone ringtone = RingtoneManager.getRingtone(getApplicationContext(), sound);
+            if (ringtone != null) {
+                ringtone.play();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not play takeaway notification sound", e);
+        }
+    }
+
+    private void showTakeawayOrderNotification(JSONObject order, String notificationActionToken) {
+        NotificationManager manager =
+            (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+
+        Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                TAKEAWAY_CHANNEL_ID,
+                "Takeaway orders",
+                NotificationManager.IMPORTANCE_HIGH
+            );
+            channel.setDescription("New takeaway orders received by NemBestil POS.");
+            channel.enableVibration(true);
+            channel.setSound(sound, null);
+            manager.createNotificationChannel(channel);
+        }
+
+        String orderId = order.optString("id", UUID.randomUUID().toString());
+        String orderNumber = order.optString("orderNumber", "");
+        String title = orderNumber.isEmpty()
+            ? "New takeaway order"
+            : "New takeaway order " + orderNumber;
+        String summary = createTakeawayOrderSummary(order);
+        int notificationId = getTakeawayOrderNotificationId(orderId);
+
+        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        PendingIntent contentIntent = null;
+        if (launchIntent != null) {
+            launchIntent.setFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP
+            );
+            launchIntent.putExtra(EXTRA_OPEN_TAKEAWAY_ORDERS, true);
+            launchIntent.putExtra(EXTRA_TAKEAWAY_ORDER_ID, orderId);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+            contentIntent = PendingIntent.getActivity(this, orderId.hashCode(), launchIntent, flags);
+        }
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, TAKEAWAY_CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(summary)
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(summary))
+            .setSmallIcon(R.drawable.ic_stat_forwarder)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setSound(sound)
+            .setDefaults(Notification.DEFAULT_ALL);
+        if (contentIntent != null) {
+            builder.setContentIntent(contentIntent);
+        }
+
+        if (!notificationActionToken.isEmpty()) {
+            builder.addAction(
+                0,
+                "Accept",
+                createTakeawayOrderActionIntent(
+                    TakeawayNotificationActionReceiver.ACTION_ACCEPT,
+                    orderId,
+                    notificationActionToken,
+                    notificationId
+                )
+            );
+            builder.addAction(
+                0,
+                "Cancel",
+                createTakeawayOrderActionIntent(
+                    TakeawayNotificationActionReceiver.ACTION_CANCEL,
+                    orderId,
+                    notificationActionToken,
+                    notificationId
+                )
+            );
+        }
+        if (contentIntent != null) {
+            builder.addAction(0, "Show order", contentIntent);
+        }
+
+        manager.notify(notificationId, builder.build());
+    }
+
+    private PendingIntent createTakeawayOrderActionIntent(
+        String action,
+        String orderId,
+        String notificationActionToken,
+        int notificationId
+    ) {
+        Intent intent = new Intent(this, TakeawayNotificationActionReceiver.class);
+        intent.setAction(action);
+        intent.putExtra(TakeawayNotificationActionReceiver.EXTRA_BASE_URL, baseUrl);
+        intent.putExtra(TakeawayNotificationActionReceiver.EXTRA_ORDER_ID, orderId);
+        intent.putExtra(TakeawayNotificationActionReceiver.EXTRA_ACTION_TOKEN, notificationActionToken);
+        intent.putExtra(TakeawayNotificationActionReceiver.EXTRA_NOTIFICATION_ID, notificationId);
+        int requestCode = 31 * orderId.hashCode() + action.hashCode();
+        return PendingIntent.getBroadcast(
+            this,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+    }
+
+    private void cancelTakeawayOrderNotification(String orderId) {
+        if (orderId.isEmpty()) {
+            return;
+        }
+        NotificationManager manager =
+            (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager != null) {
+            manager.cancel(getTakeawayOrderNotificationId(orderId));
+        }
+    }
+
+    private int getTakeawayOrderNotificationId(String orderId) {
+        return TAKEAWAY_NOTIFICATION_ID_BASE + Math.abs(orderId.hashCode() % 10_000);
+    }
+
+    private String createTakeawayOrderSummary(JSONObject order) {
+        JSONObject billing = order.optJSONObject("billing");
+        String customer = billing == null ? "" : billing.optString("name", "");
+        String fulfillment = "delivery".equals(order.optString("deliveryPickupType", ""))
+            ? "Delivery"
+            : "Pickup";
+        String scheduledTime = formatTakeawayScheduledTime(order.optString("scheduledAt", ""));
+        String total = formatTakeawayTotal(order);
+        JSONArray items = order.optJSONArray("items");
+        double itemCount = 0;
+        if (items != null) {
+            for (int index = 0; index < items.length(); index++) {
+                itemCount += items.optJSONObject(index) == null
+                    ? 0
+                    : items.optJSONObject(index).optDouble("quantity", 0);
+            }
+        }
+
+        List<String> details = new ArrayList<>();
+        if (!customer.isEmpty()) {
+            details.add(customer);
+        }
+        details.add(scheduledTime.isEmpty() ? fulfillment : fulfillment + " " + scheduledTime);
+        details.add(NumberFormat.getNumberInstance().format(itemCount) + " items");
+        if (!total.isEmpty()) {
+            details.add(total);
+        }
+        return TextUtils.join(" · ", details);
+    }
+
+    private String formatTakeawayScheduledTime(String timestamp) {
+        if (timestamp.isEmpty()) {
+            return "";
+        }
+        try {
+            SimpleDateFormat parser = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX", Locale.US);
+            Date scheduledAt = parser.parse(timestamp);
+            return scheduledAt == null ? "" : DateFormat.getTimeInstance(DateFormat.SHORT).format(scheduledAt);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private String formatTakeawayTotal(JSONObject order) {
+        String currencyCode = order.optString("currency", "");
+        if (currencyCode.isEmpty()) {
+            return "";
+        }
+        try {
+            NumberFormat formatter = NumberFormat.getCurrencyInstance();
+            formatter.setCurrency(Currency.getInstance(currencyCode));
+            return formatter.format(order.optLong("totalAmount", 0) / 100.0);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    // ========================================================================
     // Long-poll response parsing
     // ========================================================================
     //
@@ -1493,6 +1896,37 @@ public class ForwarderService extends Service {
                 Log.w(TAG, "Token listener threw", e);
             }
         }
+    }
+
+    public interface TakeawayOrderListener {
+        void onTakeawayOrder(JSONObject event);
+    }
+
+    public static void registerTakeawayOrderListener(TakeawayOrderListener listener) {
+        takeawayOrderListeners.addIfAbsent(listener);
+    }
+
+    public static void unregisterTakeawayOrderListener(TakeawayOrderListener listener) {
+        takeawayOrderListeners.remove(listener);
+    }
+
+    private void notifyTakeawayOrder(JSONObject event) {
+        for (TakeawayOrderListener listener : takeawayOrderListeners) {
+            try {
+                listener.onTakeawayOrder(event);
+            } catch (Exception e) {
+                Log.w(TAG, "Takeaway order listener threw", e);
+            }
+        }
+    }
+
+    public static void setAppFocused(boolean focused) {
+        appFocused.set(focused);
+    }
+
+    public static String getConfiguredBaseUrl(Context context) {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREFS_BASE_URL, null);
     }
 
     private static String readAll(InputStream stream) throws Exception {
@@ -2000,6 +2434,27 @@ public class ForwarderService extends Service {
         }
         Intent intent = new Intent(context, ForwarderService.class);
         intent.setAction(ACTION_NOTIFY_CONFIG_CHANGED);
+        try {
+            context.startService(intent);
+        } catch (IllegalStateException ignored) {
+        }
+    }
+
+    public static void requestUpdateTakeawayState(
+        Context context,
+        boolean enabled
+    ) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREFS_TAKEAWAY_ENABLED, enabled)
+            .apply();
+        if (!isRunning()) {
+            return;
+        }
+
+        Intent intent = new Intent(context, ForwarderService.class);
+        intent.setAction(ACTION_UPDATE_TAKEAWAY_STATE);
+        intent.putExtra(EXTRA_TAKEAWAY_ENABLED, enabled);
         try {
             context.startService(intent);
         } catch (IllegalStateException ignored) {

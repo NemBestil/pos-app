@@ -80,6 +80,7 @@ ${REG_LINES}        super.onCreate(savedInstanceState);
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        ForwarderService.setAppFocused(hasFocus);
         if (hasFocus) {
             AndroidFullscreenPlugin.applyCurrentState(this);
         }
@@ -202,6 +203,16 @@ if "ForwarderRestartReceiver" not in text and "</application>" in text:
     text = text.replace("</application>", receiver_xml + "    </application>", 1)
     changed = True
     print("🩹 Registered ForwarderRestartReceiver in AndroidManifest.xml")
+
+takeaway_action_receiver_xml = (
+    '        <receiver\n'
+    '            android:name=".TakeawayNotificationActionReceiver"\n'
+    '            android:exported="false" />\n'
+)
+if "TakeawayNotificationActionReceiver" not in text and "</application>" in text:
+    text = text.replace("</application>", takeaway_action_receiver_xml + "    </application>", 1)
+    changed = True
+    print("🩹 Registered TakeawayNotificationActionReceiver in AndroidManifest.xml")
 
 if changed:
     path.write_text(text)
