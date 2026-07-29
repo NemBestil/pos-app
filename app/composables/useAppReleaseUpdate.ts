@@ -1,4 +1,9 @@
-import { Capacitor, CapacitorHttp, registerPlugin } from '@capacitor/core'
+import {
+  Capacitor,
+  CapacitorHttp,
+  registerPlugin,
+  type PluginListenerHandle
+} from '@capacitor/core'
 import * as Sentry from '@sentry/capacitor'
 import packageJson from '../../package.json'
 
@@ -22,7 +27,20 @@ interface AvailableRelease {
   fileName: string
 }
 
+interface UpdateNotificationAction {
+  release: AvailableRelease
+  accept: boolean
+}
+
 interface ApkUpdaterPlugin {
+  getReleaseInfo(): Promise<{ prerelease: boolean }>
+  schedulePeriodicChecks(): Promise<void>
+  requestUpdateNotificationPermission(): Promise<{ granted: boolean }>
+  getPendingUpdateAction(): Promise<{ action?: UpdateNotificationAction }>
+  addListener(
+    eventName: 'updateNotificationAction',
+    listener: (action: UpdateNotificationAction) => void
+  ): Promise<PluginListenerHandle>
   canRequestPackageInstalls(): Promise<{ value: boolean }>
   openInstallPermissionSettings(): Promise<void>
   openExternalUrl(options: { url: string }): Promise<void>
@@ -32,7 +50,11 @@ interface ApkUpdaterPlugin {
 const apkUpdater = registerPlugin<ApkUpdaterPlugin>('ApkUpdater')
 
 const currentVersion = packageJson.version
-const latestReleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app/releases/latest'
+const stableReleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app/releases/latest'
+const prereleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app/releases?per_page=100'
+let updateNotificationListener: PluginListenerHandle | null = null
+let initializationPromise: Promise<void> | null = null
+let hasHandledUpdateNotificationAction = false
 
 export function useAppReleaseUpdate() {
   const availableRelease = useState<AvailableRelease | null>('app-release-update-available', () => null)
@@ -41,19 +63,64 @@ export function useAppReleaseUpdate() {
   const updateBusyMessage = useState('app-release-update-busy-message', () => 'Please wait')
   const isCheckingForUpdate = useState('app-release-update-checking', () => false)
 
+  async function initializeUpdateChecks() {
+    if (!isAndroidNative()) {
+      return
+    }
+
+    if (!initializationPromise) {
+      initializationPromise = initializeNativeUpdateChecks()
+    }
+
+    await initializationPromise
+
+    if (!hasHandledUpdateNotificationAction) {
+      await checkForUpdate()
+    }
+  }
+
+  async function initializeNativeUpdateChecks() {
+    updateNotificationListener = await apkUpdater.addListener(
+      'updateNotificationAction',
+      handleUpdateNotificationAction
+    )
+
+    await apkUpdater.schedulePeriodicChecks()
+    await apkUpdater.requestUpdateNotificationPermission()
+
+    const pendingAction = await apkUpdater.getPendingUpdateAction()
+    if (pendingAction.action) {
+      handleUpdateNotificationAction(pendingAction.action)
+    }
+  }
+
+  function handleUpdateNotificationAction(action: UpdateNotificationAction) {
+    hasHandledUpdateNotificationAction = true
+    availableRelease.value = action.release
+
+    if (action.accept) {
+      void acceptUpdate()
+      return
+    }
+
+    isUpdatePromptOpen.value = true
+  }
+
   async function checkForUpdate() {
     if (!isAndroidNative() || isCheckingForUpdate.value) {
       return
     }
 
+    const { prerelease } = await apkUpdater.getReleaseInfo()
     isCheckingForUpdate.value = true
     addUpdateBreadcrumb('Update check started', {
-      currentVersion
+      currentVersion,
+      channel: prerelease ? 'prerelease' : 'stable'
     })
 
     try {
       const response = await CapacitorHttp.get({
-        url: latestReleaseEndpoint,
+        url: prerelease ? prereleaseEndpoint : stableReleaseEndpoint,
         headers: {
           Accept: 'application/vnd.github+json',
           'X-GitHub-Api-Version': '2022-11-28'
@@ -67,8 +134,18 @@ export function useAppReleaseUpdate() {
         return
       }
 
-      const release = normalizeReleaseResponse(response.data)
-      const nextRelease = extractAvailableRelease(release)
+      const releases = normalizeReleaseResponse(response.data)
+      const nextRelease = releases
+        .map((release) => extractAvailableRelease(release, prerelease))
+        .reduce<AvailableRelease | null>((latestRelease, release) => {
+          if (!release) {
+            return latestRelease
+          }
+
+          return !latestRelease || compareVersions(release.version, latestRelease.version) > 0
+            ? release
+            : latestRelease
+        }, null)
 
       if (!nextRelease || compareVersions(nextRelease.version, currentVersion) <= 0) {
         addUpdateBreadcrumb('No newer app release found', {
@@ -210,6 +287,7 @@ export function useAppReleaseUpdate() {
     isUpdatePromptOpen,
     isUpdateBusyOpen,
     updateBusyMessage,
+    initializeUpdateChecks,
     checkForUpdate,
     postponeUpdate,
     acceptUpdate
@@ -221,19 +299,21 @@ function isAndroidNative() {
 }
 
 function normalizeReleaseResponse(data: unknown) {
-  if (typeof data === 'string') {
-    return JSON.parse(data) as GithubReleaseResponse
+  const normalized = typeof data === 'string' ? JSON.parse(data) : data
+
+  if (Array.isArray(normalized)) {
+    return normalized as GithubReleaseResponse[]
   }
 
-  return data as GithubReleaseResponse
+  return [normalized as GithubReleaseResponse]
 }
 
-function extractAvailableRelease(release: GithubReleaseResponse) {
-  if (!release || release.draft || release.prerelease) {
+function extractAvailableRelease(release: GithubReleaseResponse, prerelease: boolean) {
+  if (!release || release.draft || release.prerelease !== prerelease) {
     return null
   }
 
-  const version = extractVersionFromTag(release.tag_name)
+  const version = extractVersionFromTag(release.tag_name, prerelease)
   const apkAsset = release.assets.find((asset) => asset.browser_download_url?.toLowerCase().endsWith('.apk'))
 
   if (!version || !apkAsset) {
@@ -248,10 +328,14 @@ function extractAvailableRelease(release: GithubReleaseResponse) {
   } satisfies AvailableRelease
 }
 
-function extractVersionFromTag(tagName: string) {
-  const match = tagName.match(/^apk-(\d+\.\d+\.\d+)$/)
+function extractVersionFromTag(tagName: string, prerelease: boolean) {
+  const match = tagName.match(/^apk-(\d+\.\d+\.\d+)(-pre)?$/)
 
-  return match?.[1] ?? null
+  if (!match || Boolean(match[2]) !== prerelease) {
+    return null
+  }
+
+  return match[1]
 }
 
 function compareVersions(left: string, right: string) {

@@ -109,6 +109,19 @@ if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "io.sentry:sentry-android" "$APP_BUIL
     echo "🩹 Added Sentry Android dependency to android/app/build.gradle"
 fi
 
+# Release builds use APP_PRERELEASE=true when produced from an apk-x.y.z-pre tag.
+# Expose that immutable channel in BuildConfig so both the WebView bridge and the
+# scheduled native checker follow the same release stream.
+if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "buildConfig = true" "$APP_BUILD_GRADLE"; then
+    sed -i '' $'/compileSdk = /a\\\n    buildFeatures {\\\n        buildConfig = true\\\n    }\n' "$APP_BUILD_GRADLE"
+    echo "🩹 Enabled BuildConfig generation in android/app/build.gradle"
+fi
+
+if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "APP_PRERELEASE" "$APP_BUILD_GRADLE"; then
+    sed -i '' $'/versionName /a\\\n        buildConfigField "boolean", "APP_PRERELEASE", System.getenv("APP_PRERELEASE") ?: "false"\n' "$APP_BUILD_GRADLE"
+    echo "🩹 Added APP_PRERELEASE build metadata to android/app/build.gradle"
+fi
+
 # PaymentTerminalDiscoveryPlugin acquires a Wi-Fi multicast lock so the Wi-Fi
 # stack doesn't filter out the Worldline broadcast frames. That needs an extra
 # permission. Idempotent: only inserted if missing.
@@ -137,6 +150,7 @@ permissions = [
     "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
     "android.permission.RECEIVE_BOOT_COMPLETED",
     "android.permission.POST_NOTIFICATIONS",
+    "android.permission.REQUEST_INSTALL_PACKAGES",
 ]
 anchor = '<uses-permission android:name="android.permission.INTERNET" />'
 if anchor in text:
@@ -213,6 +227,20 @@ if "TakeawayNotificationActionReceiver" not in text and "</application>" in text
     text = text.replace("</application>", takeaway_action_receiver_xml + "    </application>", 1)
     changed = True
     print("🩹 Registered TakeawayNotificationActionReceiver in AndroidManifest.xml")
+
+app_release_update_receiver_xml = (
+    '        <receiver\n'
+    '            android:name=".AppReleaseUpdateReceiver"\n'
+    '            android:exported="false" />\n'
+)
+if "AppReleaseUpdateReceiver" not in text and "    </application>" in text:
+    text = text.replace(
+        "    </application>",
+        app_release_update_receiver_xml + "    </application>",
+        1,
+    )
+    changed = True
+    print("🩹 Registered AppReleaseUpdateReceiver in AndroidManifest.xml")
 
 if changed:
     path.write_text(text)

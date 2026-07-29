@@ -8,6 +8,7 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(AndroidFullscreenPlugin.class);
+        registerPlugin(ApkUpdaterPlugin.class);
         registerPlugin(BluetoothPrinterPlugin.class);
         registerPlugin(ForwarderServicePlugin.class);
         registerPlugin(NetworkPrinterPlugin.class);

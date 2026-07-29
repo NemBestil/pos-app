@@ -3,12 +3,16 @@ apply plugin: 'com.android.application'
 android {
     namespace = "com.nembestil.pos3.app"
     compileSdk = rootProject.ext.compileSdkVersion
+    buildFeatures {
+        buildConfig = true
+    }
     defaultConfig {
         applicationId "com.nembestil.pos3.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 101021
         versionName "1.1.10"
+        buildConfigField "boolean", "APP_PRERELEASE", System.getenv("APP_PRERELEASE") ?: "false"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

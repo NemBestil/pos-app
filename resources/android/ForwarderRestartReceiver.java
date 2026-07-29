@@ -22,5 +22,6 @@ public class ForwarderRestartReceiver extends BroadcastReceiver {
         }
         Log.i(TAG, "Restoring configured forwarder after " + action);
         ForwarderService.requestStartIfConfigured(context.getApplicationContext());
+        AppReleaseUpdateReceiver.schedule(context.getApplicationContext());
     }
 }

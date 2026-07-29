@@ -142,7 +142,7 @@ const {
   isUpdatePromptOpen,
   isUpdateBusyOpen,
   updateBusyMessage,
-  checkForUpdate,
+  initializeUpdateChecks,
   postponeUpdate,
   acceptUpdate
 } = useAppReleaseUpdate()
@@ -161,7 +161,7 @@ onMounted(() => {
     logoVisible.value = true
   }, 80)
 
-  void checkForUpdate()
+  void initializeUpdateChecks()
 
   addSentryBreadcrumb('app.lifecycle', 'Shell loaded', {
     screen: screen.value,

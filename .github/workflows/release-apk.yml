@@ -102,6 +102,7 @@ jobs:
       - name: Build signed release APK
         working-directory: android
         env:
+          APP_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
           ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
           ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
           ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
