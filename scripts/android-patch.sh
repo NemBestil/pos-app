@@ -145,6 +145,13 @@ path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 changed = False
 
+activity_name = '            android:name=".MainActivity"\n'
+soft_input_mode = '            android:windowSoftInputMode="adjustResize"\n'
+if soft_input_mode not in text:
+    text = text.replace(activity_name, activity_name + soft_input_mode, 1)
+    changed = True
+    print("🩹 Enabled adjustResize for MainActivity in AndroidManifest.xml")
+
 permissions = [
     "android.permission.FOREGROUND_SERVICE",
     "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",

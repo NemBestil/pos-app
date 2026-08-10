@@ -171,6 +171,10 @@ public class ApkUpdaterPlugin extends Plugin {
         String downloadUrl = intent.getStringExtra(AppReleaseUpdateReceiver.EXTRA_DOWNLOAD_URL);
         String releaseUrl = intent.getStringExtra(AppReleaseUpdateReceiver.EXTRA_RELEASE_URL);
         String fileName = intent.getStringExtra(AppReleaseUpdateReceiver.EXTRA_FILE_NAME);
+        boolean prerelease = intent.getBooleanExtra(
+            AppReleaseUpdateReceiver.EXTRA_PRERELEASE,
+            false
+        );
         boolean accept = intent.getBooleanExtra(AppReleaseUpdateReceiver.EXTRA_ACCEPT_UPDATE, false);
 
         intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_OPEN_UPDATE);
@@ -178,6 +182,7 @@ public class ApkUpdaterPlugin extends Plugin {
         intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_DOWNLOAD_URL);
         intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_RELEASE_URL);
         intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_FILE_NAME);
+        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_PRERELEASE);
         intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_ACCEPT_UPDATE);
 
         if (version == null || downloadUrl == null || releaseUrl == null || fileName == null) {
@@ -186,6 +191,7 @@ public class ApkUpdaterPlugin extends Plugin {
 
         JSObject release = new JSObject();
         release.put("version", version);
+        release.put("prerelease", prerelease);
         release.put("downloadUrl", downloadUrl);
         release.put("releaseUrl", releaseUrl);
         release.put("fileName", fileName);

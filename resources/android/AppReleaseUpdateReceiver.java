@@ -39,6 +39,7 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
     public static final String EXTRA_DOWNLOAD_URL = "appReleaseDownloadUrl";
     public static final String EXTRA_RELEASE_URL = "appReleaseUrl";
     public static final String EXTRA_FILE_NAME = "appReleaseFileName";
+    public static final String EXTRA_PRERELEASE = "appReleasePrerelease";
 
     private static final String TAG = "AppReleaseUpdate";
     private static final String CHECK_ACTION = "com.nembestil.pos3.app.CHECK_RELEASE_UPDATE";
@@ -46,7 +47,7 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
         "https://api.github.com/repos/NemBestil/pos-app/releases?per_page=100";
     private static final String CHANNEL_ID = "app-release-updates";
     private static final String PREFERENCES = "app-release-updates";
-    private static final String LAST_NOTIFIED_VERSION = "last-notified-version";
+    private static final String LAST_NOTIFIED_RELEASE = "last-notified-release";
     private static final long CHECK_INTERVAL_MILLIS = 24L * 60L * 60L * 1000L;
     private static final int ALARM_REQUEST_CODE = 12001;
     private static final int NOTIFICATION_ID = 12002;
@@ -95,15 +96,15 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
     private void checkForUpdate(Context context) throws Exception {
         AvailableRelease release = fetchLatestRelease();
 
-        if (release == null || compareVersions(release.version, BuildConfig.VERSION_NAME) <= 0) {
+        if (release == null) {
             return;
         }
 
-        String lastNotifiedVersion = context
+        String lastNotifiedRelease = context
             .getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-            .getString(LAST_NOTIFIED_VERSION, "");
+            .getString(LAST_NOTIFIED_RELEASE, "");
 
-        if (release.version.equals(lastNotifiedVersion) || !canShowNotifications(context)) {
+        if (release.identifier().equals(lastNotifiedRelease) || !canShowNotifications(context)) {
             return;
         }
 
@@ -111,7 +112,7 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
         context
             .getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             .edit()
-            .putString(LAST_NOTIFIED_VERSION, release.version)
+            .putString(LAST_NOTIFIED_RELEASE, release.identifier())
             .apply();
     }
 
@@ -133,21 +134,37 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
 
             JSONArray releases = new JSONArray(readBody(connection.getInputStream()));
             AvailableRelease latestRelease = null;
+            AvailableRelease latestStableRelease = null;
 
             for (int index = 0; index < releases.length(); index += 1) {
                 AvailableRelease release = extractRelease(releases.getJSONObject(index));
                 if (
                     release != null
+                        && isNewerThanInstalled(release)
                         && (
                             latestRelease == null
-                                || compareVersions(release.version, latestRelease.version) > 0
+                                || compareReleases(release, latestRelease) > 0
                         )
                 ) {
                     latestRelease = release;
                 }
+
+                if (
+                    release != null
+                        && !release.prerelease
+                        && isNewerThanInstalled(release)
+                        && (
+                            latestStableRelease == null
+                                || compareReleases(release, latestStableRelease) > 0
+                        )
+                ) {
+                    latestStableRelease = release;
+                }
             }
 
-            return latestRelease;
+            return BuildConfig.APP_PRERELEASE && latestStableRelease != null
+                ? latestStableRelease
+                : latestRelease;
         } finally {
             if (connection != null) {
                 connection.disconnect();
@@ -156,15 +173,16 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
     }
 
     private AvailableRelease extractRelease(JSONObject release) {
+        boolean prerelease = release.optBoolean("prerelease", false);
         if (
             release.optBoolean("draft", false)
-                || release.optBoolean("prerelease", false) != BuildConfig.APP_PRERELEASE
+                || (!BuildConfig.APP_PRERELEASE && prerelease)
         ) {
             return null;
         }
 
         Matcher tagMatcher = RELEASE_TAG_PATTERN.matcher(release.optString("tag_name", ""));
-        if (!tagMatcher.matches() || (tagMatcher.group(2) != null) != BuildConfig.APP_PRERELEASE) {
+        if (!tagMatcher.matches() || (tagMatcher.group(2) != null) != prerelease) {
             return null;
         }
 
@@ -183,6 +201,7 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
             if (downloadUrl.toLowerCase(Locale.ROOT).endsWith(".apk")) {
                 return new AvailableRelease(
                     tagMatcher.group(1),
+                    prerelease,
                     downloadUrl,
                     release.optString("html_url", ""),
                     asset.optString("name", "update.apk")
@@ -248,6 +267,7 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
         intent.putExtra(EXTRA_DOWNLOAD_URL, release.downloadUrl);
         intent.putExtra(EXTRA_RELEASE_URL, release.releaseUrl);
         intent.putExtra(EXTRA_FILE_NAME, release.fileName);
+        intent.putExtra(EXTRA_PRERELEASE, release.prerelease);
         intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
 
         return PendingIntent.getActivity(
@@ -309,22 +329,48 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
         return 0;
     }
 
+    private static boolean isNewerThanInstalled(AvailableRelease release) {
+        int versionComparison = compareVersions(release.version, BuildConfig.VERSION_NAME);
+        return versionComparison > 0
+            || (
+                versionComparison == 0
+                    && BuildConfig.APP_PRERELEASE
+                    && !release.prerelease
+            );
+    }
+
+    private static int compareReleases(AvailableRelease left, AvailableRelease right) {
+        int versionComparison = compareVersions(left.version, right.version);
+        if (versionComparison != 0) {
+            return versionComparison;
+        }
+
+        return Integer.compare(left.prerelease ? 0 : 1, right.prerelease ? 0 : 1);
+    }
+
     private static final class AvailableRelease {
         private final String version;
+        private final boolean prerelease;
         private final String downloadUrl;
         private final String releaseUrl;
         private final String fileName;
 
         private AvailableRelease(
             String version,
+            boolean prerelease,
             String downloadUrl,
             String releaseUrl,
             String fileName
         ) {
             this.version = version;
+            this.prerelease = prerelease;
             this.downloadUrl = downloadUrl;
             this.releaseUrl = releaseUrl;
             this.fileName = fileName;
+        }
+
+        private String identifier() {
+            return "apk-" + version + (prerelease ? "-pre" : "");
         }
     }
 }

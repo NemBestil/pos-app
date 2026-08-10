@@ -1010,7 +1010,7 @@ public class ForwarderService extends Service {
         while (running.get()) {
             try {
                 List<DiscoveredTerminal> terminals = getDiscoveredTerminals();
-                if (currentNetwork == null || terminals.isEmpty()) {
+                if (terminals.isEmpty()) {
                     waitForPaymentTerminalSignal(LAN_PRINTERS_REFRESH_MS);
                     continue;
                 }
@@ -1062,9 +1062,6 @@ public class ForwarderService extends Service {
             URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward");
             conn = (HttpURLConnection) url.openConnection();
             synchronized (paymentTerminalLongPollLock) {
-                if (currentNetwork == null) {
-                    return false;
-                }
                 currentPaymentTerminalLongPoll = conn;
             }
             conn.setRequestMethod("POST");
@@ -1182,17 +1179,13 @@ public class ForwarderService extends Service {
                     "Payment terminal " + paymentTerminalId + " is not discovered on the current Wi-Fi network."
                 );
             }
-            Network wifiNetwork = currentNetwork;
-            if (wifiNetwork == null) {
-                throw new IOException("The terminal Wi-Fi network is not available.");
-            }
             URL url = new URL("http", terminal.ipAddress, terminal.port, path);
             Log.i(
                 TAG,
                 "dispatch terminal request jobId=" + jobId + " terminal=" + paymentTerminalId
                     + " " + method + " " + url
             );
-            conn = (HttpURLConnection) wifiNetwork.openConnection(url);
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod(method);
             conn.setConnectTimeout(5_000);
             conn.setReadTimeout(Math.max(timeoutMs, TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS));

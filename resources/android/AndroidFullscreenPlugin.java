@@ -49,7 +49,7 @@ public class AndroidFullscreenPlugin extends Plugin {
     private static void apply(Activity activity, boolean fullscreen) {
         Window window = activity.getWindow();
         WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(window, window.getDecorView());
-        WindowCompat.setDecorFitsSystemWindows(window, !fullscreen);
+        WindowCompat.setDecorFitsSystemWindows(window, true);
 
         if (fullscreen) {
             controller.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);

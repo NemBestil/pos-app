@@ -22,6 +22,7 @@ interface GithubReleaseResponse {
 
 interface AvailableRelease {
   version: string
+  prerelease: boolean
   downloadUrl: string
   releaseUrl: string
   fileName: string
@@ -135,21 +136,13 @@ export function useAppReleaseUpdate() {
       }
 
       const releases = normalizeReleaseResponse(response.data)
-      const nextRelease = releases
+      const releaseCandidates = releases
         .map((release) => extractAvailableRelease(release, prerelease))
-        .reduce<AvailableRelease | null>((latestRelease, release) => {
-          if (!release) {
-            return latestRelease
-          }
+        .filter((release): release is AvailableRelease => release !== null)
+      const nextRelease = selectNextRelease(releaseCandidates, currentVersion, prerelease)
 
-          return !latestRelease || compareVersions(release.version, latestRelease.version) > 0
-            ? release
-            : latestRelease
-        }, null)
-
-      if (!nextRelease || compareVersions(nextRelease.version, currentVersion) <= 0) {
+      if (!nextRelease) {
         addUpdateBreadcrumb('No newer app release found', {
-          releaseVersion: nextRelease?.version ?? null,
           currentVersion
         })
         return
@@ -159,6 +152,7 @@ export function useAppReleaseUpdate() {
       isUpdatePromptOpen.value = true
       addUpdateBreadcrumb('New app release found', {
         releaseVersion: nextRelease.version,
+        releaseChannel: nextRelease.prerelease ? 'prerelease' : 'stable',
         currentVersion
       })
     } catch (error) {
@@ -308,12 +302,12 @@ function normalizeReleaseResponse(data: unknown) {
   return [normalized as GithubReleaseResponse]
 }
 
-function extractAvailableRelease(release: GithubReleaseResponse, prerelease: boolean) {
-  if (!release || release.draft || release.prerelease !== prerelease) {
+function extractAvailableRelease(release: GithubReleaseResponse, includePrereleases: boolean) {
+  if (!release || release.draft || (!includePrereleases && release.prerelease)) {
     return null
   }
 
-  const version = extractVersionFromTag(release.tag_name, prerelease)
+  const version = extractVersionFromTag(release.tag_name, release.prerelease)
   const apkAsset = release.assets.find((asset) => asset.browser_download_url?.toLowerCase().endsWith('.apk'))
 
   if (!version || !apkAsset) {
@@ -322,6 +316,7 @@ function extractAvailableRelease(release: GithubReleaseResponse, prerelease: boo
 
   return {
     version,
+    prerelease: release.prerelease,
     downloadUrl: apkAsset.browser_download_url,
     releaseUrl: release.html_url,
     fileName: apkAsset.name
@@ -336,6 +331,42 @@ function extractVersionFromTag(tagName: string, prerelease: boolean) {
   }
 
   return match[1]
+}
+
+function selectNextRelease(
+  releases: AvailableRelease[],
+  installedVersion: string,
+  installedPrerelease: boolean
+) {
+  const newerReleases = releases.filter((release) => {
+    const versionComparison = compareVersions(release.version, installedVersion)
+    return versionComparison > 0
+      || (versionComparison === 0 && installedPrerelease && !release.prerelease)
+  })
+
+  if (installedPrerelease) {
+    const stableRelease = findLatestRelease(newerReleases.filter((release) => !release.prerelease))
+    if (stableRelease) {
+      return stableRelease
+    }
+  }
+
+  return findLatestRelease(newerReleases)
+}
+
+function findLatestRelease(releases: AvailableRelease[]) {
+  return releases.reduce<AvailableRelease | null>((latestRelease, release) => {
+    if (!latestRelease) {
+      return release
+    }
+
+    const versionComparison = compareVersions(release.version, latestRelease.version)
+    if (versionComparison !== 0) {
+      return versionComparison > 0 ? release : latestRelease
+    }
+
+    return latestRelease.prerelease && !release.prerelease ? release : latestRelease
+  }, null)
 }
 
 function compareVersions(left: string, right: string) {
