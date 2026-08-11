@@ -79,8 +79,9 @@ import java.util.concurrent.atomic.AtomicReference;
  *   1. The LAN print forwarder long-poll loop (was useAndroidLanPrintForwarder in JS).
  *   2. The payment terminal forwarder long-poll loop (was useAndroidPaymentTerminalForwarder in JS).
  *   3. The feature-gated takeaway order broadcast long-poll loop.
+ *   4. The feature-gated table booking broadcast long-poll loop.
  *
- * Both loops authenticate against /api/_internal/* using the androidsync
+ * These loops authenticate against /api/_internal/* using the androidsync
  * Bearer token, so the forwarder keeps working even after the WebView signs
  * out. Each request is one-shot: the server pushes a single event and closes
  * the connection, which is long-polling semantics rather than a real stream.
@@ -100,8 +101,12 @@ public class ForwarderService extends Service {
     private static final int ALERT_NOTIFICATION_ID = 0x4E43;
     private static final String TAKEAWAY_CHANNEL_ID = "nembestil_takeaway_orders";
     private static final int TAKEAWAY_NOTIFICATION_ID_BASE = 0x540000;
+    private static final String TABLE_BOOKING_CHANNEL_ID = "nembestil_table_bookings";
+    private static final int TABLE_BOOKING_NOTIFICATION_ID_BASE = 0x550000;
     public static final String EXTRA_OPEN_TAKEAWAY_ORDERS = "openTakeawayOrders";
     public static final String EXTRA_TAKEAWAY_ORDER_ID = "takeawayOrderId";
+    public static final String EXTRA_OPEN_TABLE_BOOKINGS = "openTableBookings";
+    public static final String EXTRA_TABLE_BOOKING_ID = "tableBookingId";
 
     public static final String ACTION_START = "com.nembestil.pos3.app.action.START_FORWARDER";
     public static final String ACTION_STOP = "com.nembestil.pos3.app.action.STOP_FORWARDER";
@@ -109,14 +114,18 @@ public class ForwarderService extends Service {
         "com.nembestil.pos3.app.action.NOTIFY_FORWARDER_CONFIG_CHANGED";
     public static final String ACTION_UPDATE_TAKEAWAY_STATE =
         "com.nembestil.pos3.app.action.UPDATE_TAKEAWAY_STATE";
+    public static final String ACTION_UPDATE_TABLE_BOOKING_STATE =
+        "com.nembestil.pos3.app.action.UPDATE_TABLE_BOOKING_STATE";
     public static final String EXTRA_BASE_URL = "baseUrl";
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_TAKEAWAY_ENABLED = "takeawayEnabled";
+    public static final String EXTRA_TABLE_BOOKING_ENABLED = "tableBookingEnabled";
 
     private static final String PREFS_NAME = "forwarder_service_prefs";
     private static final String PREFS_BASE_URL = "baseUrl";
     private static final String PREFS_TOKEN = "token";
     private static final String PREFS_TAKEAWAY_ENABLED = "takeawayEnabled";
+    private static final String PREFS_TABLE_BOOKING_ENABLED = "tableBookingEnabled";
 
     private static final int LAN_PRINTER_PORT = 9100;
     private static final int LAN_PING_TIMEOUT_MS = 1_500;
@@ -157,6 +166,8 @@ public class ForwarderService extends Service {
     private static final CopyOnWriteArrayList<TokenListener> tokenListeners = new CopyOnWriteArrayList<>();
     private static final CopyOnWriteArrayList<TakeawayOrderListener> takeawayOrderListeners =
         new CopyOnWriteArrayList<>();
+    private static final CopyOnWriteArrayList<TableBookingListener> tableBookingListeners =
+        new CopyOnWriteArrayList<>();
 
     private final String forwarderId = UUID.randomUUID().toString();
     private final AtomicBoolean lanPrintersDirty = new AtomicBoolean(true);
@@ -165,6 +176,7 @@ public class ForwarderService extends Service {
     // tears things down; cleared again whenever fresh credentials arrive.
     private final AtomicBoolean tokenInvalidated = new AtomicBoolean(false);
     private final AtomicBoolean takeawayEnabled = new AtomicBoolean(false);
+    private final AtomicBoolean tableBookingEnabled = new AtomicBoolean(false);
 
     private volatile String baseUrl;
     private volatile String authToken;
@@ -175,6 +187,7 @@ public class ForwarderService extends Service {
     private Thread discoveryThread;
     private Thread heartbeatThread;
     private Thread takeawayOrderThread;
+    private Thread tableBookingThread;
     private volatile DatagramSocket discoverySocket;
     private WifiManager.MulticastLock multicastLock;
     private volatile ConnectivityManager.NetworkCallback networkCallback;
@@ -193,14 +206,19 @@ public class ForwarderService extends Service {
     private final Object paymentTerminalSignal = new Object();
     private final Object takeawayOrderLongPollLock = new Object();
     private final Object takeawayOrderSignal = new Object();
+    private final Object tableBookingLongPollLock = new Object();
+    private final Object tableBookingSignal = new Object();
     private final Object discoveryThreadLock = new Object();
     private final Object networkCallbackLock = new Object();
     private volatile HttpURLConnection currentLanPrintLongPoll;
     private volatile HttpURLConnection currentBluetoothPrintLongPoll;
     private volatile HttpURLConnection currentPaymentTerminalLongPoll;
     private volatile HttpURLConnection currentTakeawayOrderLongPoll;
+    private volatile HttpURLConnection currentTableBookingLongPoll;
     private volatile String takeawayOrderCursor;
     private final String takeawayOrderStartedAt = formatIsoUtc(System.currentTimeMillis());
+    private volatile String tableBookingCursor;
+    private final String tableBookingStartedAt = formatIsoUtc(System.currentTimeMillis());
 
     public static boolean isRunning() {
         return running.get();
@@ -249,6 +267,18 @@ public class ForwarderService extends Service {
             return running.get() ? START_STICKY : START_NOT_STICKY;
         }
 
+        if (ACTION_UPDATE_TABLE_BOOKING_STATE.equals(action)) {
+            boolean enabled = intent != null && intent.getBooleanExtra(EXTRA_TABLE_BOOKING_ENABLED, false);
+            tableBookingEnabled.set(enabled);
+            prefs.edit().putBoolean(PREFS_TABLE_BOOKING_ENABLED, enabled).apply();
+            if (enabled) {
+                signalTableBookingLoop();
+            } else {
+                interruptTableBookingLongPoll();
+            }
+            return running.get() ? START_STICKY : START_NOT_STICKY;
+        }
+
         String requestedBaseUrl = intent != null ? intent.getStringExtra(EXTRA_BASE_URL) : null;
         String requestedToken = intent != null ? intent.getStringExtra(EXTRA_TOKEN) : null;
 
@@ -273,6 +303,7 @@ public class ForwarderService extends Service {
         baseUrl = stripTrailingSlash(requestedBaseUrl);
         authToken = requestedToken;
         takeawayEnabled.set(prefs.getBoolean(PREFS_TAKEAWAY_ENABLED, false));
+        tableBookingEnabled.set(prefs.getBoolean(PREFS_TABLE_BOOKING_ENABLED, false));
         activeBaseUrl.set(baseUrl);
         prefs.edit()
             .putString(PREFS_BASE_URL, baseUrl)
@@ -292,6 +323,7 @@ public class ForwarderService extends Service {
             startPaymentTerminalLoop();
             startHeartbeatLoop();
             startTakeawayOrderLoop();
+            startTableBookingLoop();
         } else {
             Log.i(TAG, "Forwarder already running; credentials refreshed");
             // Reset the open long-poll connections so they reconnect with the new token.
@@ -299,6 +331,7 @@ public class ForwarderService extends Service {
             interruptBluetoothPrintLongPoll();
             interruptPaymentTerminalLongPoll();
             interruptTakeawayOrderLongPoll();
+            interruptTableBookingLongPoll();
         }
         return START_STICKY;
     }
@@ -372,8 +405,10 @@ public class ForwarderService extends Service {
         interruptBluetoothPrintLongPoll();
         interruptPaymentTerminalLongPoll();
         interruptTakeawayOrderLongPoll();
+        interruptTableBookingLongPoll();
         signalPaymentTerminalLoop();
         signalTakeawayOrderLoop();
+        signalTableBookingLoop();
         unregisterScreenStateReceiver();
         stopDiscoveryListener();
         Thread lan = lanPrintThread;
@@ -381,11 +416,13 @@ public class ForwarderService extends Service {
         Thread pay = paymentTerminalThread;
         Thread heartbeat = heartbeatThread;
         Thread takeaway = takeawayOrderThread;
+        Thread tableBooking = tableBookingThread;
         lanPrintThread = null;
         bluetoothPrintThread = null;
         paymentTerminalThread = null;
         heartbeatThread = null;
         takeawayOrderThread = null;
+        tableBookingThread = null;
         if (lan != null) {
             lan.interrupt();
         }
@@ -400,6 +437,9 @@ public class ForwarderService extends Service {
         }
         if (takeaway != null) {
             takeaway.interrupt();
+        }
+        if (tableBooking != null) {
+            tableBooking.interrupt();
         }
         // Unexpected shutdowns keep the stored credentials so Android can
         // restore the service. An explicit stop removes them before this runs.
@@ -448,6 +488,19 @@ public class ForwarderService extends Service {
         synchronized (takeawayOrderLongPollLock) {
             HttpURLConnection conn = currentTakeawayOrderLongPoll;
             currentTakeawayOrderLongPoll = null;
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void interruptTableBookingLongPoll() {
+        synchronized (tableBookingLongPollLock) {
+            HttpURLConnection conn = currentTableBookingLongPoll;
+            currentTableBookingLongPoll = null;
             if (conn != null) {
                 try {
                     conn.disconnect();
@@ -1500,7 +1553,7 @@ public class ForwarderService extends Service {
             return;
         }
 
-        boolean showAndroidNotification = shouldShowAndroidTakeawayNotification();
+        boolean showAndroidNotification = shouldShowAndroidNotification();
         try {
             event.put("notificationMode", showAndroidNotification ? "android" : "web");
         } catch (Exception e) {
@@ -1514,15 +1567,11 @@ public class ForwarderService extends Service {
                 event.optString("notificationActionToken", "")
             );
         } else {
-            playTakeawayNotificationSound();
+            playNotificationSound();
         }
     }
 
-    private boolean shouldShowAndroidTakeawayNotification() {
-        return !screenOn.get() || !appFocused.get();
-    }
-
-    private void playTakeawayNotificationSound() {
+    private void playNotificationSound() {
         try {
             Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
             Ringtone ringtone = RingtoneManager.getRingtone(getApplicationContext(), sound);
@@ -1711,6 +1760,266 @@ public class ForwarderService extends Service {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    // ========================================================================
+    // Table booking long-poll loop
+    // ========================================================================
+
+    private void startTableBookingLoop() {
+        tableBookingThread = new Thread(this::runTableBookingLoop, "ForwarderTableBookings");
+        tableBookingThread.setDaemon(true);
+        tableBookingThread.start();
+    }
+
+    private void runTableBookingLoop() {
+        while (running.get()) {
+            if (!tableBookingEnabled.get()) {
+                waitForTableBookingSignal();
+                continue;
+            }
+
+            try {
+                if (!longPollTableBooking()) {
+                    sleepQuietly(RETRY_AFTER_ERROR_MS);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Table booking loop iteration failed", t);
+                sleepQuietly(RETRY_AFTER_ERROR_MS);
+            }
+        }
+        Log.i(TAG, "Table booking loop exited");
+    }
+
+    private void waitForTableBookingSignal() {
+        synchronized (tableBookingSignal) {
+            if (!running.get() || tableBookingEnabled.get()) {
+                return;
+            }
+            try {
+                tableBookingSignal.wait();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void signalTableBookingLoop() {
+        synchronized (tableBookingSignal) {
+            tableBookingSignal.notifyAll();
+        }
+    }
+
+    private boolean longPollTableBooking() {
+        HttpURLConnection conn = null;
+        try {
+            JSONObject body = new JSONObject();
+            String cursor = tableBookingCursor;
+            if (cursor != null && !cursor.isEmpty()) {
+                body.put("cursor", cursor);
+            } else {
+                body.put("startedAt", tableBookingStartedAt);
+            }
+
+            final String usedToken = authToken;
+            URL url = new URL(baseUrl + "/api/_internal/table-bookings");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Accept", "application/json");
+            applyCookies(conn);
+
+            synchronized (tableBookingLongPollLock) {
+                currentTableBookingLongPoll = conn;
+            }
+
+            try (OutputStream out = conn.getOutputStream()) {
+                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+            int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken)) {
+                return false;
+            }
+            if (status < 200 || status >= 300) {
+                Log.w(TAG, "table-bookings HTTP " + status);
+                return false;
+            }
+
+            JSONObject response = new JSONObject(readAll(conn.getInputStream()));
+            String responseCursor = response.optString("cursor", "");
+            if (!responseCursor.isEmpty()) {
+                tableBookingCursor = responseCursor;
+            }
+
+            JSONObject event = response.optJSONObject("event");
+            if (event != null) {
+                handleTableBookingEvent(event);
+            }
+            return true;
+        } catch (Exception e) {
+            if (running.get() && tableBookingEnabled.get()) {
+                Log.w(TAG, "Table booking long poll failed", e);
+            }
+            return false;
+        } finally {
+            synchronized (tableBookingLongPollLock) {
+                if (currentTableBookingLongPoll == conn) {
+                    currentTableBookingLongPoll = null;
+                }
+            }
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void handleTableBookingEvent(JSONObject event) {
+        String type = event.optString("type", "");
+        if ("deleted".equals(type)) {
+            cancelTableBookingNotification(event.optString("bookingId", ""));
+            notifyTableBooking(event);
+            return;
+        }
+
+        JSONObject booking = event.optJSONObject("booking");
+        if (booking == null) {
+            notifyTableBooking(event);
+            return;
+        }
+
+        String bookingId = booking.optString("id", "");
+        boolean unconfirmedCreated = "created".equals(type)
+            && event.optBoolean("notifyUnconfirmed", false)
+            && "pending".equals(booking.optString("status", ""));
+        if (!unconfirmedCreated) {
+            if (!"pending".equals(booking.optString("status", ""))) {
+                cancelTableBookingNotification(bookingId);
+            }
+            notifyTableBooking(event);
+            return;
+        }
+
+        boolean showAndroidNotification = shouldShowAndroidNotification();
+        try {
+            event.put("notificationMode", showAndroidNotification ? "android" : "web");
+        } catch (Exception e) {
+            Log.w(TAG, "Could not attach table booking notification mode", e);
+        }
+        notifyTableBooking(event);
+
+        if (showAndroidNotification) {
+            showTableBookingNotification(booking);
+        } else {
+            playNotificationSound();
+        }
+    }
+
+    private boolean shouldShowAndroidNotification() {
+        return !screenOn.get() || !appFocused.get();
+    }
+
+    private void showTableBookingNotification(JSONObject booking) {
+        NotificationManager manager =
+            (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+
+        Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                TABLE_BOOKING_CHANNEL_ID,
+                "Table bookings",
+                NotificationManager.IMPORTANCE_HIGH
+            );
+            channel.setDescription("New table bookings awaiting confirmation in NemBestil POS.");
+            channel.enableVibration(true);
+            channel.setSound(sound, null);
+            manager.createNotificationChannel(channel);
+        }
+
+        String bookingId = booking.optString("id", UUID.randomUUID().toString());
+        String summary = createTableBookingSummary(booking);
+        int notificationId = getTableBookingNotificationId(bookingId);
+        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        PendingIntent contentIntent = null;
+        if (launchIntent != null) {
+            launchIntent.setFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP
+            );
+            launchIntent.putExtra(EXTRA_OPEN_TABLE_BOOKINGS, true);
+            launchIntent.putExtra(EXTRA_TABLE_BOOKING_ID, bookingId);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+            contentIntent = PendingIntent.getActivity(this, bookingId.hashCode(), launchIntent, flags);
+        }
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, TABLE_BOOKING_CHANNEL_ID)
+            .setContentTitle("Table booking awaiting confirmation")
+            .setContentText(summary)
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(summary))
+            .setSmallIcon(R.drawable.ic_stat_forwarder)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setSound(sound)
+            .setDefaults(Notification.DEFAULT_ALL);
+        if (contentIntent != null) {
+            builder.setContentIntent(contentIntent);
+            builder.addAction(0, "Review booking", contentIntent);
+        }
+        manager.notify(notificationId, builder.build());
+    }
+
+    private void cancelTableBookingNotification(String bookingId) {
+        if (bookingId.isEmpty()) {
+            return;
+        }
+        NotificationManager manager =
+            (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager != null) {
+            manager.cancel(getTableBookingNotificationId(bookingId));
+        }
+    }
+
+    private int getTableBookingNotificationId(String bookingId) {
+        return TABLE_BOOKING_NOTIFICATION_ID_BASE + Math.abs(bookingId.hashCode() % 10_000);
+    }
+
+    private String createTableBookingSummary(JSONObject booking) {
+        String customer = "";
+        JSONArray details = booking.optJSONArray("details");
+        if (details != null) {
+            for (int index = 0; index < details.length(); index++) {
+                JSONObject detail = details.optJSONObject(index);
+                if (detail != null && "name".equals(detail.optString("type", ""))) {
+                    customer = detail.optString("value", "");
+                    break;
+                }
+            }
+        }
+
+        List<String> summary = new ArrayList<>();
+        if (!customer.isEmpty()) {
+            summary.add(customer);
+        }
+        String date = booking.optString("date", "");
+        String time = booking.optString("timeFrom", "");
+        String dateTime = (date + " " + time).trim();
+        if (!dateTime.isEmpty()) {
+            summary.add(dateTime);
+        }
+        summary.add(NumberFormat.getIntegerInstance().format(booking.optInt("guests", 0)) + " guests");
+        return TextUtils.join(" · ", summary);
     }
 
     // ========================================================================
@@ -1909,6 +2218,28 @@ public class ForwarderService extends Service {
                 listener.onTakeawayOrder(event);
             } catch (Exception e) {
                 Log.w(TAG, "Takeaway order listener threw", e);
+            }
+        }
+    }
+
+    public interface TableBookingListener {
+        void onTableBooking(JSONObject event);
+    }
+
+    public static void registerTableBookingListener(TableBookingListener listener) {
+        tableBookingListeners.addIfAbsent(listener);
+    }
+
+    public static void unregisterTableBookingListener(TableBookingListener listener) {
+        tableBookingListeners.remove(listener);
+    }
+
+    private void notifyTableBooking(JSONObject event) {
+        for (TableBookingListener listener : tableBookingListeners) {
+            try {
+                listener.onTableBooking(event);
+            } catch (Exception e) {
+                Log.w(TAG, "Table booking listener threw", e);
             }
         }
     }
@@ -2448,6 +2779,24 @@ public class ForwarderService extends Service {
         Intent intent = new Intent(context, ForwarderService.class);
         intent.setAction(ACTION_UPDATE_TAKEAWAY_STATE);
         intent.putExtra(EXTRA_TAKEAWAY_ENABLED, enabled);
+        try {
+            context.startService(intent);
+        } catch (IllegalStateException ignored) {
+        }
+    }
+
+    public static void requestUpdateTableBookingState(Context context, boolean enabled) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREFS_TABLE_BOOKING_ENABLED, enabled)
+            .apply();
+        if (!isRunning()) {
+            return;
+        }
+
+        Intent intent = new Intent(context, ForwarderService.class);
+        intent.setAction(ACTION_UPDATE_TABLE_BOOKING_STATE);
+        intent.putExtra(EXTRA_TABLE_BOOKING_ENABLED, enabled);
         try {
             context.startService(intent);
         } catch (IllegalStateException ignored) {

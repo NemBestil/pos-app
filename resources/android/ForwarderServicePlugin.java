@@ -46,12 +46,21 @@ public class ForwarderServicePlugin extends Plugin {
             android.util.Log.w("ForwarderServicePlugin", "Could not forward takeaway order to WebView", exception);
         }
     };
+    private final ForwarderService.TableBookingListener tableBookingListener = event -> {
+        try {
+            notifyListeners("tableBooking", JSObject.fromJSONObject(event), true);
+        } catch (JSONException exception) {
+            android.util.Log.w("ForwarderServicePlugin", "Could not forward table booking to WebView", exception);
+        }
+    };
 
     @Override
     public void load() {
         ForwarderService.registerTokenListener(tokenListener);
         ForwarderService.registerTakeawayOrderListener(takeawayOrderListener);
+        ForwarderService.registerTableBookingListener(tableBookingListener);
         handleTakeawayNotificationIntent(getActivity().getIntent());
+        handleTableBookingNotificationIntent(getActivity().getIntent());
     }
 
     @Override
@@ -59,6 +68,7 @@ public class ForwarderServicePlugin extends Plugin {
         ForwarderService.setAppFocused(false);
         ForwarderService.unregisterTokenListener(tokenListener);
         ForwarderService.unregisterTakeawayOrderListener(takeawayOrderListener);
+        ForwarderService.unregisterTableBookingListener(tableBookingListener);
         super.handleOnDestroy();
     }
 
@@ -70,6 +80,7 @@ public class ForwarderServicePlugin extends Plugin {
     @Override
     protected void handleOnNewIntent(Intent intent) {
         handleTakeawayNotificationIntent(intent);
+        handleTableBookingNotificationIntent(intent);
     }
 
     @PluginMethod
@@ -153,6 +164,21 @@ public class ForwarderServicePlugin extends Plugin {
     }
 
     @PluginMethod
+    public void setTableBookingState(PluginCall call) {
+        Context context = getContext();
+        if (context == null) {
+            call.reject("No Android context");
+            return;
+        }
+        boolean enabled = Boolean.TRUE.equals(call.getBoolean("enabled", false));
+        ForwarderService.requestUpdateTableBookingState(
+            context.getApplicationContext(),
+            enabled
+        );
+        call.resolve();
+    }
+
+    @PluginMethod
     public void requestTakeawayNotificationPermission(PluginCall call) {
         if (
             Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
@@ -210,6 +236,21 @@ public class ForwarderServicePlugin extends Plugin {
         // Capacitor retains the click across WebView startup until the hosted
         // POS has installed its listener and can apply its own readiness gates.
         notifyListeners("takeawayNotificationClick", event, true);
+    }
+
+    private void handleTableBookingNotificationIntent(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra(ForwarderService.EXTRA_OPEN_TABLE_BOOKINGS, false)) {
+            return;
+        }
+        intent.removeExtra(ForwarderService.EXTRA_OPEN_TABLE_BOOKINGS);
+        String bookingId = intent.getStringExtra(ForwarderService.EXTRA_TABLE_BOOKING_ID);
+        intent.removeExtra(ForwarderService.EXTRA_TABLE_BOOKING_ID);
+
+        JSObject event = new JSObject();
+        if (bookingId != null && !bookingId.isEmpty()) {
+            event.put("bookingId", bookingId);
+        }
+        notifyListeners("tableBookingNotificationClick", event, true);
     }
 
 }
