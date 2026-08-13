@@ -17,6 +17,12 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
+import android.hardware.usb.UsbManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -77,9 +83,10 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Persistent foreground service that owns:
  *   1. The LAN print forwarder long-poll loop (was useAndroidLanPrintForwarder in JS).
- *   2. The payment terminal forwarder long-poll loop (was useAndroidPaymentTerminalForwarder in JS).
- *   3. The feature-gated takeaway order broadcast long-poll loop.
- *   4. The feature-gated table booking broadcast long-poll loop.
+ *   2. The local Bluetooth/USB print forwarder long-poll loop.
+ *   3. The payment terminal forwarder long-poll loop (was useAndroidPaymentTerminalForwarder in JS).
+ *   4. The feature-gated takeaway order broadcast long-poll loop.
+ *   5. The feature-gated table booking broadcast long-poll loop.
  *
  * These loops authenticate against /api/_internal/* using the androidsync
  * Bearer token, so the forwarder keeps working even after the WebView signs
@@ -134,7 +141,7 @@ public class ForwarderService extends Service {
     // Bluetooth Classic SPP (Serial Port Profile) — the channel ESC/POS printers expose.
     private static final UUID BLUETOOTH_SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final int BLUETOOTH_PRINT_TIMEOUT_MS = 8_000;
-    private static final int BLUETOOTH_PRINTERS_REFRESH_MS = 30_000;
+    private static final int LOCAL_PRINTERS_REFRESH_MS = 30_000;
     private static final int LONG_POLL_CONNECT_TIMEOUT_MS = 5_000;
     private static final int LONG_POLL_READ_TIMEOUT_MS = 35_000;
     private static final int RETRY_AFTER_ERROR_MS = 3_000;
@@ -171,7 +178,7 @@ public class ForwarderService extends Service {
 
     private final String forwarderId = UUID.randomUUID().toString();
     private final AtomicBoolean lanPrintersDirty = new AtomicBoolean(true);
-    private final AtomicBoolean bluetoothPrintersDirty = new AtomicBoolean(true);
+    private final AtomicBoolean localPrintersDirty = new AtomicBoolean(true);
     // Latches the first time the server rejects our token (401) so only one loop
     // tears things down; cleared again whenever fresh credentials arrive.
     private final AtomicBoolean tokenInvalidated = new AtomicBoolean(false);
@@ -182,7 +189,7 @@ public class ForwarderService extends Service {
     private volatile String authToken;
 
     private Thread lanPrintThread;
-    private Thread bluetoothPrintThread;
+    private Thread localPrintThread;
     private Thread paymentTerminalThread;
     private Thread discoveryThread;
     private Thread heartbeatThread;
@@ -201,7 +208,7 @@ public class ForwarderService extends Service {
     private BroadcastReceiver screenStateReceiver;
 
     private final Object lanPrintLongPollLock = new Object();
-    private final Object bluetoothPrintLongPollLock = new Object();
+    private final Object localPrintLongPollLock = new Object();
     private final Object paymentTerminalLongPollLock = new Object();
     private final Object paymentTerminalSignal = new Object();
     private final Object takeawayOrderLongPollLock = new Object();
@@ -211,7 +218,7 @@ public class ForwarderService extends Service {
     private final Object discoveryThreadLock = new Object();
     private final Object networkCallbackLock = new Object();
     private volatile HttpURLConnection currentLanPrintLongPoll;
-    private volatile HttpURLConnection currentBluetoothPrintLongPoll;
+    private volatile HttpURLConnection currentLocalPrintLongPoll;
     private volatile HttpURLConnection currentPaymentTerminalLongPoll;
     private volatile HttpURLConnection currentTakeawayOrderLongPoll;
     private volatile HttpURLConnection currentTableBookingLongPoll;
@@ -247,11 +254,11 @@ public class ForwarderService extends Service {
         }
 
         if (ACTION_NOTIFY_CONFIG_CHANGED.equals(action)) {
-            Log.i(TAG, "Config change notified; restarting LAN and Bluetooth print loops");
+            Log.i(TAG, "Config change notified; restarting LAN and local print loops");
             lanPrintersDirty.set(true);
-            bluetoothPrintersDirty.set(true);
+            localPrintersDirty.set(true);
             interruptLanPrintLongPoll();
-            interruptBluetoothPrintLongPoll();
+            interruptLocalPrintLongPoll();
             return START_STICKY;
         }
 
@@ -319,7 +326,7 @@ public class ForwarderService extends Service {
             registerScreenStateReceiver();
             startDiscoveryListener();
             startLanPrintLoop();
-            startBluetoothPrintLoop();
+            startLocalPrintLoop();
             startPaymentTerminalLoop();
             startHeartbeatLoop();
             startTakeawayOrderLoop();
@@ -328,7 +335,7 @@ public class ForwarderService extends Service {
             Log.i(TAG, "Forwarder already running; credentials refreshed");
             // Reset the open long-poll connections so they reconnect with the new token.
             interruptLanPrintLongPoll();
-            interruptBluetoothPrintLongPoll();
+            interruptLocalPrintLongPoll();
             interruptPaymentTerminalLongPoll();
             interruptTakeawayOrderLongPoll();
             interruptTableBookingLongPoll();
@@ -402,7 +409,7 @@ public class ForwarderService extends Service {
         }
         activeBaseUrl.set(null);
         interruptLanPrintLongPoll();
-        interruptBluetoothPrintLongPoll();
+        interruptLocalPrintLongPoll();
         interruptPaymentTerminalLongPoll();
         interruptTakeawayOrderLongPoll();
         interruptTableBookingLongPoll();
@@ -412,13 +419,13 @@ public class ForwarderService extends Service {
         unregisterScreenStateReceiver();
         stopDiscoveryListener();
         Thread lan = lanPrintThread;
-        Thread bluetooth = bluetoothPrintThread;
+        Thread local = localPrintThread;
         Thread pay = paymentTerminalThread;
         Thread heartbeat = heartbeatThread;
         Thread takeaway = takeawayOrderThread;
         Thread tableBooking = tableBookingThread;
         lanPrintThread = null;
-        bluetoothPrintThread = null;
+        localPrintThread = null;
         paymentTerminalThread = null;
         heartbeatThread = null;
         takeawayOrderThread = null;
@@ -426,8 +433,8 @@ public class ForwarderService extends Service {
         if (lan != null) {
             lan.interrupt();
         }
-        if (bluetooth != null) {
-            bluetooth.interrupt();
+        if (local != null) {
+            local.interrupt();
         }
         if (pay != null) {
             pay.interrupt();
@@ -458,10 +465,10 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void interruptBluetoothPrintLongPoll() {
-        synchronized (bluetoothPrintLongPollLock) {
-            HttpURLConnection conn = currentBluetoothPrintLongPoll;
-            currentBluetoothPrintLongPoll = null;
+    private void interruptLocalPrintLongPoll() {
+        synchronized (localPrintLongPollLock) {
+            HttpURLConnection conn = currentLocalPrintLongPoll;
+            currentLocalPrintLongPoll = null;
             if (conn != null) {
                 try {
                     conn.disconnect();
@@ -751,62 +758,57 @@ public class ForwarderService extends Service {
     }
 
     // ========================================================================
-    // Bluetooth print long-poll loop
+    // Local printer long-poll loop
     // ========================================================================
     //
-    // Mirrors the LAN loop, but the destination is a bonded (paired) Bluetooth
-    // printer reachable only from this tablet. We advertise the bonded printers
-    // we can actually reach, and deliver each job over a Bluetooth Classic SPP
-    // (RFCOMM) socket, which is what ESC/POS printers expose.
+    // The endpoint names remain Bluetooth-based for deployed-client compatibility,
+    // but this loop advertises every locally attached printer it can currently
+    // reach and dispatches each job according to its Bluetooth or USB transport.
 
-    private void startBluetoothPrintLoop() {
-        bluetoothPrintThread = new Thread(this::runBluetoothPrintLoop, "ForwarderBluetoothPrint");
-        bluetoothPrintThread.setDaemon(true);
-        bluetoothPrintThread.start();
+    private void startLocalPrintLoop() {
+        localPrintThread = new Thread(this::runLocalPrintLoop, "ForwarderLocalPrint");
+        localPrintThread.setDaemon(true);
+        localPrintThread.start();
     }
 
-    private void runBluetoothPrintLoop() {
+    private void runLocalPrintLoop() {
         long lastPrinterFetchAt = 0L;
-        List<BluetoothPrinter> bonded = new ArrayList<>();
+        List<LocalPrinter> available = new ArrayList<>();
 
         while (running.get()) {
             try {
-                if (!hasBluetoothConnectPermission()) {
-                    sleepQuietly(BLUETOOTH_PRINTERS_REFRESH_MS);
-                    continue;
-                }
-
                 long now = System.currentTimeMillis();
-                boolean dirty = bluetoothPrintersDirty.getAndSet(false);
-                if (dirty || bonded.isEmpty() || now - lastPrinterFetchAt > BLUETOOTH_PRINTERS_REFRESH_MS) {
-                    List<BluetoothPrinter> active = fetchActiveBluetoothPrinters();
-                    bonded = filterBondedBluetoothPrinters(active);
+                boolean dirty = localPrintersDirty.getAndSet(false);
+                if (dirty || available.isEmpty() || now - lastPrinterFetchAt > LOCAL_PRINTERS_REFRESH_MS) {
+                    List<LocalPrinter> active = fetchActiveLocalPrinters();
+                    available = filterAvailableLocalPrinters(active);
                     lastPrinterFetchAt = System.currentTimeMillis();
-                    Log.i(TAG, "Bluetooth printers fetched: total=" + active.size() + " bonded=" + bonded.size());
+                    Log.i(TAG, "Local printers fetched: configured=" + active.size() + " available=" + available.size());
                 }
 
-                if (bonded.isEmpty()) {
-                    sleepQuietly(BLUETOOTH_PRINTERS_REFRESH_MS);
+                if (available.isEmpty()) {
+                    sleepQuietly(LOCAL_PRINTERS_REFRESH_MS);
                     continue;
                 }
 
-                boolean handled = longPollBluetoothPrintJob(bonded);
+                boolean handled = longPollLocalPrintJob(available);
                 if (!handled) {
                     sleepQuietly(RETRY_AFTER_ERROR_MS);
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "Bluetooth print loop iteration failed", t);
+                Log.w(TAG, "Local print loop iteration failed", t);
                 sleepQuietly(RETRY_AFTER_ERROR_MS);
             }
         }
-        Log.i(TAG, "Bluetooth print loop exited");
+        Log.i(TAG, "Local print loop exited");
     }
 
-    private List<BluetoothPrinter> fetchActiveBluetoothPrinters() {
-        List<BluetoothPrinter> result = new ArrayList<>();
+    private List<LocalPrinter> fetchActiveLocalPrinters() {
+        List<LocalPrinter> result = new ArrayList<>();
         HttpURLConnection conn = null;
         try {
             final String usedToken = authToken;
+            // Kept unchanged so old app and server releases remain interoperable.
             URL url = new URL(baseUrl + "/api/_internal/bluetooth-printers");
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
@@ -819,23 +821,32 @@ public class ForwarderService extends Service {
                 return result;
             }
             if (status < 200 || status >= 300) {
-                Log.w(TAG, "bluetooth-printers HTTP " + status);
+                Log.w(TAG, "local-printers HTTP " + status);
                 return result;
             }
             String body = readAll(conn.getInputStream());
             JSONArray arr = new JSONArray(body);
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject obj = arr.getJSONObject(i);
-                BluetoothPrinter printer = new BluetoothPrinter();
+                LocalPrinter printer = new LocalPrinter();
                 printer.printerId = obj.optString("printerId", null);
-                String address = obj.optString("address", null);
-                printer.address = address == null ? null : address.toUpperCase();
-                if (printer.printerId != null && printer.address != null) {
+                printer.transport = obj.optString("transport", "bluetooth");
+                printer.target = obj.optString("target", obj.optString("address", null));
+                if ("bluetooth".equals(printer.transport) && printer.target != null) {
+                    printer.target = printer.target.toUpperCase();
+                }
+                printer.usbDeviceName = obj.optString("usbDeviceName", null);
+                printer.usbVendorId = obj.optInt("usbVendorId", -1);
+                printer.usbProductId = obj.optInt("usbProductId", -1);
+                printer.usbSerialNumber = obj.isNull("usbSerialNumber")
+                    ? null
+                    : obj.optString("usbSerialNumber", null);
+                if (printer.printerId != null && printer.target != null) {
                     result.add(printer);
                 }
             }
         } catch (Exception e) {
-            Log.w(TAG, "fetchActiveBluetoothPrinters failed", e);
+            Log.w(TAG, "fetchActiveLocalPrinters failed", e);
         } finally {
             if (conn != null) {
                 conn.disconnect();
@@ -844,18 +855,64 @@ public class ForwarderService extends Service {
         return result;
     }
 
-    private List<BluetoothPrinter> filterBondedBluetoothPrinters(List<BluetoothPrinter> printers) {
-        List<BluetoothPrinter> bonded = new ArrayList<>();
-        if (printers.isEmpty()) {
-            return bonded;
-        }
-        Set<String> bondedAddresses = getBondedAddresses();
-        for (BluetoothPrinter printer : printers) {
-            if (bondedAddresses.contains(printer.address)) {
-                bonded.add(printer);
+    private List<LocalPrinter> filterAvailableLocalPrinters(List<LocalPrinter> printers) {
+        List<LocalPrinter> available = new ArrayList<>();
+        Set<String> bondedAddresses = hasBluetoothConnectPermission() ? getBondedAddresses() : new HashSet<>();
+        UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+
+        for (LocalPrinter printer : printers) {
+            if ("bluetooth".equals(printer.transport)) {
+                if (bondedAddresses.contains(printer.target)) {
+                    available.add(printer);
+                }
+                continue;
+            }
+
+            if (!"usb".equals(printer.transport) || usbManager == null) {
+                continue;
+            }
+
+            UsbDevice device = findUsbDevice(usbManager, printer, printers);
+            if (device != null && usbManager.hasPermission(device)) {
+                printer.target = device.getDeviceName();
+                available.add(printer);
             }
         }
-        return bonded;
+        return available;
+    }
+
+    private UsbDevice findUsbDevice(UsbManager manager, LocalPrinter printer, List<LocalPrinter> configured) {
+        List<UsbDevice> candidates = new ArrayList<>();
+        for (UsbDevice device : manager.getDeviceList().values()) {
+            if (device.getVendorId() == printer.usbVendorId && device.getProductId() == printer.usbProductId) {
+                candidates.add(device);
+            }
+        }
+
+        if (printer.usbSerialNumber != null) {
+            for (UsbDevice device : candidates) {
+                if (!manager.hasPermission(device)) continue;
+                try {
+                    if (printer.usbSerialNumber.equals(device.getSerialNumber())) return device;
+                } catch (SecurityException ignored) {
+                }
+            }
+            return null;
+        }
+
+        for (UsbDevice device : candidates) {
+            if (device.getDeviceName().equals(printer.usbDeviceName)) return device;
+        }
+
+        int configuredWithSameProduct = 0;
+        for (LocalPrinter entry : configured) {
+            if ("usb".equals(entry.transport)
+                && entry.usbVendorId == printer.usbVendorId
+                && entry.usbProductId == printer.usbProductId) {
+                configuredWithSameProduct++;
+            }
+        }
+        return candidates.size() == 1 && configuredWithSameProduct == 1 ? candidates.get(0) : null;
     }
 
     private Set<String> getBondedAddresses() {
@@ -880,14 +937,18 @@ public class ForwarderService extends Service {
         return addresses;
     }
 
-    private boolean longPollBluetoothPrintJob(List<BluetoothPrinter> printers) {
+    private boolean longPollLocalPrintJob(List<LocalPrinter> printers) {
         HttpURLConnection conn = null;
         try {
             JSONArray arr = new JSONArray();
-            for (BluetoothPrinter printer : printers) {
+            for (LocalPrinter printer : printers) {
                 JSONObject obj = new JSONObject();
                 obj.put("printerId", printer.printerId);
-                obj.put("address", printer.address);
+                obj.put("transport", printer.transport);
+                obj.put("target", printer.target);
+                if ("bluetooth".equals(printer.transport)) {
+                    obj.put("address", printer.target);
+                }
                 arr.put(obj);
             }
             JSONObject body = new JSONObject();
@@ -910,8 +971,8 @@ public class ForwarderService extends Service {
                 out.write(payload);
             }
 
-            synchronized (bluetoothPrintLongPollLock) {
-                currentBluetoothPrintLongPoll = conn;
+            synchronized (localPrintLongPollLock) {
+                currentLocalPrintLongPoll = conn;
             }
 
             int status = conn.getResponseCode();
@@ -923,26 +984,26 @@ public class ForwarderService extends Service {
                 return false;
             }
 
-            Map<String, String> addressByPrinterId = new java.util.HashMap<>();
-            for (BluetoothPrinter printer : printers) {
-                addressByPrinterId.put(printer.printerId, printer.address);
+            Map<String, LocalPrinter> printerById = new java.util.HashMap<>();
+            for (LocalPrinter printer : printers) {
+                printerById.put(printer.printerId, printer);
             }
 
             readLongPollResponse(conn, (event, data) -> {
                 if ("print-job".equals(event)) {
-                    handleBluetoothPrintJob(data, addressByPrinterId);
+                    handleLocalPrintJob(data, printerById);
                 }
             });
             return true;
         } catch (Exception e) {
             if (running.get()) {
-                Log.w(TAG, "longPollBluetoothPrintJob failed", e);
+                Log.w(TAG, "longPollLocalPrintJob failed", e);
             }
             return false;
         } finally {
-            synchronized (bluetoothPrintLongPollLock) {
-                if (currentBluetoothPrintLongPoll == conn) {
-                    currentBluetoothPrintLongPoll = null;
+            synchronized (localPrintLongPollLock) {
+                if (currentLocalPrintLongPoll == conn) {
+                    currentLocalPrintLongPoll = null;
                 }
             }
             if (conn != null) {
@@ -954,27 +1015,32 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void handleBluetoothPrintJob(String data, Map<String, String> addressByPrinterId) {
+    private void handleLocalPrintJob(String data, Map<String, LocalPrinter> printerById) {
         try {
             JSONObject job = new JSONObject(data);
             String jobId = job.optString("jobId", "");
             String printerId = job.optString("printerId", null);
-            String addressFromJob = job.optString("target", null);
+            LocalPrinter printer = printerById.get(printerId);
+            String transport = printer == null ? job.optString("transport", "bluetooth") : printer.transport;
+            String target = printer == null ? job.optString("target", null) : printer.target;
             String payloadBase64 = job.optString("payloadBase64", null);
             int timeoutMs = job.optInt("timeoutMs", BLUETOOTH_PRINT_TIMEOUT_MS);
             if (payloadBase64 == null) {
-                Log.w(TAG, "Bluetooth print-job missing payloadBase64 jobId=" + jobId);
+                Log.w(TAG, "Local print-job missing payloadBase64 jobId=" + jobId);
                 return;
             }
-            String address = addressByPrinterId.getOrDefault(printerId, addressFromJob);
-            if (address == null || address.isEmpty()) {
-                Log.w(TAG, "Bluetooth print-job has no address jobId=" + jobId);
+            if (target == null || target.isEmpty()) {
+                Log.w(TAG, "Local print-job has no target jobId=" + jobId);
                 return;
             }
             byte[] bytes = Base64.decode(payloadBase64, Base64.DEFAULT);
-            sendBytesToBluetoothPrinter(address, bytes, timeoutMs, jobId);
+            if ("usb".equals(transport)) {
+                sendBytesToUsbPrinter(target, bytes, timeoutMs, jobId);
+            } else {
+                sendBytesToBluetoothPrinter(target, bytes, timeoutMs, jobId);
+            }
         } catch (Exception e) {
-            Log.w(TAG, "handleBluetoothPrintJob failed", e);
+            Log.w(TAG, "handleLocalPrintJob failed", e);
         }
     }
 
@@ -1024,6 +1090,64 @@ public class ForwarderService extends Service {
         }
     }
 
+    private void sendBytesToUsbPrinter(String deviceName, byte[] bytes, int timeoutMs, String jobId) {
+        UsbManager manager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        UsbDevice device = manager == null ? null : manager.getDeviceList().get(deviceName);
+        if (manager == null || device == null || !manager.hasPermission(device)) {
+            Log.w(TAG, "USB printer unavailable jobId=" + jobId + " device=" + deviceName);
+            return;
+        }
+
+        UsbInterface selectedInterface = null;
+        UsbEndpoint outputEndpoint = null;
+        for (int interfaceIndex = 0; interfaceIndex < device.getInterfaceCount(); interfaceIndex++) {
+            UsbInterface candidate = device.getInterface(interfaceIndex);
+            for (int endpointIndex = 0; endpointIndex < candidate.getEndpointCount(); endpointIndex++) {
+                UsbEndpoint endpoint = candidate.getEndpoint(endpointIndex);
+                if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK
+                    && endpoint.getDirection() == UsbConstants.USB_DIR_OUT) {
+                    if (outputEndpoint == null || candidate.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER) {
+                        selectedInterface = candidate;
+                        outputEndpoint = endpoint;
+                    }
+                }
+            }
+            if (selectedInterface != null && selectedInterface.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER) {
+                break;
+            }
+        }
+
+        if (selectedInterface == null || outputEndpoint == null) {
+            Log.w(TAG, "USB printer has no bulk OUT endpoint jobId=" + jobId + " device=" + deviceName);
+            return;
+        }
+
+        UsbDeviceConnection connection = manager.openDevice(device);
+        if (connection == null || !connection.claimInterface(selectedInterface, true)) {
+            if (connection != null) connection.close();
+            Log.w(TAG, "Could not claim USB printer interface jobId=" + jobId + " device=" + deviceName);
+            return;
+        }
+
+        try {
+            int offset = 0;
+            while (offset < bytes.length) {
+                int length = Math.min(16_384, bytes.length - offset);
+                int transferred = connection.bulkTransfer(outputEndpoint, bytes, offset, length, timeoutMs);
+                if (transferred <= 0) {
+                    throw new IOException("USB bulk transfer failed at byte " + offset);
+                }
+                offset += transferred;
+            }
+            Log.i(TAG, "USB print delivered jobId=" + jobId + " device=" + deviceName + " bytes=" + bytes.length);
+        } catch (IOException e) {
+            Log.w(TAG, "USB print failed jobId=" + jobId + " device=" + deviceName, e);
+        } finally {
+            connection.releaseInterface(selectedInterface);
+            connection.close();
+        }
+    }
+
     private BluetoothAdapter resolveBluetoothAdapter() {
         try {
             BluetoothManager manager =
@@ -1043,10 +1167,15 @@ public class ForwarderService extends Service {
             == PackageManager.PERMISSION_GRANTED;
     }
 
-    // Container used internally for bonded Bluetooth printer entries.
-    private static class BluetoothPrinter {
+    // Container used internally for locally attached printer entries.
+    private static class LocalPrinter {
         String printerId;
-        String address;
+        String transport;
+        String target;
+        String usbDeviceName;
+        int usbVendorId;
+        int usbProductId;
+        String usbSerialNumber;
     }
 
     // ========================================================================

@@ -160,6 +160,12 @@ permissions = [
     "android.permission.REQUEST_INSTALL_PACKAGES",
 ]
 anchor = '<uses-permission android:name="android.permission.INTERNET" />'
+usb_host_feature = '<uses-feature android:name="android.hardware.usb.host" android:required="false" />'
+if usb_host_feature not in text and "<application" in text:
+    text = text.replace("    <application", "    " + usb_host_feature + "\n\n    <application", 1)
+    changed = True
+    print("🩹 Declared optional Android USB host support in AndroidManifest.xml")
+
 if anchor in text:
     for perm in permissions:
         line = f'<uses-permission android:name="{perm}" />'
