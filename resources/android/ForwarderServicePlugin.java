@@ -21,9 +21,8 @@ import org.json.JSONException;
  * needs to ask "turn it on/off" and "what's the state" — everything else lives
  * in the service itself.
  *
- * Android does not require POST_NOTIFICATIONS permission to start a foreground
- * service. The service therefore starts independently of notification-drawer
- * visibility and remains visible in Android's active-apps UI.
+ * Notification permission is requested explicitly by the hosted POS after the
+ * user has authenticated, never while the app shell is starting.
  */
 @CapacitorPlugin(
     name = "ForwarderService",
@@ -179,7 +178,7 @@ public class ForwarderServicePlugin extends Plugin {
     }
 
     @PluginMethod
-    public void requestTakeawayNotificationPermission(PluginCall call) {
+    public void requestNotificationPermission(PluginCall call) {
         if (
             Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
                 || getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED
@@ -190,29 +189,25 @@ public class ForwarderServicePlugin extends Plugin {
         requestPermissionForAlias(
             NOTIFICATIONS_ALIAS,
             call,
-            "takeawayNotificationPermissionCallback"
+            "notificationPermissionCallback"
         );
     }
 
     @PermissionCallback
-    private void takeawayNotificationPermissionCallback(PluginCall call) {
+    private void notificationPermissionCallback(PluginCall call) {
         resolveNotificationPermission(
             call,
             getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED
         );
     }
 
-    /**
-     * Kept for hosted frontend versions that still treat notification
-     * permission as a foreground-service prerequisite. Modern Android does not
-     * require that permission to start the service, so compatibility clients
-     * should proceed as though the prerequisite is satisfied.
-     */
     @PluginMethod
     public void checkNotificationPermission(PluginCall call) {
-        JSObject ret = new JSObject();
-        ret.put("granted", true);
-        call.resolve(ret);
+        resolveNotificationPermission(
+            call,
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+                || getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED
+        );
     }
 
     private void resolveNotificationPermission(PluginCall call, boolean granted) {

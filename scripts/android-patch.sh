@@ -183,10 +183,11 @@ if legacy_data_sync_permission in text:
     print("🩹 Removed FOREGROUND_SERVICE_DATA_SYNC permission from AndroidManifest.xml")
 
 # Bluetooth printing (BluetoothPrinterPlugin + ForwarderService Bluetooth loop).
-# BLUETOOTH_CONNECT is the runtime permission used from Android 12; the legacy
-# BLUETOOTH/BLUETOOTH_ADMIN permissions only matter on API <= 30.
+# BLUETOOTH_CONNECT and BLUETOOTH_SCAN are runtime permissions used from Android
+# 12; the legacy BLUETOOTH/BLUETOOTH_ADMIN permissions only matter on API <= 30.
 bluetooth_lines = [
     '<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />',
+    '<uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />',
     '<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />',
     '<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />',
 ]

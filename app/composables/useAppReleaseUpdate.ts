@@ -36,7 +36,6 @@ interface UpdateNotificationAction {
 interface ApkUpdaterPlugin {
   getReleaseInfo(): Promise<{ prerelease: boolean }>
   schedulePeriodicChecks(): Promise<void>
-  requestUpdateNotificationPermission(): Promise<{ granted: boolean }>
   getPendingUpdateAction(): Promise<{ action?: UpdateNotificationAction }>
   addListener(
     eventName: 'updateNotificationAction',
@@ -87,7 +86,6 @@ export function useAppReleaseUpdate() {
     )
 
     await apkUpdater.schedulePeriodicChecks()
-    await apkUpdater.requestUpdateNotificationPermission()
 
     const pendingAction = await apkUpdater.getPendingUpdateAction()
     if (pendingAction.action) {

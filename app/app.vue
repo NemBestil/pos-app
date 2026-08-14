@@ -161,6 +161,10 @@ onMounted(() => {
     logoVisible.value = true
   }, 80)
 
+  if (installations.value.length > 0) {
+    void synchronizeInstallationMetadata()
+  }
+
   void initializeUpdateChecks()
 
   addSentryBreadcrumb('app.lifecycle', 'Shell loaded', {
@@ -464,6 +468,60 @@ async function fetchInstallationDetails(baseUrl: string) {
   }
 
   return data
+}
+
+async function synchronizeInstallationMetadata() {
+  const savedInstallations = installations.value
+  const results = await Promise.allSettled(
+    savedInstallations.map(async (installation) => ({
+      id: installation.id,
+      details: await fetchInstallationDetails(installation.baseUrl)
+    }))
+  )
+
+  const metadataByInstallationId = new Map<string, InstallationResponse>()
+  let failedCount = 0
+
+  results.forEach((result, index) => {
+    const installation = savedInstallations[index]
+
+    if (result.status === 'fulfilled') {
+      metadataByInstallationId.set(result.value.id, result.value.details)
+      return
+    }
+
+    failedCount += 1
+    addSentryBreadcrumb('app.installation', 'Installation metadata synchronization failed', {
+      installationId: installation.id,
+      baseUrl: installation.baseUrl,
+      error: getErrorMessage(result.reason)
+    }, 'warning')
+  })
+
+  if (metadataByInstallationId.size === 0) {
+    return
+  }
+
+  installations.value = installations.value.map((installation) => {
+    const metadata = metadataByInstallationId.get(installation.id)
+
+    if (!metadata) {
+      return installation
+    }
+
+    return {
+      ...installation,
+      organization: metadata.organization,
+      branding: metadata.branding
+    }
+  })
+
+  persistInstallations()
+  setSentryInstallationContext(selectedInstallation.value)
+  addSentryBreadcrumb('app.installation', 'Installation metadata synchronized', {
+    synchronizedCount: metadataByInstallationId.size,
+    failedCount
+  })
 }
 
 function normalizeInstallationResponse(data: unknown): InstallationResponse {

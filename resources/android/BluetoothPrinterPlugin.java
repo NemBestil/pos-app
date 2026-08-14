@@ -32,7 +32,13 @@ import java.util.Set;
 @CapacitorPlugin(
     name = "BluetoothPrinter",
     permissions = {
-        @Permission(alias = "bluetooth", strings = { Manifest.permission.BLUETOOTH_CONNECT })
+        @Permission(
+            alias = "bluetooth",
+            strings = {
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_SCAN
+            }
+        )
     }
 )
 public class BluetoothPrinterPlugin extends Plugin {
@@ -41,12 +47,25 @@ public class BluetoothPrinterPlugin extends Plugin {
 
     @PluginMethod
     public void list(PluginCall call) {
-        // BLUETOOTH_CONNECT only exists (and is only enforced) from Android 12.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && getPermissionState(BLUETOOTH_ALIAS) != PermissionState.GRANTED) {
-            requestPermissionForAlias(BLUETOOTH_ALIAS, call, "listPermissionCallback");
+        if (!hasBluetoothPermission()) {
+            call.reject("Bluetooth permission is required to list paired printers.");
             return;
         }
         resolveBondedPrinters(call);
+    }
+
+    @PluginMethod
+    public void checkPermission(PluginCall call) {
+        resolveBluetoothPermission(call, hasBluetoothPermission());
+    }
+
+    @PluginMethod
+    public void requestPermission(PluginCall call) {
+        if (hasBluetoothPermission()) {
+            resolveBluetoothPermission(call, true);
+            return;
+        }
+        requestPermissionForAlias(BLUETOOTH_ALIAS, call, "permissionCallback");
     }
 
     @PluginMethod
@@ -56,12 +75,19 @@ public class BluetoothPrinterPlugin extends Plugin {
     }
 
     @PermissionCallback
-    private void listPermissionCallback(PluginCall call) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && getPermissionState(BLUETOOTH_ALIAS) != PermissionState.GRANTED) {
-            call.reject("Bluetooth permission is required to list paired printers.");
-            return;
-        }
-        resolveBondedPrinters(call);
+    private void permissionCallback(PluginCall call) {
+        resolveBluetoothPermission(call, hasBluetoothPermission());
+    }
+
+    private boolean hasBluetoothPermission() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+            || getPermissionState(BLUETOOTH_ALIAS) == PermissionState.GRANTED;
+    }
+
+    private void resolveBluetoothPermission(PluginCall call, boolean granted) {
+        JSObject result = new JSObject();
+        result.put("granted", granted);
+        call.resolve(result);
     }
 
     private void resolveBondedPrinters(PluginCall call) {

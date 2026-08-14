@@ -23,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -46,6 +47,7 @@ public class NetworkPrinterPlugin extends Plugin {
     private static final int PRINTER_PORT = 9100;
     private static final int DEFAULT_PRINT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_PING_TIMEOUT_MS = 1500;
+    private static final int DEFAULT_ESCPOS_PROBE_TIMEOUT_MS = 2000;
 
     private static final Pattern ETH_INFO_PATTERN = Pattern.compile(
         "Ethernet\\s+Information",
@@ -95,7 +97,106 @@ public class NetworkPrinterPlugin extends Plugin {
     public void status(PluginCall call) {
         JSObject ret = new JSObject();
         ret.put("scanning", scanning.get());
+        ret.put("supportsManualSetup", true);
         call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void networkInfo(PluginCall call) {
+        ioExecutor.submit(() -> {
+            JSObject result = new JSObject();
+            try {
+                Inet4Address address = findPrivateLanAddress();
+                if (address != null) {
+                    String ip = address.getHostAddress();
+                    int lastDot = ip.lastIndexOf('.');
+                    result.put("ip", ip);
+                    result.put("suggestedIpPrefix", ip.substring(0, lastDot + 1));
+                }
+            } catch (Exception ignored) {
+            }
+            call.resolve(result);
+        });
+    }
+
+    @PluginMethod
+    public void probeEscPos(PluginCall call) {
+        final String ip = call.getString("ip");
+        if (ip == null || ip.trim().isEmpty()) {
+            call.reject("Missing 'ip'");
+            return;
+        }
+        final int timeoutMs = call.getInt("timeoutMs", DEFAULT_ESCPOS_PROBE_TIMEOUT_MS);
+
+        ioExecutor.submit(() -> runEscPosProbe(ip.trim(), timeoutMs, call));
+    }
+
+    private void runEscPosProbe(String ip, int timeoutMs, PluginCall call) {
+        long started = System.currentTimeMillis();
+        boolean portOpen = false;
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(ip, PRINTER_PORT), timeoutMs);
+            socket.setSoTimeout(timeoutMs);
+            socket.setTcpNoDelay(true);
+            portOpen = true;
+
+            OutputStream out = socket.getOutputStream();
+            InputStream in = socket.getInputStream();
+            out.write(new byte[] {
+                0x10, 0x04, 0x01,
+                0x10, 0x04, 0x02,
+                0x10, 0x04, 0x03,
+                0x10, 0x04, 0x04
+            });
+            out.flush();
+
+            int[] statuses = new int[4];
+            for (int index = 0; index < statuses.length; index++) {
+                int statusByte = in.read();
+                if (statusByte < 0 || !isValidEscPosStatusByte(statusByte)) {
+                    throw new IllegalStateException("Device did not return valid ESC/POS status bytes");
+                }
+                statuses[index] = statusByte;
+            }
+
+            NetworkMetadata metadata = queryNetworkMetadata(ip, timeoutMs);
+            JSObject result = new JSObject();
+            JSONArray statusBytes = new JSONArray();
+            for (int statusByte : statuses) {
+                statusBytes.put(statusByte);
+            }
+            result.put("success", true);
+            result.put("tcpPortOpen", true);
+            result.put("statusBytes", statusBytes);
+            result.put("online", (statuses[0] & 0x08) == 0);
+            result.put("coverOpen", (statuses[1] & 0x04) != 0);
+            result.put("paperNearEnd", (statuses[3] & 0x0c) == 0x0c);
+            result.put("paperOut", (statuses[3] & 0x60) == 0x60);
+            result.put("hasError", (statuses[1] & 0x40) != 0 || (statuses[2] & 0x6c) != 0);
+            result.put("durationMs", System.currentTimeMillis() - started);
+            if (metadata != null && metadata.mac != null) {
+                result.put("mac", metadata.mac);
+            }
+            call.resolve(result);
+        } catch (Exception e) {
+            JSObject result = new JSObject();
+            result.put("success", false);
+            result.put("tcpPortOpen", portOpen);
+            result.put("durationMs", System.currentTimeMillis() - started);
+            result.put("error", e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            call.resolve(result);
+        } finally {
+            try {
+                socket.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static boolean isValidEscPosStatusByte(int statusByte) {
+        // ESC/POS DLE EOT status bytes use the fixed pattern 0xx1xx10b.
+        return (statusByte & 0x93) == 0x12;
     }
 
     private void runScan() {
@@ -192,28 +293,37 @@ public class NetworkPrinterPlugin extends Plugin {
     }
 
     private FoundPrinter probe(String ip) {
+        NetworkMetadata metadata = queryNetworkMetadata(ip, SCAN_REQUEST_TIMEOUT_MS);
+        if (metadata != null && metadata.mac != null && metadata.ip != null) {
+            FoundPrinter found = new FoundPrinter();
+            found.ip = ip;
+            found.mac = metadata.mac;
+            return found;
+        }
+        return null;
+    }
+
+    private NetworkMetadata queryNetworkMetadata(String ip, int timeoutMs) {
         // The XPrinter web UI speaks HTTP/0.9: it accepts a bare "GET <path>\r\n"
-        // request line (no version, no headers) and replies with the raw HTML body,
-        // no status line and no headers. Java's HttpURLConnection cannot parse that,
-        // so we use a raw socket and read until close.
+        // request line and replies with a raw HTML body.
         Socket socket = new Socket();
         try {
-            socket.connect(new InetSocketAddress(ip, 80), SCAN_REQUEST_TIMEOUT_MS);
-            socket.setSoTimeout(SCAN_REQUEST_TIMEOUT_MS);
+            socket.connect(new InetSocketAddress(ip, 80), timeoutMs);
+            socket.setSoTimeout(timeoutMs);
 
             OutputStream out = socket.getOutputStream();
             out.write("GET /ip_info.htm\r\n".getBytes(StandardCharsets.ISO_8859_1));
             out.flush();
 
-            InputStream is = socket.getInputStream();
-            ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            byte[] tmp = new byte[1024];
+            InputStream in = socket.getInputStream();
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            byte[] chunk = new byte[1024];
             int total = 0;
-            int n;
-            while ((n = is.read(tmp)) > 0) {
-                int allowed = Math.min(n, MAX_RESPONSE_BYTES - total);
+            int read;
+            while ((read = in.read(chunk)) > 0) {
+                int allowed = Math.min(read, MAX_RESPONSE_BYTES - total);
                 if (allowed > 0) {
-                    buf.write(tmp, 0, allowed);
+                    buffer.write(chunk, 0, allowed);
                     total += allowed;
                 }
                 if (total >= MAX_RESPONSE_BYTES) {
@@ -221,24 +331,22 @@ public class NetworkPrinterPlugin extends Plugin {
                 }
             }
 
-            // If the device happened to reply with HTTP/1.x (status line + headers),
-            // strip the prologue so the regex patterns see clean markup.
-            String body = stripHttpPrologue(buf.toString("ISO-8859-1"));
-
+            String body = stripHttpPrologue(buffer.toString("ISO-8859-1"));
             if (!ETH_INFO_PATTERN.matcher(body).find()) {
                 return null;
             }
+
             Matcher macMatch = MAC_PATTERN.matcher(body);
             Matcher ipMatch = IP_PATTERN.matcher(body);
-            if (!macMatch.find() || !ipMatch.find()) {
-                return null;
+            NetworkMetadata metadata = new NetworkMetadata();
+            if (macMatch.find()) {
+                metadata.mac = macMatch.group(1).toUpperCase().replace(':', '-');
             }
-
-            FoundPrinter found = new FoundPrinter();
-            found.ip = ip;
-            found.mac = macMatch.group(1).toUpperCase().replace(':', '-');
-            return found;
-        } catch (Exception e) {
+            if (ipMatch.find()) {
+                metadata.ip = ipMatch.group(1);
+            }
+            return metadata;
+        } catch (Exception ignored) {
             return null;
         } finally {
             try {
@@ -311,7 +419,53 @@ public class NetworkPrinterPlugin extends Plugin {
         return result;
     }
 
+    private Inet4Address findPrivateLanAddress() throws Exception {
+        Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+        if (interfaces == null) {
+            return null;
+        }
+
+        while (interfaces.hasMoreElements()) {
+            NetworkInterface networkInterface = interfaces.nextElement();
+            if (!networkInterface.isUp() || networkInterface.isLoopback() || networkInterface.isVirtual()) {
+                continue;
+            }
+
+            String interfaceName = networkInterface.getName().toLowerCase(Locale.ROOT);
+            boolean preferredInterface = interfaceName.startsWith("wlan") || interfaceName.startsWith("eth");
+            if (!preferredInterface) {
+                continue;
+            }
+
+            Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
+            while (addresses.hasMoreElements()) {
+                InetAddress address = addresses.nextElement();
+                if (!(address instanceof Inet4Address) || !isPrivateLanAddress(address.getAddress())) {
+                    continue;
+                }
+
+                Inet4Address ipv4Address = (Inet4Address) address;
+                return ipv4Address;
+            }
+        }
+
+        return null;
+    }
+
+    private static boolean isPrivateLanAddress(byte[] address) {
+        int first = address[0] & 0xff;
+        int second = address[1] & 0xff;
+        return first == 10
+            || (first == 172 && second >= 16 && second <= 31)
+            || (first == 192 && second == 168);
+    }
+
     private static class FoundPrinter {
+        String ip;
+        String mac;
+    }
+
+    private static class NetworkMetadata {
         String ip;
         String mac;
     }

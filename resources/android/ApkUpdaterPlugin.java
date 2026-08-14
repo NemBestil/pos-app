@@ -1,6 +1,5 @@
 package com.nembestil.pos3.app;
 
-import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
@@ -10,13 +9,10 @@ import android.provider.Settings;
 import androidx.core.content.FileProvider;
 
 import com.getcapacitor.JSObject;
-import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
-import com.getcapacitor.annotation.Permission;
-import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -25,15 +21,8 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
-@CapacitorPlugin(
-    name = "ApkUpdater",
-    permissions = {
-        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS })
-    }
-)
+@CapacitorPlugin(name = "ApkUpdater")
 public class ApkUpdaterPlugin extends Plugin {
-
-    private static final String NOTIFICATIONS_ALIAS = "notifications";
 
     @Override
     public void load() {
@@ -57,31 +46,6 @@ public class ApkUpdaterPlugin extends Plugin {
     public void schedulePeriodicChecks(PluginCall call) {
         AppReleaseUpdateReceiver.schedule(getContext());
         call.resolve();
-    }
-
-    @PluginMethod
-    public void requestUpdateNotificationPermission(PluginCall call) {
-        if (
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
-                || getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED
-        ) {
-            resolveNotificationPermission(call, true);
-            return;
-        }
-
-        requestPermissionForAlias(
-            NOTIFICATIONS_ALIAS,
-            call,
-            "updateNotificationPermissionCallback"
-        );
-    }
-
-    @PermissionCallback
-    private void updateNotificationPermissionCallback(PluginCall call) {
-        resolveNotificationPermission(
-            call,
-            getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED
-        );
     }
 
     @PluginMethod
@@ -200,12 +164,6 @@ public class ApkUpdaterPlugin extends Plugin {
         action.put("release", release);
         action.put("accept", accept);
         return action;
-    }
-
-    private void resolveNotificationPermission(PluginCall call, boolean granted) {
-        JSObject result = new JSObject();
-        result.put("granted", granted);
-        call.resolve(result);
     }
 
     private void downloadAndInstall(PluginCall call, String url, String fileName) {
