@@ -77,6 +77,8 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -149,6 +151,8 @@ public class ForwarderService extends Service {
     private static final int TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS = 5 * 60_000;
     private static final int RESPONSE_SUBMIT_RETRY_MS = 1_000;
     private static final int RESPONSE_SUBMIT_MAX_MS = 60_000;
+    private static final int PAYMENT_TERMINAL_FORWARDER_PROTOCOL = 2;
+    private static final int TERMINAL_JOB_CONTROL_POLL_MS = 1_000;
 
     // Worldline UDP discovery
     private static final int DISCOVERY_PORT = 8000;
@@ -184,6 +188,8 @@ public class ForwarderService extends Service {
     private final AtomicBoolean tokenInvalidated = new AtomicBoolean(false);
     private final AtomicBoolean takeawayEnabled = new AtomicBoolean(false);
     private final AtomicBoolean tableBookingEnabled = new AtomicBoolean(false);
+    private final ConcurrentMap<String, ExecutorService> paymentTerminalExecutors = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, TerminalJobExecution> activeTerminalJobs = new ConcurrentHashMap<>();
 
     private volatile String baseUrl;
     private volatile String authToken;
@@ -448,6 +454,14 @@ public class ForwarderService extends Service {
         if (tableBooking != null) {
             tableBooking.interrupt();
         }
+        for (TerminalJobExecution execution : activeTerminalJobs.values()) {
+            execution.requestCancellation();
+        }
+        activeTerminalJobs.clear();
+        for (ExecutorService executor : paymentTerminalExecutors.values()) {
+            executor.shutdownNow();
+        }
+        paymentTerminalExecutors.clear();
         // Unexpected shutdowns keep the stored credentials so Android can
         // restore the service. An explicit stop removes them before this runs.
     }
@@ -1239,6 +1253,13 @@ public class ForwarderService extends Service {
             body.put("forwarderId", forwarderId);
             body.put("terminalIds", arr);
             body.put("screenOn", screenOn.get());
+            body.put("appVersion", BuildConfig.VERSION_NAME);
+            body.put("forwarderProtocol", PAYMENT_TERMINAL_FORWARDER_PROTOCOL);
+            JSONArray capabilities = new JSONArray();
+            capabilities.put("terminal-job-claim");
+            capabilities.put("terminal-job-cancel");
+            capabilities.put("per-terminal-serialization");
+            body.put("capabilities", capabilities);
 
             final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward");
@@ -1302,25 +1323,30 @@ public class ForwarderService extends Service {
             String forwardedUrl = job.optString("url", null);
             String method = job.optString("method", "POST");
             int timeoutMs = job.optInt("timeoutMs", TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS);
+            int forwarderProtocol = job.optInt("forwarderProtocol", 1);
+            String deliveryToken = job.optString("deliveryToken", "");
+            String operationMode = job.optString("operationMode", "exclusive");
+            String responseDeliveryToken = forwarderProtocol >= 2 ? deliveryToken : null;
             JSONObject headers = job.optJSONObject("headers");
             String requestBody = job.isNull("body") ? null : job.optString("body", null);
             if (paymentTerminalId.isEmpty()) {
-                postTerminalError(jobId, "Forwarded terminal request missing paymentTerminalId.");
+                postTerminalError(jobId, responseDeliveryToken, "Forwarded terminal request missing paymentTerminalId.");
                 return;
             }
             if (forwardedUrl == null) {
-                postTerminalError(jobId, "Forwarded terminal request missing url.");
+                postTerminalError(jobId, responseDeliveryToken, "Forwarded terminal request missing url.");
+                return;
+            }
+            if (forwarderProtocol >= 2 && deliveryToken.isEmpty()) {
+                postTerminalError(jobId, "Forwarded terminal v2 request is missing its delivery token.");
                 return;
             }
             URL parsedForwardedUrl = new URL(forwardedUrl);
             String path = parsedForwardedUrl.getFile();
             if (path == null || !path.startsWith("/") || path.startsWith("//")) {
-                postTerminalError(jobId, "Forwarded terminal request url has an invalid path.");
+                postTerminalError(jobId, responseDeliveryToken, "Forwarded terminal request url has an invalid path.");
                 return;
             }
-            // Run the actual terminal call in its own thread so the long-poll
-            // can close right away and the next job can come in without waiting on
-            // the (possibly multi-minute) terminal interaction.
             final String finalJobId = jobId;
             final String finalPaymentTerminalId = paymentTerminalId;
             final String finalPath = path;
@@ -1328,20 +1354,91 @@ public class ForwarderService extends Service {
             final int finalTimeoutMs = timeoutMs;
             final JSONObject finalHeaders = headers;
             final String finalBody = requestBody;
-            Thread worker = new Thread(() -> dispatchTerminalRequest(
+            final String finalDeliveryToken = deliveryToken;
+
+            if (forwarderProtocol < 2) {
+                // Protocol v1 stays byte-for-byte compatible while customers roll
+                // forward. It deliberately retains the old concurrent worker model.
+                Thread worker = new Thread(() -> dispatchTerminalRequestV1(
+                    finalJobId,
+                    finalPaymentTerminalId,
+                    finalPath,
+                    finalMethod,
+                    finalHeaders,
+                    finalBody,
+                    finalTimeoutMs
+                ), "ForwarderTerminalJobV1-" + jobId);
+                worker.setDaemon(true);
+                worker.start();
+                return;
+            }
+
+            if (!updateTerminalJobLifecycle(finalJobId, finalDeliveryToken, "claim")) {
+                Log.i(TAG, "Server rejected terminal job claim jobId=" + finalJobId);
+                return;
+            }
+
+            Runnable operation = () -> dispatchTerminalRequestV2(
                 finalJobId,
                 finalPaymentTerminalId,
                 finalPath,
                 finalMethod,
                 finalHeaders,
                 finalBody,
-                finalTimeoutMs
-            ), "ForwarderTerminalJob-" + jobId);
-            worker.setDaemon(true);
-            worker.start();
+                finalTimeoutMs,
+                finalDeliveryToken
+            );
+            if ("modeless".equals(operationMode)) {
+                Thread worker = new Thread(operation, "ForwarderTerminalModelessJob-" + jobId);
+                worker.setDaemon(true);
+                worker.start();
+            } else {
+                ExecutorService executor = paymentTerminalExecutors.computeIfAbsent(
+                    paymentTerminalId,
+                    ignored -> Executors.newSingleThreadExecutor(runnable -> {
+                        Thread thread = new Thread(
+                            runnable,
+                            "ForwarderTerminalExclusive-" + paymentTerminalId
+                        );
+                        thread.setDaemon(true);
+                        return thread;
+                    })
+                );
+                executor.execute(operation);
+            }
         } catch (Exception e) {
             Log.w(TAG, "handleTerminalRequest failed to parse", e);
         }
+    }
+
+    private void dispatchTerminalRequestV1(
+        String jobId,
+        String paymentTerminalId,
+        String path,
+        String method,
+        JSONObject headers,
+        String body,
+        int timeoutMs
+    ) {
+        dispatchTerminalRequest(jobId, paymentTerminalId, path, method, headers, body, timeoutMs, null);
+    }
+
+    private void dispatchTerminalRequestV2(
+        String jobId,
+        String paymentTerminalId,
+        String path,
+        String method,
+        JSONObject headers,
+        String body,
+        int timeoutMs,
+        String deliveryToken
+    ) {
+        if (!updateTerminalJobLifecycle(jobId, deliveryToken, "start")) {
+            Log.i(TAG, "Server cancelled terminal job before start jobId=" + jobId);
+            postTerminalCancellation(jobId, deliveryToken, false);
+            return;
+        }
+        dispatchTerminalRequest(jobId, paymentTerminalId, path, method, headers, body, timeoutMs, deliveryToken);
     }
 
     private void dispatchTerminalRequest(
@@ -1351,10 +1448,17 @@ public class ForwarderService extends Service {
         String method,
         JSONObject headers,
         String body,
-        int timeoutMs
+        int timeoutMs,
+        String deliveryToken
     ) {
         HttpURLConnection conn = null;
+        TerminalJobExecution execution = deliveryToken == null ? null : new TerminalJobExecution();
+        Thread cancellationWatcher = null;
         try {
+            if (execution != null) {
+                activeTerminalJobs.put(jobId, execution);
+                cancellationWatcher = startTerminalJobCancellationWatcher(jobId, deliveryToken, execution);
+            }
             DiscoveredTerminal terminal = discoveredTerminals.get(paymentTerminalId);
             if (terminal == null) {
                 throw new IOException(
@@ -1368,6 +1472,12 @@ public class ForwarderService extends Service {
                     + " " + method + " " + url
             );
             conn = (HttpURLConnection) url.openConnection();
+            if (execution != null) {
+                execution.setConnection(conn);
+                if (execution.isCancellationRequested()) {
+                    throw new IOException("Forwarded terminal request was cancelled before dispatch.");
+                }
+            }
             conn.setRequestMethod(method);
             conn.setConnectTimeout(5_000);
             conn.setReadTimeout(Math.max(timeoutMs, TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS));
@@ -1402,11 +1512,66 @@ public class ForwarderService extends Service {
             result.put("status", status);
             result.put("headers", responseHeaders);
             result.put("body", responseBody);
-            postTerminalResult(jobId, result, null);
+            postTerminalResult(jobId, deliveryToken, result, null);
         } catch (Exception e) {
             Log.w(TAG, "dispatchTerminalRequest failed jobId=" + jobId, e);
-            postTerminalError(jobId, e.getMessage() == null
-                ? "Forwarded terminal request failed." : e.getMessage());
+            if (execution != null && execution.isCancellationRequested()) {
+                postTerminalCancellation(jobId, deliveryToken, true);
+            } else {
+                postTerminalError(jobId, deliveryToken, e.getMessage() == null
+                    ? "Forwarded terminal request failed." : e.getMessage());
+            }
+        } finally {
+            if (execution != null) {
+                execution.markFinished();
+                activeTerminalJobs.remove(jobId, execution);
+            }
+            if (cancellationWatcher != null) {
+                cancellationWatcher.interrupt();
+            }
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private boolean updateTerminalJobLifecycle(String jobId, String deliveryToken, String action) {
+        HttpURLConnection conn = null;
+        try {
+            final String usedToken = authToken;
+            URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward-job");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+            conn.setRequestProperty("Content-Type", "application/json");
+            applyCookies(conn);
+
+            JSONObject body = new JSONObject();
+            body.put("jobId", jobId);
+            body.put("forwarderId", forwarderId);
+            body.put("deliveryToken", deliveryToken);
+            body.put("action", action);
+            try (OutputStream out = conn.getOutputStream()) {
+                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+            int status = conn.getResponseCode();
+            if (handledUnauthorized(status, usedToken) || status < 200 || status >= 300) {
+                return false;
+            }
+            String responseBody = readAll(conn.getInputStream());
+            JSONObject response = new JSONObject(responseBody);
+            return "poll".equals(action)
+                ? response.optBoolean("cancelRequested", false)
+                : response.optBoolean("accepted", false);
+        } catch (Exception e) {
+            Log.w(TAG, "terminal job lifecycle failed jobId=" + jobId + " action=" + action, e);
+            return false;
         } finally {
             if (conn != null) {
                 try {
@@ -1417,7 +1582,37 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void postTerminalResult(String jobId, JSONObject result, String errorMessage) {
+    private Thread startTerminalJobCancellationWatcher(
+        String jobId,
+        String deliveryToken,
+        TerminalJobExecution execution
+    ) {
+        Thread watcher = new Thread(() -> {
+            while (running.get() && !Thread.currentThread().isInterrupted() && !execution.isFinished()) {
+                if (updateTerminalJobLifecycle(jobId, deliveryToken, "poll")) {
+                    Log.i(TAG, "Cancelling active terminal request jobId=" + jobId);
+                    execution.requestCancellation();
+                    return;
+                }
+                sleepQuietly(TERMINAL_JOB_CONTROL_POLL_MS);
+            }
+        }, "ForwarderTerminalJobControl-" + jobId);
+        watcher.setDaemon(true);
+        watcher.start();
+        return watcher;
+    }
+
+    private void postTerminalCancellation(String jobId, String deliveryToken, boolean requestStarted) {
+        JSONObject result = new JSONObject();
+        try {
+            result.put("cancelled", true);
+            result.put("requestStarted", requestStarted);
+        } catch (Exception ignored) {
+        }
+        postTerminalResult(jobId, deliveryToken, result, null);
+    }
+
+    private void postTerminalResult(String jobId, String deliveryToken, JSONObject result, String errorMessage) {
         long startedAt = System.currentTimeMillis();
         while (running.get() && System.currentTimeMillis() - startedAt <= RESPONSE_SUBMIT_MAX_MS) {
             HttpURLConnection conn = null;
@@ -1433,6 +1628,10 @@ public class ForwarderService extends Service {
                 applyCookies(conn);
                 JSONObject body = new JSONObject();
                 body.put("jobId", jobId);
+                if (deliveryToken != null) {
+                    body.put("forwarderId", forwarderId);
+                    body.put("deliveryToken", deliveryToken);
+                }
                 if (errorMessage != null) {
                     JSONObject errObj = new JSONObject();
                     errObj.put("message", errorMessage);
@@ -1468,7 +1667,44 @@ public class ForwarderService extends Service {
     }
 
     private void postTerminalError(String jobId, String message) {
-        postTerminalResult(jobId, null, message);
+        postTerminalError(jobId, null, message);
+    }
+
+    private void postTerminalError(String jobId, String deliveryToken, String message) {
+        postTerminalResult(jobId, deliveryToken, null, message);
+    }
+
+    private static final class TerminalJobExecution {
+        private final AtomicBoolean cancellationRequested = new AtomicBoolean(false);
+        private final AtomicBoolean finished = new AtomicBoolean(false);
+        private volatile HttpURLConnection connection;
+
+        void setConnection(HttpURLConnection connection) {
+            this.connection = connection;
+            if (cancellationRequested.get()) {
+                connection.disconnect();
+            }
+        }
+
+        boolean isCancellationRequested() {
+            return cancellationRequested.get();
+        }
+
+        boolean isFinished() {
+            return finished.get();
+        }
+
+        void markFinished() {
+            finished.set(true);
+        }
+
+        void requestCancellation() {
+            cancellationRequested.set(true);
+            HttpURLConnection activeConnection = connection;
+            if (activeConnection != null) {
+                activeConnection.disconnect();
+            }
+        }
     }
 
     // ========================================================================
