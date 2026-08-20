@@ -70,6 +70,43 @@ jobs:
           echo "tag_version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
           [[ "$TAG_SUFFIX" == "-pre" ]] && echo "is_prerelease=true" >> "$GITHUB_OUTPUT" || echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
 
+      - name: Read release details
+        id: release_details
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_METADATA="$RUNNER_TEMP/release-metadata"
+          RELEASE_NOTES="$RUNNER_TEMP/release-notes.md"
+          git tag -l "$GITHUB_REF_NAME" --format='%(contents)' > "$TAG_METADATA"
+
+          RELEASE_TITLE="$(awk '
+            /^\[release_title\]$/ { section = "title"; next }
+            /^\[release_notes\]$/ { section = "notes"; next }
+            section == "title" {
+              line = $0
+              sub(/^[[:space:]]+/, "", line)
+              sub(/[[:space:]]+$/, "", line)
+              if (line != "") title = title == "" ? line : title " " line
+            }
+            END { print title }
+          ' "$TAG_METADATA")"
+
+          awk '
+            /^\[release_notes\]$/ { notes = 1; next }
+            notes { lines[++count] = $0 }
+            END {
+              first = 1
+              while (first <= count && lines[first] ~ /^[[:space:]]*$/) first++
+              while (count >= first && lines[count] ~ /^[[:space:]]*$/) count--
+              for (line_index = first; line_index <= count; line_index++) print lines[line_index]
+            }
+          ' "$TAG_METADATA" > "$RELEASE_NOTES"
+
+          VERSION="${{ steps.version.outputs.tag_version }}"
+          echo "release_title=${VERSION}${RELEASE_TITLE:+: $RELEASE_TITLE}" >> "$GITHUB_OUTPUT"
+          echo "release_notes_path=$RELEASE_NOTES" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies
         run: npm ci
 
@@ -131,9 +168,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: APK ${{ steps.version.outputs.tag_version }}
+          name: ${{ steps.release_details.outputs.release_title }}
           prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
-          generate_release_notes: true
+          body_path: ${{ steps.release_details.outputs.release_notes_path }}
           files: ${{ steps.asset.outputs.apk_path }}
           fail_on_unmatched_files: true
           overwrite_files: true

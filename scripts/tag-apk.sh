@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Usage: ./scripts/tag-apk.sh <pre|full>
-# Tags the current version with apk-x.y.z-pre (prerelease) or apk-x.y.z (full release) and pushes it.
+# Opens a release-details document, tags the current version with apk-x.y.z-pre
+# (prerelease) or apk-x.y.z (full release), and pushes it.
 
 RELEASE_TYPE="${1:-}"
 if [[ "$RELEASE_TYPE" != "pre" && "$RELEASE_TYPE" != "full" ]]; then
@@ -27,13 +28,19 @@ else
     TAG="apk-$CURRENT_VERSION"
 fi
 
+RELEASE_METADATA_FILE="$(mktemp "${TMPDIR:-/tmp}/release-apk.XXXXXX")"
+trap 'rm -f "$RELEASE_METADATA_FILE"' EXIT
+
+printf '[release_title]\n\n[release_notes]\n\n' > "$RELEASE_METADATA_FILE"
+vim "$RELEASE_METADATA_FILE"
+
 echo "🏷️  Creating tag: $TAG"
 
 # Check if tag already exists locally
 if git rev-parse "$TAG" >/dev/null 2>&1; then
     echo "⚠️  Tag $TAG already exists locally."
 else
-    git tag "$TAG"
+    git tag -a "$TAG" -F "$RELEASE_METADATA_FILE"
 fi
 
 # Push tag to origin

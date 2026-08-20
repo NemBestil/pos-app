@@ -151,6 +151,7 @@ public class ForwarderService extends Service {
     private static final int TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS = 5 * 60_000;
     private static final int RESPONSE_SUBMIT_RETRY_MS = 1_000;
     private static final int RESPONSE_SUBMIT_MAX_MS = 60_000;
+    private static final int PRINT_RESULT_SUBMIT_MAX_MS = 15_000;
     private static final int PAYMENT_TERMINAL_FORWARDER_PROTOCOL = 2;
     private static final int TERMINAL_JOB_CONTROL_POLL_MS = 1_000;
 
@@ -653,6 +654,7 @@ public class ForwarderService extends Service {
             JSONObject body = new JSONObject();
             body.put("printers", arr);
             body.put("screenOn", screenOn.get());
+            body.put("supportsPrintResults", true);
 
             final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/lan-print-forward");
@@ -718,27 +720,35 @@ public class ForwarderService extends Service {
         try {
             JSONObject job = new JSONObject(data);
             String jobId = job.optString("jobId", "");
+            String deliveryToken = job.optString("deliveryToken", "");
             String printerId = job.optString("printerId", null);
             String ipFromJob = job.optString("ip", null);
             String payloadBase64 = job.optString("payloadBase64", null);
             int timeoutMs = job.optInt("timeoutMs", LAN_PRINT_TIMEOUT_MS);
             if (payloadBase64 == null) {
                 Log.w(TAG, "LAN print-job missing payloadBase64 jobId=" + jobId);
+                postPrintJobResult(jobId, deliveryToken, "failed", "The print job payload is missing.");
                 return;
             }
             String ip = ipByPrinterId.getOrDefault(printerId, ipFromJob);
             if (ip == null || ip.isEmpty()) {
                 Log.w(TAG, "LAN print-job has no IP jobId=" + jobId);
+                postPrintJobResult(jobId, deliveryToken, "failed", "The LAN printer address is missing.");
                 return;
             }
             byte[] bytes = Base64.decode(payloadBase64, Base64.DEFAULT);
-            sendBytesToPrinter(ip, bytes, timeoutMs, jobId);
+            if (!postPrintJobResult(jobId, deliveryToken, "accepted", null)) {
+                Log.w(TAG, "Server did not acknowledge LAN print acceptance jobId=" + jobId);
+                return;
+            }
+            String errorMessage = sendBytesToPrinter(ip, bytes, timeoutMs, jobId);
+            postPrintJobResult(jobId, deliveryToken, errorMessage == null ? "succeeded" : "failed", errorMessage);
         } catch (Exception e) {
             Log.w(TAG, "handleLanPrintJob failed", e);
         }
     }
 
-    private void sendBytesToPrinter(String ip, byte[] bytes, int timeoutMs, String jobId) {
+    private String sendBytesToPrinter(String ip, byte[] bytes, int timeoutMs, String jobId) {
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress(ip, LAN_PRINTER_PORT), timeoutMs);
@@ -761,8 +771,10 @@ public class ForwarderService extends Service {
             } catch (Exception ignored) {
             }
             Log.i(TAG, "LAN print delivered jobId=" + jobId + " ip=" + ip + " bytes=" + bytes.length);
+            return null;
         } catch (Exception e) {
             Log.w(TAG, "LAN print failed jobId=" + jobId + " ip=" + ip, e);
+            return e.getMessage() == null ? "The LAN printer write failed." : e.getMessage();
         } finally {
             try {
                 socket.close();
@@ -968,6 +980,7 @@ public class ForwarderService extends Service {
             JSONObject body = new JSONObject();
             body.put("printers", arr);
             body.put("screenOn", screenOn.get());
+            body.put("supportsPrintResults", true);
 
             final String usedToken = authToken;
             URL url = new URL(baseUrl + "/api/_internal/bluetooth-print-forward");
@@ -1033,6 +1046,7 @@ public class ForwarderService extends Service {
         try {
             JSONObject job = new JSONObject(data);
             String jobId = job.optString("jobId", "");
+            String deliveryToken = job.optString("deliveryToken", "");
             String printerId = job.optString("printerId", null);
             LocalPrinter printer = printerById.get(printerId);
             String transport = printer == null ? job.optString("transport", "bluetooth") : printer.transport;
@@ -1041,32 +1055,40 @@ public class ForwarderService extends Service {
             int timeoutMs = job.optInt("timeoutMs", BLUETOOTH_PRINT_TIMEOUT_MS);
             if (payloadBase64 == null) {
                 Log.w(TAG, "Local print-job missing payloadBase64 jobId=" + jobId);
+                postPrintJobResult(jobId, deliveryToken, "failed", "The print job payload is missing.");
                 return;
             }
             if (target == null || target.isEmpty()) {
                 Log.w(TAG, "Local print-job has no target jobId=" + jobId);
+                postPrintJobResult(jobId, deliveryToken, "failed", "The local printer target is missing.");
                 return;
             }
             byte[] bytes = Base64.decode(payloadBase64, Base64.DEFAULT);
-            if ("usb".equals(transport)) {
-                sendBytesToUsbPrinter(target, bytes, timeoutMs, jobId);
-            } else {
-                sendBytesToBluetoothPrinter(target, bytes, timeoutMs, jobId);
+            if (!postPrintJobResult(jobId, deliveryToken, "accepted", null)) {
+                Log.w(TAG, "Server did not acknowledge local print acceptance jobId=" + jobId);
+                return;
             }
+            String errorMessage;
+            if ("usb".equals(transport)) {
+                errorMessage = sendBytesToUsbPrinter(target, bytes, timeoutMs, jobId);
+            } else {
+                errorMessage = sendBytesToBluetoothPrinter(target, bytes, timeoutMs, jobId);
+            }
+            postPrintJobResult(jobId, deliveryToken, errorMessage == null ? "succeeded" : "failed", errorMessage);
         } catch (Exception e) {
             Log.w(TAG, "handleLocalPrintJob failed", e);
         }
     }
 
-    private void sendBytesToBluetoothPrinter(String address, byte[] bytes, int timeoutMs, String jobId) {
+    private String sendBytesToBluetoothPrinter(String address, byte[] bytes, int timeoutMs, String jobId) {
         BluetoothAdapter adapter = resolveBluetoothAdapter();
         if (adapter == null || !adapter.isEnabled()) {
             Log.w(TAG, "Bluetooth adapter unavailable jobId=" + jobId);
-            return;
+            return "The Bluetooth adapter is unavailable.";
         }
         if (!hasBluetoothConnectPermission()) {
             Log.w(TAG, "Bluetooth connect permission missing jobId=" + jobId);
-            return;
+            return "Bluetooth printer permission is missing.";
         }
         BluetoothSocket socket = null;
         try {
@@ -1090,10 +1112,13 @@ public class ForwarderService extends Service {
                 Thread.currentThread().interrupt();
             }
             Log.i(TAG, "Bluetooth print delivered jobId=" + jobId + " address=" + address + " bytes=" + bytes.length);
+            return null;
         } catch (SecurityException e) {
             Log.w(TAG, "Bluetooth print denied jobId=" + jobId + " address=" + address, e);
+            return e.getMessage() == null ? "Bluetooth printer access was denied." : e.getMessage();
         } catch (IOException e) {
             Log.w(TAG, "Bluetooth print failed jobId=" + jobId + " address=" + address, e);
+            return e.getMessage() == null ? "The Bluetooth printer write failed." : e.getMessage();
         } finally {
             if (socket != null) {
                 try {
@@ -1104,12 +1129,12 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void sendBytesToUsbPrinter(String deviceName, byte[] bytes, int timeoutMs, String jobId) {
+    private String sendBytesToUsbPrinter(String deviceName, byte[] bytes, int timeoutMs, String jobId) {
         UsbManager manager = (UsbManager) getSystemService(Context.USB_SERVICE);
         UsbDevice device = manager == null ? null : manager.getDeviceList().get(deviceName);
         if (manager == null || device == null || !manager.hasPermission(device)) {
             Log.w(TAG, "USB printer unavailable jobId=" + jobId + " device=" + deviceName);
-            return;
+            return "The USB printer is unavailable or permission is missing.";
         }
 
         UsbInterface selectedInterface = null;
@@ -1133,14 +1158,14 @@ public class ForwarderService extends Service {
 
         if (selectedInterface == null || outputEndpoint == null) {
             Log.w(TAG, "USB printer has no bulk OUT endpoint jobId=" + jobId + " device=" + deviceName);
-            return;
+            return "The USB printer has no writable endpoint.";
         }
 
         UsbDeviceConnection connection = manager.openDevice(device);
         if (connection == null || !connection.claimInterface(selectedInterface, true)) {
             if (connection != null) connection.close();
             Log.w(TAG, "Could not claim USB printer interface jobId=" + jobId + " device=" + deviceName);
-            return;
+            return "The USB printer interface could not be opened.";
         }
 
         try {
@@ -1154,8 +1179,10 @@ public class ForwarderService extends Service {
                 offset += transferred;
             }
             Log.i(TAG, "USB print delivered jobId=" + jobId + " device=" + deviceName + " bytes=" + bytes.length);
+            return null;
         } catch (IOException e) {
             Log.w(TAG, "USB print failed jobId=" + jobId + " device=" + deviceName, e);
+            return e.getMessage() == null ? "The USB printer write failed." : e.getMessage();
         } finally {
             connection.releaseInterface(selectedInterface);
             connection.close();
@@ -1610,6 +1637,62 @@ public class ForwarderService extends Service {
         } catch (Exception ignored) {
         }
         postTerminalResult(jobId, deliveryToken, result, null);
+    }
+
+    private boolean postPrintJobResult(String jobId, String deliveryToken, String status, String errorMessage) {
+        if (jobId == null || jobId.isEmpty() || deliveryToken == null || deliveryToken.isEmpty()) {
+            return false;
+        }
+
+        long startedAt = System.currentTimeMillis();
+        while (running.get() && System.currentTimeMillis() - startedAt <= PRINT_RESULT_SUBMIT_MAX_MS) {
+            HttpURLConnection conn = null;
+            try {
+                final String usedToken = authToken;
+                URL url = new URL(baseUrl + "/api/_internal/print-forward-result");
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+                conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
+                conn.setRequestProperty("Content-Type", "application/json");
+                applyCookies(conn);
+
+                JSONObject body = new JSONObject();
+                body.put("jobId", jobId);
+                body.put("deliveryToken", deliveryToken);
+                body.put("status", status);
+                if (errorMessage != null && !errorMessage.isEmpty()) {
+                    body.put("errorMessage", errorMessage.substring(0, Math.min(errorMessage.length(), 1_000)));
+                }
+                try (OutputStream out = conn.getOutputStream()) {
+                    out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+                }
+
+                int responseStatus = conn.getResponseCode();
+                if (handledUnauthorized(responseStatus, usedToken)) {
+                    return false;
+                }
+                if (responseStatus >= 200 && responseStatus < 300) {
+                    Log.i(TAG, "Submitted print result jobId=" + jobId + " status=" + status);
+                    return true;
+                }
+                Log.w(TAG, "Submit print result HTTP " + responseStatus + " jobId=" + jobId + " status=" + status);
+            } catch (Exception e) {
+                Log.w(TAG, "Submit print result failed jobId=" + jobId + " status=" + status, e);
+            } finally {
+                if (conn != null) {
+                    try {
+                        conn.disconnect();
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+            sleepQuietly(RESPONSE_SUBMIT_RETRY_MS);
+        }
+
+        Log.w(TAG, "Gave up submitting print result jobId=" + jobId + " status=" + status);
+        return false;
     }
 
     private void postTerminalResult(String jobId, String deliveryToken, JSONObject result, String errorMessage) {
