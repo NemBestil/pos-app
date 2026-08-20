@@ -19,6 +19,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # Release metadata lives in the annotated tag object, not the commit.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -78,7 +81,18 @@ jobs:
 
           TAG_METADATA="$RUNNER_TEMP/release-metadata"
           RELEASE_NOTES="$RUNNER_TEMP/release-notes.md"
+
+          if ! git cat-file -e "refs/tags/${GITHUB_REF_NAME}^{tag}" 2>/dev/null; then
+            echo "Expected $GITHUB_REF_NAME to be an annotated tag with release metadata"
+            exit 1
+          fi
+
           git tag -l "$GITHUB_REF_NAME" --format='%(contents)' > "$TAG_METADATA"
+
+          if ! grep -Fxq '[release_title]' "$TAG_METADATA" || ! grep -Fxq '[release_notes]' "$TAG_METADATA"; then
+            echo "Tag metadata must contain [release_title] and [release_notes] sections"
+            exit 1
+          fi
 
           RELEASE_TITLE="$(awk '
             /^\[release_title\]$/ { section = "title"; next }
@@ -102,6 +116,16 @@ jobs:
               for (line_index = first; line_index <= count; line_index++) print lines[line_index]
             }
           ' "$TAG_METADATA" > "$RELEASE_NOTES"
+
+          if [[ -z "$RELEASE_TITLE" ]]; then
+            echo "The [release_title] section must not be empty"
+            exit 1
+          fi
+
+          if [[ ! -s "$RELEASE_NOTES" ]]; then
+            echo "The [release_notes] section must not be empty"
+            exit 1
+          fi
 
           VERSION="${{ steps.version.outputs.tag_version }}"
           echo "release_title=${VERSION}${RELEASE_TITLE:+: $RELEASE_TITLE}" >> "$GITHUB_OUTPUT"
