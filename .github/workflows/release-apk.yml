@@ -19,9 +19,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          # Release metadata lives in the annotated tag object, not the commit.
-          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -81,6 +78,11 @@ jobs:
 
           TAG_METADATA="$RUNNER_TEMP/release-metadata"
           RELEASE_NOTES="$RUNNER_TEMP/release-notes.md"
+
+          # actions/checkout can replace an annotated tag with a lightweight tag
+          # during tag-triggered runs. Restore the remote tag object explicitly.
+          git fetch --force --no-tags origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
 
           if ! git cat-file -e "refs/tags/${GITHUB_REF_NAME}^{tag}" 2>/dev/null; then
             echo "Expected $GITHUB_REF_NAME to be an annotated tag with release metadata"
