@@ -36,6 +36,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.Base64;
 import android.util.Log;
@@ -46,11 +47,15 @@ import androidx.core.content.ContextCompat;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -76,28 +81,26 @@ import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Persistent foreground service that owns:
- *   1. The LAN print forwarder long-poll loop (was useAndroidLanPrintForwarder in JS).
- *   2. The local Bluetooth/USB print forwarder long-poll loop.
- *   3. The payment terminal forwarder long-poll loop (was useAndroidPaymentTerminalForwarder in JS).
- *   4. The feature-gated takeaway order broadcast long-poll loop.
- *   5. The feature-gated table booking broadcast long-poll loop.
- *
- * These loops authenticate against /api/_internal/* using the androidsync
- * Bearer token, so the forwarder keeps working even after the WebView signs
- * out. Each request is one-shot: the server pushes a single event and closes
- * the connection, which is long-polling semantics rather than a real stream.
+ * Persistent foreground service that owns one authenticated, bidirectional
+ * WebSocket for print jobs, terminal traffic, notifications, device presence,
+ * configuration changes, and liveness.
  *
  * Lifecycle: started/stopped through ForwarderServicePlugin. While alive it
  * shows a persistent low-priority notification so Android won't kill the
- * process; the long-poll loops keep running even when the WebView is backgrounded.
+ * process; the socket keeps working even when the WebView is backgrounded.
  */
 public class ForwarderService extends Service {
 
@@ -135,6 +138,7 @@ public class ForwarderService extends Service {
     private static final String PREFS_TOKEN = "token";
     private static final String PREFS_TAKEAWAY_ENABLED = "takeawayEnabled";
     private static final String PREFS_TABLE_BOOKING_ENABLED = "tableBookingEnabled";
+    private static final String PREFS_FORWARDER_ID = "forwarderId";
 
     private static final int LAN_PRINTER_PORT = 9100;
     private static final int LAN_PING_TIMEOUT_MS = 1_500;
@@ -143,28 +147,28 @@ public class ForwarderService extends Service {
     // Bluetooth Classic SPP (Serial Port Profile) — the channel ESC/POS printers expose.
     private static final UUID BLUETOOTH_SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final int BLUETOOTH_PRINT_TIMEOUT_MS = 8_000;
-    private static final int LOCAL_PRINTERS_REFRESH_MS = 30_000;
-    private static final int LONG_POLL_CONNECT_TIMEOUT_MS = 5_000;
-    private static final int LONG_POLL_READ_TIMEOUT_MS = 35_000;
-    private static final int RETRY_AFTER_ERROR_MS = 3_000;
-    private static final int LAN_PRINTERS_REFRESH_MS = 30_000;
     private static final int TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS = 5 * 60_000;
-    private static final int RESPONSE_SUBMIT_RETRY_MS = 1_000;
-    private static final int RESPONSE_SUBMIT_MAX_MS = 60_000;
-    private static final int PRINT_RESULT_SUBMIT_MAX_MS = 15_000;
-    private static final int PAYMENT_TERMINAL_FORWARDER_PROTOCOL = 2;
-    private static final int TERMINAL_JOB_CONTROL_POLL_MS = 1_000;
+
+    private static final int ANDROID_SOCKET_PROTOCOL = 3;
+    private static final long DEVICE_REFRESH_INTERVAL_MS = 15_000;
+    private static final long IDLE_DEVICE_REFRESH_INTERVAL_MS = 2 * 60_000;
+    private static final long TERMINAL_STALE_AFTER_MS = 2 * 60_000;
+    private static final long SOCKET_REQUEST_TIMEOUT_MS = 8_000;
+    private static final long SOCKET_RECONNECT_MAX_MS = 15_000;
+    private static final long SOCKET_SERVER_PING_TIMEOUT_MS = 15_000;
+    private static final long SOCKET_WATCHDOG_INTERVAL_MS = 1_000;
+    private static final String WHOAMI_URL = "https://whoami.nemkasse.com";
 
     // Worldline UDP discovery
     private static final int DISCOVERY_PORT = 8000;
     private static final int DISCOVERY_BUFFER_SIZE = 64 * 1024;
     private static final int DISCOVERY_RESTART_DELAY_MS = 1_000;
     private static final String MULTICAST_LOCK_TAG = "ForwarderServiceDiscovery";
-    private static final long HEARTBEAT_INTERVAL_MS = 15_000;
 
     private static final AtomicBoolean running = new AtomicBoolean(false);
     private static final AtomicReference<String> activeBaseUrl = new AtomicReference<>(null);
     private static final AtomicBoolean appFocused = new AtomicBoolean(false);
+    private static final AtomicReference<ForwarderService> activeService = new AtomicReference<>(null);
 
     // Discovery state lives in static fields so the Capacitor plugin (running
     // in the same process) can subscribe and query without holding a reference
@@ -181,54 +185,67 @@ public class ForwarderService extends Service {
     private static final CopyOnWriteArrayList<TableBookingListener> tableBookingListeners =
         new CopyOnWriteArrayList<>();
 
-    private final String forwarderId = UUID.randomUUID().toString();
-    private final AtomicBoolean lanPrintersDirty = new AtomicBoolean(true);
-    private final AtomicBoolean localPrintersDirty = new AtomicBoolean(true);
-    // Latches the first time the server rejects our token (401) so only one loop
+    private volatile String forwarderId;
+    // Latches the first time the server rejects our token so only one socket
     // tears things down; cleared again whenever fresh credentials arrive.
     private final AtomicBoolean tokenInvalidated = new AtomicBoolean(false);
     private final AtomicBoolean takeawayEnabled = new AtomicBoolean(false);
     private final AtomicBoolean tableBookingEnabled = new AtomicBoolean(false);
     private final ConcurrentMap<String, ExecutorService> paymentTerminalExecutors = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, TerminalJobExecution> activeTerminalJobs = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, String> cancelledTerminalJobs = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, CompletableFuture<JSONObject>> pendingSocketRequests = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, JSONObject> pendingPrintResults = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, JSONObject> pendingTerminalResults = new ConcurrentHashMap<>();
+    private final ExecutorService socketWorkExecutor = Executors.newCachedThreadPool();
+    private final ScheduledExecutorService socketScheduler = Executors.newSingleThreadScheduledExecutor();
+    private final OkHttpClient socketClient = new OkHttpClient.Builder()
+        .callTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(5, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .build();
+    private final AtomicBoolean socketConnecting = new AtomicBoolean(false);
+    private final AtomicBoolean socketReconnectScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean socketRegistered = new AtomicBoolean(false);
+    private final AtomicBoolean pendingResultFlushRunning = new AtomicBoolean(false);
+    private final AtomicInteger socketReconnectAttempt = new AtomicInteger(0);
+    private final AtomicLong socketGeneration = new AtomicLong(0);
+    private final AtomicInteger availableDeviceCount = new AtomicInteger(0);
+    private final Object deviceMonitorSignal = new Object();
+    private final Object deviceConfigurationLock = new Object();
+    private final List<LanPrinter> configuredLanPrinters = new ArrayList<>();
+    private final List<LocalPrinter> configuredLocalPrinters = new ArrayList<>();
+    private final List<ConfiguredTerminal> configuredPaymentTerminals = new ArrayList<>();
+    private volatile boolean terminalProbePending = false;
+    private volatile WebSocket webSocket;
+    private volatile long socketConnectStartedElapsedAt = 0;
+    private volatile long lastServerPingElapsedAt = 0;
+    private volatile String lastAdvertisedDevices = "";
 
     private volatile String baseUrl;
     private volatile String authToken;
 
-    private Thread lanPrintThread;
-    private Thread localPrintThread;
-    private Thread paymentTerminalThread;
     private Thread discoveryThread;
-    private Thread heartbeatThread;
-    private Thread takeawayOrderThread;
-    private Thread tableBookingThread;
+    private Thread deviceMonitorThread;
     private volatile DatagramSocket discoverySocket;
     private WifiManager.MulticastLock multicastLock;
     private volatile ConnectivityManager.NetworkCallback networkCallback;
     private volatile Network currentNetwork;
+    private final Object networkLocationCallbackLock = new Object();
+    private volatile ConnectivityManager.NetworkCallback networkLocationCallback;
+    private volatile Network networkLocationNetwork;
+    private volatile String networkAttestationToken;
+    private volatile long networkAttestationExpiresAt;
 
-    /** True when the device is currently interactive. The forwarder advertises
-     *  this on every long-poll handshake so the server can prefer screen-on
-     *  tablets when dispatching jobs. Transitions take effect on the next
-     *  long-poll reconnect — we never interrupt an in-flight window. */
+    /** True when the device is currently interactive. State changes are pushed
+     *  immediately so the server can prefer screen-on tablets for dispatch. */
     private final AtomicBoolean screenOn = new AtomicBoolean(true);
     private BroadcastReceiver screenStateReceiver;
+    private BroadcastReceiver attachedDeviceReceiver;
 
-    private final Object lanPrintLongPollLock = new Object();
-    private final Object localPrintLongPollLock = new Object();
-    private final Object paymentTerminalLongPollLock = new Object();
-    private final Object paymentTerminalSignal = new Object();
-    private final Object takeawayOrderLongPollLock = new Object();
-    private final Object takeawayOrderSignal = new Object();
-    private final Object tableBookingLongPollLock = new Object();
-    private final Object tableBookingSignal = new Object();
     private final Object discoveryThreadLock = new Object();
     private final Object networkCallbackLock = new Object();
-    private volatile HttpURLConnection currentLanPrintLongPoll;
-    private volatile HttpURLConnection currentLocalPrintLongPoll;
-    private volatile HttpURLConnection currentPaymentTerminalLongPoll;
-    private volatile HttpURLConnection currentTakeawayOrderLongPoll;
-    private volatile HttpURLConnection currentTableBookingLongPoll;
     private volatile String takeawayOrderCursor;
     private final String takeawayOrderStartedAt = formatIsoUtc(System.currentTimeMillis());
     private volatile String tableBookingCursor;
@@ -261,11 +278,9 @@ public class ForwarderService extends Service {
         }
 
         if (ACTION_NOTIFY_CONFIG_CHANGED.equals(action)) {
-            Log.i(TAG, "Config change notified; restarting LAN and local print loops");
-            lanPrintersDirty.set(true);
-            localPrintersDirty.set(true);
-            interruptLanPrintLongPoll();
-            interruptLocalPrintLongPoll();
+            Log.i(TAG, "Config change notified; requesting an immediate socket configuration snapshot");
+            sendSocketMessage("configuration.request", new JSONObject());
+            wakeDeviceMonitor();
             return START_STICKY;
         }
 
@@ -273,11 +288,7 @@ public class ForwarderService extends Service {
             boolean enabled = intent != null && intent.getBooleanExtra(EXTRA_TAKEAWAY_ENABLED, false);
             takeawayEnabled.set(enabled);
             prefs.edit().putBoolean(PREFS_TAKEAWAY_ENABLED, enabled).apply();
-            if (enabled) {
-                signalTakeawayOrderLoop();
-            } else {
-                interruptTakeawayOrderLongPoll();
-            }
+            sendClientState();
             return running.get() ? START_STICKY : START_NOT_STICKY;
         }
 
@@ -285,11 +296,7 @@ public class ForwarderService extends Service {
             boolean enabled = intent != null && intent.getBooleanExtra(EXTRA_TABLE_BOOKING_ENABLED, false);
             tableBookingEnabled.set(enabled);
             prefs.edit().putBoolean(PREFS_TABLE_BOOKING_ENABLED, enabled).apply();
-            if (enabled) {
-                signalTableBookingLoop();
-            } else {
-                interruptTableBookingLongPoll();
-            }
+            sendClientState();
             return running.get() ? START_STICKY : START_NOT_STICKY;
         }
 
@@ -314,8 +321,11 @@ public class ForwarderService extends Service {
             return START_NOT_STICKY;
         }
 
-        baseUrl = stripTrailingSlash(requestedBaseUrl);
+        String nextBaseUrl = stripTrailingSlash(requestedBaseUrl);
+        boolean credentialsChanged = !nextBaseUrl.equals(baseUrl) || !requestedToken.equals(authToken);
+        baseUrl = nextBaseUrl;
         authToken = requestedToken;
+        forwarderId = getOrCreateForwarderId(prefs);
         takeawayEnabled.set(prefs.getBoolean(PREFS_TAKEAWAY_ENABLED, false));
         tableBookingEnabled.set(prefs.getBoolean(PREFS_TABLE_BOOKING_ENABLED, false));
         activeBaseUrl.set(baseUrl);
@@ -329,23 +339,24 @@ public class ForwarderService extends Service {
         startForegroundWithNotification();
 
         if (running.compareAndSet(false, true)) {
-            Log.i(TAG, "Starting forwarder loops baseUrl=" + baseUrl + " forwarderId=" + forwarderId);
+            Log.i(TAG, "Starting WebSocket forwarder baseUrl=" + baseUrl + " forwarderId=" + forwarderId);
+            activeService.set(this);
             registerScreenStateReceiver();
+            registerAttachedDeviceReceiver();
             startDiscoveryListener();
-            startLanPrintLoop();
-            startLocalPrintLoop();
-            startPaymentTerminalLoop();
-            startHeartbeatLoop();
-            startTakeawayOrderLoop();
-            startTableBookingLoop();
+            startNetworkLocationTracking();
+            startDeviceMonitor();
+            startSocketWatchdog();
+            connectWebSocket();
         } else {
             Log.i(TAG, "Forwarder already running; credentials refreshed");
-            // Reset the open long-poll connections so they reconnect with the new token.
-            interruptLanPrintLongPoll();
-            interruptLocalPrintLongPoll();
-            interruptPaymentTerminalLongPoll();
-            interruptTakeawayOrderLongPoll();
-            interruptTableBookingLongPoll();
+            sendClientState();
+            sendSocketMessage("configuration.request", new JSONObject());
+            refreshNetworkLocation(networkLocationNetwork);
+            wakeDeviceMonitor();
+            if (credentialsChanged || webSocket == null) {
+                reconnectWebSocketNow();
+            }
         }
         return START_STICKY;
     }
@@ -414,46 +425,32 @@ public class ForwarderService extends Service {
         if (!running.compareAndSet(true, false)) {
             return;
         }
+        activeService.compareAndSet(this, null);
         activeBaseUrl.set(null);
-        interruptLanPrintLongPoll();
-        interruptLocalPrintLongPoll();
-        interruptPaymentTerminalLongPoll();
-        interruptTakeawayOrderLongPoll();
-        interruptTableBookingLongPoll();
-        signalPaymentTerminalLoop();
-        signalTakeawayOrderLoop();
-        signalTableBookingLoop();
+        socketRegistered.set(false);
+        socketGeneration.incrementAndGet();
+        socketConnectStartedElapsedAt = 0;
+        lastServerPingElapsedAt = 0;
+        WebSocket socket = webSocket;
+        webSocket = null;
+        if (socket != null) {
+            socket.close(1000, "Forwarder stopped");
+        }
+        for (CompletableFuture<JSONObject> future : pendingSocketRequests.values()) {
+            future.completeExceptionally(new IOException("The Android socket stopped."));
+        }
+        pendingSocketRequests.clear();
+        pendingPrintResults.clear();
+        pendingTerminalResults.clear();
+        wakeDeviceMonitor();
         unregisterScreenStateReceiver();
+        unregisterAttachedDeviceReceiver();
         stopDiscoveryListener();
-        Thread lan = lanPrintThread;
-        Thread local = localPrintThread;
-        Thread pay = paymentTerminalThread;
-        Thread heartbeat = heartbeatThread;
-        Thread takeaway = takeawayOrderThread;
-        Thread tableBooking = tableBookingThread;
-        lanPrintThread = null;
-        localPrintThread = null;
-        paymentTerminalThread = null;
-        heartbeatThread = null;
-        takeawayOrderThread = null;
-        tableBookingThread = null;
-        if (lan != null) {
-            lan.interrupt();
-        }
-        if (local != null) {
-            local.interrupt();
-        }
-        if (pay != null) {
-            pay.interrupt();
-        }
-        if (heartbeat != null) {
-            heartbeat.interrupt();
-        }
-        if (takeaway != null) {
-            takeaway.interrupt();
-        }
-        if (tableBooking != null) {
-            tableBooking.interrupt();
+        stopNetworkLocationTracking();
+        Thread deviceMonitor = deviceMonitorThread;
+        deviceMonitorThread = null;
+        if (deviceMonitor != null) {
+            deviceMonitor.interrupt();
         }
         for (TerminalJobExecution execution : activeTerminalJobs.values()) {
             execution.requestCancellation();
@@ -463,158 +460,718 @@ public class ForwarderService extends Service {
             executor.shutdownNow();
         }
         paymentTerminalExecutors.clear();
+        cancelledTerminalJobs.clear();
+        socketWorkExecutor.shutdownNow();
+        socketScheduler.shutdownNow();
+        socketClient.dispatcher().executorService().shutdownNow();
+        socketClient.connectionPool().evictAll();
         // Unexpected shutdowns keep the stored credentials so Android can
         // restore the service. An explicit stop removes them before this runs.
     }
 
-    private void interruptLanPrintLongPoll() {
-        synchronized (lanPrintLongPollLock) {
-            HttpURLConnection conn = currentLanPrintLongPoll;
-            currentLanPrintLongPoll = null;
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void interruptLocalPrintLongPoll() {
-        synchronized (localPrintLongPollLock) {
-            HttpURLConnection conn = currentLocalPrintLongPoll;
-            currentLocalPrintLongPoll = null;
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void interruptPaymentTerminalLongPoll() {
-        synchronized (paymentTerminalLongPollLock) {
-            HttpURLConnection conn = currentPaymentTerminalLongPoll;
-            currentPaymentTerminalLongPoll = null;
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void interruptTakeawayOrderLongPoll() {
-        synchronized (takeawayOrderLongPollLock) {
-            HttpURLConnection conn = currentTakeawayOrderLongPoll;
-            currentTakeawayOrderLongPoll = null;
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void interruptTableBookingLongPoll() {
-        synchronized (tableBookingLongPollLock) {
-            HttpURLConnection conn = currentTableBookingLongPoll;
-            currentTableBookingLongPoll = null;
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
     // ========================================================================
-    // LAN print long-poll loop
+    // Bidirectional server connection
     // ========================================================================
 
-    private void startLanPrintLoop() {
-        lanPrintThread = new Thread(this::runLanPrintLoop, "ForwarderLanPrint");
-        lanPrintThread.setDaemon(true);
-        lanPrintThread.start();
-    }
-
-    private void runLanPrintLoop() {
-        long lastPrinterFetchAt = 0L;
-        List<LanPrinter> reachable = new ArrayList<>();
-
-        while (running.get()) {
-            try {
-                long now = System.currentTimeMillis();
-                boolean dirty = lanPrintersDirty.getAndSet(false);
-                if (dirty || reachable.isEmpty() || now - lastPrinterFetchAt > LAN_PRINTERS_REFRESH_MS) {
-                    List<LanPrinter> active = fetchActiveLanPrinters();
-                    reachable = filterReachableLanPrinters(active);
-                    lastPrinterFetchAt = System.currentTimeMillis();
-                    Log.i(TAG, "LAN printers fetched: total=" + active.size()
-                        + " reachable=" + reachable.size());
-                }
-
-                if (reachable.isEmpty()) {
-                    sleepQuietly(LAN_PRINTERS_REFRESH_MS);
-                    continue;
-                }
-
-                boolean handled = longPollLanPrintJob(reachable);
-                if (!handled) {
-                    sleepQuietly(RETRY_AFTER_ERROR_MS);
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "LAN print loop iteration failed", t);
-                sleepQuietly(RETRY_AFTER_ERROR_MS);
-            }
+    private String getOrCreateForwarderId(SharedPreferences prefs) {
+        String stored = prefs.getString(PREFS_FORWARDER_ID, null);
+        if (stored != null && !stored.isEmpty()) {
+            return stored;
         }
-        Log.i(TAG, "LAN print loop exited");
+        String created = UUID.randomUUID().toString();
+        prefs.edit().putString(PREFS_FORWARDER_ID, created).apply();
+        return created;
     }
 
-    private List<LanPrinter> fetchActiveLanPrinters() {
-        List<LanPrinter> result = new ArrayList<>();
-        HttpURLConnection conn = null;
+    private String getSocketUrl() {
+        if (baseUrl.startsWith("https://")) {
+            return "wss://" + baseUrl.substring("https://".length()) + "/api/_internal/android-forwarder";
+        }
+        if (baseUrl.startsWith("http://")) {
+            return "ws://" + baseUrl.substring("http://".length()) + "/api/_internal/android-forwarder";
+        }
+        throw new IllegalStateException("The configured POS URL must use HTTP or HTTPS.");
+    }
+
+    private void connectWebSocket() {
+        if (!running.get() || authToken == null || !socketConnecting.compareAndSet(false, true)) {
+            return;
+        }
+        final String usedToken = authToken;
+        final Request request;
         try {
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/lan-printers");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("GET");
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            applyCookies(conn);
-            conn.setRequestProperty("Accept", "application/json");
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return result;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "lan-printers HTTP " + status);
-                return result;
-            }
-            String body = readAll(conn.getInputStream());
-            JSONArray arr = new JSONArray(body);
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject obj = arr.getJSONObject(i);
-                LanPrinter printer = new LanPrinter();
-                printer.printerId = obj.optString("printerId", null);
-                printer.ip = obj.optString("ip", null);
-                if (printer.printerId != null && printer.ip != null) {
-                    result.add(printer);
+            request = new Request.Builder()
+                .url(getSocketUrl())
+                .header("Authorization", "Bearer " + usedToken)
+                .build();
+        } catch (Exception e) {
+            socketConnecting.set(false);
+            Log.e(TAG, "Could not construct Android WebSocket request", e);
+            scheduleSocketReconnect();
+            return;
+        }
+
+        Log.i(TAG, "Connecting Android WebSocket to " + request.url());
+        final long generation = socketGeneration.incrementAndGet();
+        socketConnectStartedElapsedAt = SystemClock.elapsedRealtime();
+        final WebSocketListener listener = new WebSocketListener() {
+            @Override
+            public void onOpen(WebSocket socket, Response response) {
+                if (!running.get() || generation != socketGeneration.get() || !usedToken.equals(authToken)) {
+                    socket.close(1000, "Credentials changed");
+                    return;
                 }
+                webSocket = socket;
+                socketConnectStartedElapsedAt = 0;
+                lastServerPingElapsedAt = SystemClock.elapsedRealtime();
+                socketConnecting.set(false);
+                socketReconnectScheduled.set(false);
+                socketReconnectAttempt.set(0);
+                socketRegistered.set(false);
+                Log.i(TAG, "Android WebSocket connected");
+                sendSocketRegistration();
+            }
+
+            @Override
+            public void onMessage(WebSocket socket, String text) {
+                if (generation != socketGeneration.get() || socket != webSocket) {
+                    return;
+                }
+                handleSocketMessage(text);
+            }
+
+            @Override
+            public void onClosing(WebSocket socket, int code, String reason) {
+                socket.close(code, reason);
+            }
+
+            @Override
+            public void onClosed(WebSocket socket, int code, String reason) {
+                handleSocketDisconnected(socket, generation, "closed code=" + code + " reason=" + reason, null);
+            }
+
+            @Override
+            public void onFailure(WebSocket socket, Throwable error, Response response) {
+                if (generation != socketGeneration.get()) {
+                    return;
+                }
+                if (response != null && response.code() == 401) {
+                    socketConnectStartedElapsedAt = 0;
+                    socketConnecting.set(false);
+                    handledUnauthorized(401, usedToken);
+                    return;
+                }
+                handleSocketDisconnected(socket, generation, "connection failure", error);
+            }
+        };
+
+        try {
+            WebSocket connectingSocket = socketClient.newWebSocket(request, listener);
+            if (generation == socketGeneration.get()) {
+                webSocket = connectingSocket;
+            } else {
+                connectingSocket.cancel();
+            }
+        } catch (Exception error) {
+            if (generation == socketGeneration.get()) {
+                webSocket = null;
+                socketConnectStartedElapsedAt = 0;
+                socketConnecting.set(false);
+                Log.w(TAG, "Could not start Android WebSocket connection", error);
+                scheduleSocketReconnect();
+            }
+        }
+    }
+
+    private void handleSocketDisconnected(WebSocket socket, long generation, String reason, Throwable error) {
+        if (generation != socketGeneration.get()) {
+            return;
+        }
+        if (webSocket == socket) {
+            webSocket = null;
+        }
+        socketConnectStartedElapsedAt = 0;
+        lastServerPingElapsedAt = 0;
+        socketConnecting.set(false);
+        socketRegistered.set(false);
+        for (CompletableFuture<JSONObject> future : pendingSocketRequests.values()) {
+            future.completeExceptionally(new IOException("The Android WebSocket disconnected."));
+        }
+        pendingSocketRequests.clear();
+        if (error == null) {
+            Log.w(TAG, "Android WebSocket " + reason);
+        } else {
+            Log.w(TAG, "Android WebSocket " + reason, error);
+        }
+        if (running.get()) {
+            scheduleSocketReconnect();
+        }
+    }
+
+    private void scheduleSocketReconnect() {
+        if (!running.get() || !socketReconnectScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        int attempt = socketReconnectAttempt.getAndIncrement();
+        long delayMs = attempt == 0 ? 0 : Math.min(SOCKET_RECONNECT_MAX_MS, 1_000L << Math.min(attempt - 1, 4));
+        socketScheduler.schedule(() -> {
+            socketReconnectScheduled.set(false);
+            connectWebSocket();
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void reconnectWebSocketNow() {
+        socketGeneration.incrementAndGet();
+        WebSocket current = webSocket;
+        webSocket = null;
+        socketConnectStartedElapsedAt = 0;
+        lastServerPingElapsedAt = 0;
+        socketRegistered.set(false);
+        socketConnecting.set(false);
+        socketReconnectAttempt.set(0);
+        if (current != null) {
+            current.cancel();
+        }
+        scheduleSocketReconnect();
+    }
+
+    private void startSocketWatchdog() {
+        socketScheduler.scheduleWithFixedDelay(() -> {
+            if (!running.get()) {
+                return;
+            }
+
+            long now = SystemClock.elapsedRealtime();
+            if (socketConnecting.get()) {
+                long connectStarted = socketConnectStartedElapsedAt;
+                if (connectStarted > 0 && now - connectStarted >= SOCKET_SERVER_PING_TIMEOUT_MS) {
+                    Log.w(TAG, "Android WebSocket handshake exceeded 15 seconds; reconnecting");
+                    reconnectWebSocketNow();
+                }
+                return;
+            }
+
+            WebSocket socket = webSocket;
+            if (socket == null) {
+                scheduleSocketReconnect();
+                return;
+            }
+
+            long lastPing = lastServerPingElapsedAt;
+            if (lastPing <= 0) {
+                return;
+            }
+
+            long silenceMs = now - lastPing;
+            if (silenceMs >= SOCKET_SERVER_PING_TIMEOUT_MS) {
+                Log.w(TAG, "No server WebSocket ping received for " + silenceMs + " ms; reconnecting");
+                reconnectWebSocketNow();
+            }
+        }, SOCKET_WATCHDOG_INTERVAL_MS, SOCKET_WATCHDOG_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private boolean sendSocketMessage(String type, JSONObject payload) {
+        return sendSocketMessage(type, payload, null);
+    }
+
+    private boolean sendSocketMessage(String type, JSONObject payload, String requestId) {
+        WebSocket socket = webSocket;
+        if (socket == null) {
+            return false;
+        }
+        if (!socketRegistered.get()
+            && !"connection.register".equals(type)
+            && !"connection.pong".equals(type)) {
+            return false;
+        }
+        try {
+            JSONObject envelope = new JSONObject();
+            envelope.put("type", type);
+            if (requestId != null) {
+                envelope.put("requestId", requestId);
+            }
+            envelope.put("payload", payload);
+            boolean accepted = socket.send(envelope.toString());
+            if (!accepted) {
+                Log.w(TAG, "Android WebSocket rejected outgoing message type=" + type);
+                reconnectWebSocketNow();
+            }
+            return accepted;
+        } catch (Exception e) {
+            Log.w(TAG, "Could not encode Android WebSocket message type=" + type, e);
+            return false;
+        }
+    }
+
+    private JSONObject sendSocketRequest(String type, JSONObject payload) throws Exception {
+        String requestId = UUID.randomUUID().toString();
+        CompletableFuture<JSONObject> future = new CompletableFuture<>();
+        pendingSocketRequests.put(requestId, future);
+        if (!sendSocketMessage(type, payload, requestId)) {
+            pendingSocketRequests.remove(requestId);
+            throw new IOException("The Android WebSocket is not connected.");
+        }
+        try {
+            return future.get(SOCKET_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new IOException("The server did not answer the Android WebSocket request in time.", e);
+        } finally {
+            pendingSocketRequests.remove(requestId);
+        }
+    }
+
+    private void sendSocketRegistration() {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("forwarderId", forwarderId);
+            payload.put("deviceName", (Build.MANUFACTURER + " " + Build.MODEL).trim());
+            payload.put("appVersion", BuildConfig.VERSION_NAME);
+            payload.put("protocolVersion", ANDROID_SOCKET_PROTOCOL);
+            payload.put("screenOn", screenOn.get());
+            payload.put("appFocused", appFocused.get());
+            payload.put("takeawayEnabled", takeawayEnabled.get());
+            payload.put("tableBookingEnabled", tableBookingEnabled.get());
+            if (takeawayOrderCursor != null && !takeawayOrderCursor.isEmpty()) {
+                payload.put("takeawayCursor", takeawayOrderCursor);
+            }
+            payload.put("takeawayStartedAt", takeawayOrderStartedAt);
+            if (tableBookingCursor != null && !tableBookingCursor.isEmpty()) {
+                payload.put("tableBookingCursor", tableBookingCursor);
+            }
+            payload.put("tableBookingStartedAt", tableBookingStartedAt);
+            payload.put("devices", lastAdvertisedDevices.isEmpty()
+                ? new JSONArray()
+                : new JSONArray(lastAdvertisedDevices));
+            sendSocketMessage("connection.register", payload);
+        } catch (Exception e) {
+            Log.e(TAG, "Could not register Android WebSocket", e);
+            reconnectWebSocketNow();
+        }
+    }
+
+    private void handleSocketMessage(String text) {
+        try {
+            JSONObject envelope = new JSONObject(text);
+            String requestId = envelope.optString("requestId", "");
+            JSONObject payload = envelope.optJSONObject("payload");
+            if (!requestId.isEmpty()) {
+                CompletableFuture<JSONObject> future = pendingSocketRequests.remove(requestId);
+                if (future != null) {
+                    future.complete(payload == null ? new JSONObject() : payload);
+                    return;
+                }
+            }
+
+            String type = envelope.optString("type", "");
+            if ("connection.ping".equals(type)) {
+                lastServerPingElapsedAt = SystemClock.elapsedRealtime();
+                sendSocketMessage("connection.pong", payload == null ? new JSONObject() : payload);
+                return;
+            }
+            if ("connection.ready".equals(type)) {
+                socketRegistered.set(true);
+                // Force one post-registration snapshot so changes discovered
+                // during the handshake cannot be lost behind the ready gate.
+                lastAdvertisedDevices = "";
+                socketWorkExecutor.execute(this::flushPendingSocketResults);
+                if (!sendNetworkLocation()) {
+                    refreshNetworkLocation(networkLocationNetwork);
+                }
+                wakeDeviceMonitor();
+                return;
+            }
+            if ("configuration.snapshot".equals(type) && payload != null) {
+                applyConfigurationSnapshot(payload);
+                return;
+            }
+            if ("print.job".equals(type) && payload != null) {
+                socketWorkExecutor.execute(() -> handleSocketPrintJob(payload));
+                return;
+            }
+            if ("terminal.request".equals(type) && payload != null) {
+                socketWorkExecutor.execute(() -> handleTerminalRequest(payload.toString()));
+                return;
+            }
+            if ("terminal.cancel".equals(type) && payload != null) {
+                handleTerminalCancellation(payload);
+                return;
+            }
+            if ("takeaway.event".equals(type) && payload != null) {
+                takeawayOrderCursor = payload.optString("cursor", takeawayOrderCursor);
+                handleTakeawayOrderEvent(payload);
+                return;
+            }
+            if ("table-booking.event".equals(type) && payload != null) {
+                tableBookingCursor = payload.optString("cursor", tableBookingCursor);
+                handleTableBookingEvent(payload);
+                return;
+            }
+            if ("connection.error".equals(type)) {
+                Log.w(TAG, "Android WebSocket server error: " + (payload == null ? text : payload.toString()));
             }
         } catch (Exception e) {
-            Log.w(TAG, "fetchActiveLanPrinters failed", e);
+            Log.w(TAG, "Could not handle Android WebSocket message", e);
+        }
+    }
+
+    private void sendClientState() {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("screenOn", screenOn.get());
+            payload.put("appFocused", appFocused.get());
+            payload.put("takeawayEnabled", takeawayEnabled.get());
+            payload.put("tableBookingEnabled", tableBookingEnabled.get());
+            sendSocketMessage("client.state", payload);
+        } catch (Exception e) {
+            Log.w(TAG, "Could not send Android client state", e);
+        }
+    }
+
+    private boolean sendNetworkLocation() {
+        String token = networkAttestationToken;
+        long now = System.currentTimeMillis() / 1_000L;
+        if (token == null || networkAttestationExpiresAt <= now || !socketRegistered.get()) {
+            return false;
+        }
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("token", token);
+            return sendSocketMessage("network.location", payload);
+        } catch (Exception e) {
+            Log.w(TAG, "Could not send network location", e);
+            return false;
+        }
+    }
+
+    private void refreshNetworkLocation(Network network) {
+        if (!running.get()) {
+            return;
+        }
+        socketWorkExecutor.execute(() -> {
+            HttpURLConnection connection = null;
+            try {
+                URL url = new URL(WHOAMI_URL);
+                connection = (HttpURLConnection) (network == null ? url.openConnection() : network.openConnection(url));
+                connection.setRequestMethod("GET");
+                connection.setConnectTimeout(5_000);
+                connection.setReadTimeout(5_000);
+                connection.setRequestProperty("Accept", "application/json");
+                int status = connection.getResponseCode();
+                if (status < 200 || status >= 300) {
+                    throw new IOException("Whoami returned HTTP " + status + ".");
+                }
+                JSONObject response;
+                try (InputStream stream = connection.getInputStream()) {
+                    response = new JSONObject(readAll(stream));
+                }
+                String token = response.optString("token", "");
+                long expiresAt = response.optLong("expiresAt", 0);
+                if (token.isEmpty() || expiresAt <= System.currentTimeMillis() / 1_000L) {
+                    throw new IOException("Whoami returned an invalid network attestation.");
+                }
+                if (network != null && !network.equals(networkLocationNetwork)) {
+                    return;
+                }
+                networkAttestationToken = token;
+                networkAttestationExpiresAt = expiresAt;
+                sendNetworkLocation();
+                Log.i(TAG, "Network location refreshed from whoami");
+            } catch (Exception e) {
+                Log.w(TAG, "Could not refresh network location", e);
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        });
+    }
+
+    private void flushPendingSocketResults() {
+        if (!pendingResultFlushRunning.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            for (JSONObject payload : pendingPrintResults.values()) {
+                submitPrintResultPayload(payload);
+            }
+            for (JSONObject payload : pendingTerminalResults.values()) {
+                submitTerminalResultPayload(payload);
+            }
         } finally {
-            if (conn != null) {
-                conn.disconnect();
+            pendingResultFlushRunning.set(false);
+        }
+    }
+
+    private void applyConfigurationSnapshot(JSONObject payload) {
+        List<LanPrinter> nextLanPrinters = new ArrayList<>();
+        List<LocalPrinter> nextLocalPrinters = new ArrayList<>();
+        List<ConfiguredTerminal> nextTerminals = new ArrayList<>();
+        JSONArray printers = payload.optJSONArray("printers");
+        if (printers != null) {
+            for (int index = 0; index < printers.length(); index++) {
+                JSONObject printer = printers.optJSONObject(index);
+                if (printer == null) continue;
+                String transport = printer.optString("transport", "");
+                if ("lan".equals(transport)) {
+                    LanPrinter configured = new LanPrinter();
+                    configured.printerId = printer.optString("printerId", "");
+                    configured.name = printer.optString("name", configured.printerId);
+                    configured.ip = printer.optString("target", "");
+                    if (!configured.printerId.isEmpty() && !configured.ip.isEmpty()) {
+                        nextLanPrinters.add(configured);
+                    }
+                    continue;
+                }
+                if (!"bluetooth".equals(transport) && !"usb".equals(transport)) continue;
+                LocalPrinter configured = new LocalPrinter();
+                configured.printerId = printer.optString("printerId", "");
+                configured.name = printer.optString("name", configured.printerId);
+                configured.transport = transport;
+                configured.target = printer.optString("target", "");
+                configured.usbDeviceName = printer.optString("usbDeviceName", null);
+                configured.usbVendorId = printer.optInt("usbVendorId", -1);
+                configured.usbProductId = printer.optInt("usbProductId", -1);
+                configured.usbSerialNumber = printer.isNull("usbSerialNumber")
+                    ? null
+                    : printer.optString("usbSerialNumber", null);
+                if (!configured.printerId.isEmpty() && !configured.target.isEmpty()) {
+                    nextLocalPrinters.add(configured);
+                }
             }
         }
-        return result;
+
+        JSONArray terminals = payload.optJSONArray("terminals");
+        if (terminals != null) {
+            for (int index = 0; index < terminals.length(); index++) {
+                JSONObject terminal = terminals.optJSONObject(index);
+                if (terminal == null) continue;
+                ConfiguredTerminal configured = ConfiguredTerminal.fromJson(terminal);
+                if (configured != null) {
+                    nextTerminals.add(configured);
+                }
+            }
+        }
+
+        synchronized (deviceConfigurationLock) {
+            configuredLanPrinters.clear();
+            configuredLanPrinters.addAll(nextLanPrinters);
+            configuredLocalPrinters.clear();
+            configuredLocalPrinters.addAll(nextLocalPrinters);
+            configuredPaymentTerminals.clear();
+            configuredPaymentTerminals.addAll(nextTerminals);
+            terminalProbePending = true;
+        }
+        wakeDeviceMonitor();
     }
+
+    private void handleSocketPrintJob(JSONObject job) {
+        String transport = job.optString("transport", "");
+        if ("lan".equals(transport)) {
+            Map<String, String> ipByPrinterId = new java.util.HashMap<>();
+            synchronized (deviceConfigurationLock) {
+                for (LanPrinter printer : configuredLanPrinters) {
+                    ipByPrinterId.put(printer.printerId, printer.ip);
+                }
+            }
+            handleLanPrintJob(job.toString(), ipByPrinterId);
+            return;
+        }
+
+        Map<String, LocalPrinter> printerById = new java.util.HashMap<>();
+        List<LocalPrinter> configured;
+        synchronized (deviceConfigurationLock) {
+            configured = new ArrayList<>(configuredLocalPrinters);
+        }
+        for (LocalPrinter printer : filterAvailableLocalPrinters(configured)) {
+            printerById.put(printer.printerId, printer);
+        }
+        handleLocalPrintJob(job.toString(), printerById);
+    }
+
+    private void handleTerminalCancellation(JSONObject payload) {
+        String jobId = payload.optString("jobId", "");
+        String deliveryToken = payload.optString("deliveryToken", "");
+        if (jobId.isEmpty() || deliveryToken.isEmpty()) {
+            return;
+        }
+        cancelledTerminalJobs.put(jobId, deliveryToken);
+        TerminalJobExecution execution = activeTerminalJobs.get(jobId);
+        if (execution != null) {
+            execution.requestCancellation();
+        }
+        socketScheduler.schedule(
+            () -> cancelledTerminalJobs.remove(jobId, deliveryToken),
+            60,
+            TimeUnit.SECONDS
+        );
+    }
+
+    // ========================================================================
+    // Reactive device availability
+    // ========================================================================
+
+    private void startDeviceMonitor() {
+        deviceMonitorThread = new Thread(this::runDeviceMonitor, "ForwarderDeviceMonitor");
+        deviceMonitorThread.setDaemon(true);
+        deviceMonitorThread.start();
+    }
+
+    private void runDeviceMonitor() {
+        while (running.get()) {
+            try {
+                refreshAndAdvertiseDevices();
+            } catch (Throwable error) {
+                Log.w(TAG, "Device availability refresh failed", error);
+            }
+            long waitMs = availableDeviceCount.get() == 0
+                ? IDLE_DEVICE_REFRESH_INTERVAL_MS
+                : DEVICE_REFRESH_INTERVAL_MS;
+            synchronized (deviceMonitorSignal) {
+                if (!running.get()) break;
+                try {
+                    deviceMonitorSignal.wait(waitMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (running.get() && availableDeviceCount.get() == 0) {
+                sendSocketMessage("configuration.request", new JSONObject());
+            }
+        }
+    }
+
+    private void wakeDeviceMonitor() {
+        synchronized (deviceMonitorSignal) {
+            deviceMonitorSignal.notifyAll();
+        }
+    }
+
+    private void refreshAndAdvertiseDevices() throws Exception {
+        List<LanPrinter> lanPrinters;
+        List<LocalPrinter> localPrinters;
+        List<ConfiguredTerminal> terminals;
+        boolean shouldProbeTerminals;
+        synchronized (deviceConfigurationLock) {
+            lanPrinters = new ArrayList<>(configuredLanPrinters);
+            localPrinters = new ArrayList<>(configuredLocalPrinters);
+            terminals = new ArrayList<>(configuredPaymentTerminals);
+            shouldProbeTerminals = terminalProbePending;
+            terminalProbePending = false;
+        }
+
+        List<LanPrinter> reachableLan = filterReachableLanPrinters(lanPrinters);
+        List<LocalPrinter> reachableLocal = filterAvailableLocalPrinters(localPrinters);
+        if (shouldProbeTerminals) {
+            for (ConfiguredTerminal terminal : terminals) {
+                if (probeConfiguredTerminal(terminal)) {
+                    discoveredTerminals.put(
+                        terminal.terminalId,
+                        new DiscoveredTerminal(
+                            terminal.terminalId,
+                            terminal.identity,
+                            terminal.ipAddress,
+                            terminal.port,
+                            terminal.protocolType,
+                            terminal.protocolVersion,
+                            System.currentTimeMillis()
+                        )
+                    );
+                }
+            }
+        }
+
+        long staleBefore = System.currentTimeMillis() - TERMINAL_STALE_AFTER_MS;
+        for (Map.Entry<String, DiscoveredTerminal> entry : discoveredTerminals.entrySet()) {
+            if (entry.getValue().lastSeenAtMs < staleBefore) {
+                discoveredTerminals.remove(entry.getKey(), entry.getValue());
+            }
+        }
+
+        JSONArray devices = new JSONArray();
+        for (LanPrinter printer : reachableLan) {
+            JSONObject device = new JSONObject();
+            device.put("kind", "printer");
+            device.put("id", printer.printerId);
+            device.put("name", printer.name);
+            device.put("transport", "lan");
+            device.put("target", printer.ip);
+            devices.put(device);
+        }
+        for (LocalPrinter printer : reachableLocal) {
+            JSONObject device = new JSONObject();
+            device.put("kind", "printer");
+            device.put("id", printer.printerId);
+            device.put("name", printer.name);
+            device.put("transport", printer.transport);
+            device.put("target", printer.target);
+            devices.put(device);
+        }
+        Map<String, String> terminalNames = new java.util.HashMap<>();
+        for (ConfiguredTerminal terminal : terminals) {
+            terminalNames.put(terminal.terminalId, terminal.name);
+        }
+        for (DiscoveredTerminal terminal : getDiscoveredTerminals()) {
+            JSONObject device = new JSONObject();
+            device.put("kind", "payment_terminal");
+            device.put("id", terminal.terminalId);
+            device.put("name", terminalNames.getOrDefault(terminal.terminalId, terminal.terminalId));
+            device.put("transport", "network");
+            device.put("target", terminal.ipAddress + ":" + terminal.port);
+            device.put("ipAddress", terminal.ipAddress);
+            device.put("port", terminal.port);
+            device.put("lastSeenAt", formatIsoUtc(terminal.lastSeenAtMs));
+            devices.put(device);
+        }
+
+        availableDeviceCount.set(devices.length());
+        String serialized = devices.toString();
+        boolean changed = !serialized.equals(lastAdvertisedDevices);
+        lastAdvertisedDevices = serialized;
+        if ((changed || !socketRegistered.get()) && webSocket != null) {
+            JSONObject payload = new JSONObject();
+            payload.put("screenOn", screenOn.get());
+            payload.put("devices", devices);
+            sendSocketMessage("devices.snapshot", payload);
+        }
+    }
+
+    private boolean probeConfiguredTerminal(ConfiguredTerminal terminal) {
+        if (terminal.probePath == null || terminal.probeHeaders == null) {
+            return false;
+        }
+        HttpURLConnection connection = null;
+        try {
+            URL url = new URL("http", terminal.ipAddress, terminal.port, terminal.probePath);
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(3_000);
+            connection.setReadTimeout(3_000);
+            Iterator<String> names = terminal.probeHeaders.keys();
+            while (names.hasNext()) {
+                String name = names.next();
+                connection.setRequestProperty(name, terminal.probeHeaders.optString(name, ""));
+            }
+            int status = connection.getResponseCode();
+            if (status >= 200 && status < 300) {
+                InputStream stream = connection.getInputStream();
+                if (stream != null) stream.close();
+                Log.i(TAG, "Payment terminal startup probe succeeded terminal=" + terminal.terminalId);
+                return true;
+            }
+            Log.w(TAG, "Payment terminal startup probe returned HTTP " + status
+                + " terminal=" + terminal.terminalId);
+        } catch (Exception e) {
+            Log.i(TAG, "Payment terminal startup probe failed terminal=" + terminal.terminalId);
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+        return false;
+    }
+
+    // ========================================================================
+    // Printer access and delivery
+    // ========================================================================
 
     private List<LanPrinter> filterReachableLanPrinters(List<LanPrinter> printers) {
         List<LanPrinter> reachable = new ArrayList<>();
@@ -637,81 +1194,6 @@ public class ForwarderService extends Service {
             try {
                 socket.close();
             } catch (Exception ignored) {
-            }
-        }
-    }
-
-    private boolean longPollLanPrintJob(List<LanPrinter> printers) {
-        HttpURLConnection conn = null;
-        try {
-            JSONArray arr = new JSONArray();
-            for (LanPrinter printer : printers) {
-                JSONObject obj = new JSONObject();
-                obj.put("printerId", printer.printerId);
-                obj.put("ip", printer.ip);
-                arr.put(obj);
-            }
-            JSONObject body = new JSONObject();
-            body.put("printers", arr);
-            body.put("screenOn", screenOn.get());
-            body.put("supportsPrintResults", true);
-
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/lan-print-forward");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Accept", "text/event-stream");
-            applyCookies(conn);
-
-            byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(payload);
-            }
-
-            synchronized (lanPrintLongPollLock) {
-                currentLanPrintLongPoll = conn;
-            }
-
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return false;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "lan-print-forward HTTP " + status);
-                return false;
-            }
-
-            Map<String, String> ipByPrinterId = new java.util.HashMap<>();
-            for (LanPrinter printer : printers) {
-                ipByPrinterId.put(printer.printerId, printer.ip);
-            }
-
-            readLongPollResponse(conn, (event, data) -> {
-                if ("print-job".equals(event)) {
-                    handleLanPrintJob(data, ipByPrinterId);
-                }
-            });
-            return true;
-        } catch (Exception e) {
-            if (running.get()) {
-                Log.w(TAG, "longPollLanPrintJob failed", e);
-            }
-            return false;
-        } finally {
-            synchronized (lanPrintLongPollLock) {
-                if (currentLanPrintLongPoll == conn) {
-                    currentLanPrintLongPoll = null;
-                }
-            }
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
             }
         }
     }
@@ -781,104 +1263,6 @@ public class ForwarderService extends Service {
             } catch (Exception ignored) {
             }
         }
-    }
-
-    // ========================================================================
-    // Local printer long-poll loop
-    // ========================================================================
-    //
-    // The endpoint names remain Bluetooth-based for deployed-client compatibility,
-    // but this loop advertises every locally attached printer it can currently
-    // reach and dispatches each job according to its Bluetooth or USB transport.
-
-    private void startLocalPrintLoop() {
-        localPrintThread = new Thread(this::runLocalPrintLoop, "ForwarderLocalPrint");
-        localPrintThread.setDaemon(true);
-        localPrintThread.start();
-    }
-
-    private void runLocalPrintLoop() {
-        long lastPrinterFetchAt = 0L;
-        List<LocalPrinter> available = new ArrayList<>();
-
-        while (running.get()) {
-            try {
-                long now = System.currentTimeMillis();
-                boolean dirty = localPrintersDirty.getAndSet(false);
-                if (dirty || available.isEmpty() || now - lastPrinterFetchAt > LOCAL_PRINTERS_REFRESH_MS) {
-                    List<LocalPrinter> active = fetchActiveLocalPrinters();
-                    available = filterAvailableLocalPrinters(active);
-                    lastPrinterFetchAt = System.currentTimeMillis();
-                    Log.i(TAG, "Local printers fetched: configured=" + active.size() + " available=" + available.size());
-                }
-
-                if (available.isEmpty()) {
-                    sleepQuietly(LOCAL_PRINTERS_REFRESH_MS);
-                    continue;
-                }
-
-                boolean handled = longPollLocalPrintJob(available);
-                if (!handled) {
-                    sleepQuietly(RETRY_AFTER_ERROR_MS);
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "Local print loop iteration failed", t);
-                sleepQuietly(RETRY_AFTER_ERROR_MS);
-            }
-        }
-        Log.i(TAG, "Local print loop exited");
-    }
-
-    private List<LocalPrinter> fetchActiveLocalPrinters() {
-        List<LocalPrinter> result = new ArrayList<>();
-        HttpURLConnection conn = null;
-        try {
-            final String usedToken = authToken;
-            // Kept unchanged so old app and server releases remain interoperable.
-            URL url = new URL(baseUrl + "/api/_internal/bluetooth-printers");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("GET");
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            applyCookies(conn);
-            conn.setRequestProperty("Accept", "application/json");
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return result;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "local-printers HTTP " + status);
-                return result;
-            }
-            String body = readAll(conn.getInputStream());
-            JSONArray arr = new JSONArray(body);
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject obj = arr.getJSONObject(i);
-                LocalPrinter printer = new LocalPrinter();
-                printer.printerId = obj.optString("printerId", null);
-                printer.transport = obj.optString("transport", "bluetooth");
-                printer.target = obj.optString("target", obj.optString("address", null));
-                if ("bluetooth".equals(printer.transport) && printer.target != null) {
-                    printer.target = printer.target.toUpperCase();
-                }
-                printer.usbDeviceName = obj.optString("usbDeviceName", null);
-                printer.usbVendorId = obj.optInt("usbVendorId", -1);
-                printer.usbProductId = obj.optInt("usbProductId", -1);
-                printer.usbSerialNumber = obj.isNull("usbSerialNumber")
-                    ? null
-                    : obj.optString("usbSerialNumber", null);
-                if (printer.printerId != null && printer.target != null) {
-                    result.add(printer);
-                }
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "fetchActiveLocalPrinters failed", e);
-        } finally {
-            if (conn != null) {
-                conn.disconnect();
-            }
-        }
-        return result;
     }
 
     private List<LocalPrinter> filterAvailableLocalPrinters(List<LocalPrinter> printers) {
@@ -961,85 +1345,6 @@ public class ForwarderService extends Service {
             Log.w(TAG, "getBondedDevices denied", e);
         }
         return addresses;
-    }
-
-    private boolean longPollLocalPrintJob(List<LocalPrinter> printers) {
-        HttpURLConnection conn = null;
-        try {
-            JSONArray arr = new JSONArray();
-            for (LocalPrinter printer : printers) {
-                JSONObject obj = new JSONObject();
-                obj.put("printerId", printer.printerId);
-                obj.put("transport", printer.transport);
-                obj.put("target", printer.target);
-                if ("bluetooth".equals(printer.transport)) {
-                    obj.put("address", printer.target);
-                }
-                arr.put(obj);
-            }
-            JSONObject body = new JSONObject();
-            body.put("printers", arr);
-            body.put("screenOn", screenOn.get());
-            body.put("supportsPrintResults", true);
-
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/bluetooth-print-forward");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Accept", "text/event-stream");
-            applyCookies(conn);
-
-            byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(payload);
-            }
-
-            synchronized (localPrintLongPollLock) {
-                currentLocalPrintLongPoll = conn;
-            }
-
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return false;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "bluetooth-print-forward HTTP " + status);
-                return false;
-            }
-
-            Map<String, LocalPrinter> printerById = new java.util.HashMap<>();
-            for (LocalPrinter printer : printers) {
-                printerById.put(printer.printerId, printer);
-            }
-
-            readLongPollResponse(conn, (event, data) -> {
-                if ("print-job".equals(event)) {
-                    handleLocalPrintJob(data, printerById);
-                }
-            });
-            return true;
-        } catch (Exception e) {
-            if (running.get()) {
-                Log.w(TAG, "longPollLocalPrintJob failed", e);
-            }
-            return false;
-        } finally {
-            synchronized (localPrintLongPollLock) {
-                if (currentLocalPrintLongPoll == conn) {
-                    currentLocalPrintLongPoll = null;
-                }
-            }
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
     }
 
     private void handleLocalPrintJob(String data, Map<String, LocalPrinter> printerById) {
@@ -1211,6 +1516,7 @@ public class ForwarderService extends Service {
     // Container used internally for locally attached printer entries.
     private static class LocalPrinter {
         String printerId;
+        String name;
         String transport;
         String target;
         String usbDeviceName;
@@ -1219,159 +1525,29 @@ public class ForwarderService extends Service {
         String usbSerialNumber;
     }
 
-    // ========================================================================
-    // Payment terminal long-poll loop
-    // ========================================================================
-
-    private void startPaymentTerminalLoop() {
-        paymentTerminalThread = new Thread(this::runPaymentTerminalLoop, "ForwarderPaymentTerminal");
-        paymentTerminalThread.setDaemon(true);
-        paymentTerminalThread.start();
-    }
-
-    private void runPaymentTerminalLoop() {
-        while (running.get()) {
-            try {
-                List<DiscoveredTerminal> terminals = getDiscoveredTerminals();
-                if (terminals.isEmpty()) {
-                    waitForPaymentTerminalSignal(LAN_PRINTERS_REFRESH_MS);
-                    continue;
-                }
-
-                boolean ok = longPollPaymentTerminalRequest(terminals);
-                if (!ok) {
-                    waitForPaymentTerminalSignal(RETRY_AFTER_ERROR_MS);
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "payment terminal loop iteration failed", t);
-                waitForPaymentTerminalSignal(RETRY_AFTER_ERROR_MS);
-            }
-        }
-        Log.i(TAG, "Payment terminal loop exited");
-    }
-
-    private void waitForPaymentTerminalSignal(long timeoutMs) {
-        synchronized (paymentTerminalSignal) {
-            if (!running.get()) {
-                return;
-            }
-            try {
-                paymentTerminalSignal.wait(timeoutMs);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    private void signalPaymentTerminalLoop() {
-        synchronized (paymentTerminalSignal) {
-            paymentTerminalSignal.notifyAll();
-        }
-    }
-
-    private boolean longPollPaymentTerminalRequest(List<DiscoveredTerminal> terminals) {
-        HttpURLConnection conn = null;
-        try {
-            JSONArray arr = new JSONArray();
-            for (DiscoveredTerminal terminal : terminals) {
-                arr.put(terminal.terminalId);
-            }
-            JSONObject body = new JSONObject();
-            body.put("forwarderId", forwarderId);
-            body.put("terminalIds", arr);
-            body.put("screenOn", screenOn.get());
-            body.put("appVersion", BuildConfig.VERSION_NAME);
-            body.put("forwarderProtocol", PAYMENT_TERMINAL_FORWARDER_PROTOCOL);
-            JSONArray capabilities = new JSONArray();
-            capabilities.put("terminal-job-claim");
-            capabilities.put("terminal-job-cancel");
-            capabilities.put("per-terminal-serialization");
-            body.put("capabilities", capabilities);
-
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward");
-            conn = (HttpURLConnection) url.openConnection();
-            synchronized (paymentTerminalLongPollLock) {
-                currentPaymentTerminalLongPoll = conn;
-            }
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Accept", "text/event-stream");
-            applyCookies(conn);
-
-            byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(payload);
-            }
-
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return false;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "payment-terminal-forward HTTP " + status);
-                return false;
-            }
-
-            readLongPollResponse(conn, (event, data) -> {
-                if ("terminal-request".equals(event)) {
-                    handleTerminalRequest(data);
-                }
-            });
-            return true;
-        } catch (Exception e) {
-            if (running.get()) {
-                Log.w(TAG, "longPollPaymentTerminalRequest failed", e);
-            }
-            return false;
-        } finally {
-            synchronized (paymentTerminalLongPollLock) {
-                if (currentPaymentTerminalLongPoll == conn) {
-                    currentPaymentTerminalLongPoll = null;
-                }
-            }
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
     private void handleTerminalRequest(String data) {
         try {
             JSONObject job = new JSONObject(data);
             String jobId = job.optString("jobId", "");
             String paymentTerminalId = job.optString("paymentTerminalId", "");
-            String forwardedUrl = job.optString("url", null);
+            String path = job.optString("path", null);
             String method = job.optString("method", "POST");
             int timeoutMs = job.optInt("timeoutMs", TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS);
-            int forwarderProtocol = job.optInt("forwarderProtocol", 1);
             String deliveryToken = job.optString("deliveryToken", "");
             String operationMode = job.optString("operationMode", "exclusive");
-            String responseDeliveryToken = forwarderProtocol >= 2 ? deliveryToken : null;
+            String responseDeliveryToken = deliveryToken;
             JSONObject headers = job.optJSONObject("headers");
             String requestBody = job.isNull("body") ? null : job.optString("body", null);
             if (paymentTerminalId.isEmpty()) {
                 postTerminalError(jobId, responseDeliveryToken, "Forwarded terminal request missing paymentTerminalId.");
                 return;
             }
-            if (forwardedUrl == null) {
-                postTerminalError(jobId, responseDeliveryToken, "Forwarded terminal request missing url.");
-                return;
-            }
-            if (forwarderProtocol >= 2 && deliveryToken.isEmpty()) {
-                postTerminalError(jobId, "Forwarded terminal v2 request is missing its delivery token.");
-                return;
-            }
-            URL parsedForwardedUrl = new URL(forwardedUrl);
-            String path = parsedForwardedUrl.getFile();
             if (path == null || !path.startsWith("/") || path.startsWith("//")) {
-                postTerminalError(jobId, responseDeliveryToken, "Forwarded terminal request url has an invalid path.");
+                postTerminalError(jobId, responseDeliveryToken, "Forwarded terminal request has an invalid path.");
+                return;
+            }
+            if (deliveryToken.isEmpty()) {
+                postTerminalError(jobId, "Forwarded terminal request is missing its delivery token.");
                 return;
             }
             final String finalJobId = jobId;
@@ -1383,20 +1559,8 @@ public class ForwarderService extends Service {
             final String finalBody = requestBody;
             final String finalDeliveryToken = deliveryToken;
 
-            if (forwarderProtocol < 2) {
-                // Protocol v1 stays byte-for-byte compatible while customers roll
-                // forward. It deliberately retains the old concurrent worker model.
-                Thread worker = new Thread(() -> dispatchTerminalRequestV1(
-                    finalJobId,
-                    finalPaymentTerminalId,
-                    finalPath,
-                    finalMethod,
-                    finalHeaders,
-                    finalBody,
-                    finalTimeoutMs
-                ), "ForwarderTerminalJobV1-" + jobId);
-                worker.setDaemon(true);
-                worker.start();
+            if (deliveryToken.equals(cancelledTerminalJobs.remove(finalJobId))) {
+                postTerminalCancellation(finalJobId, deliveryToken, false);
                 return;
             }
 
@@ -1415,8 +1579,8 @@ public class ForwarderService extends Service {
                 finalTimeoutMs,
                 finalDeliveryToken
             );
-            if ("modeless".equals(operationMode)) {
-                Thread worker = new Thread(operation, "ForwarderTerminalModelessJob-" + jobId);
+            if ("modeless".equals(operationMode) || "concurrent".equals(operationMode)) {
+                Thread worker = new Thread(operation, "ForwarderTerminalConcurrentJob-" + jobId);
                 worker.setDaemon(true);
                 worker.start();
             } else {
@@ -1438,18 +1602,6 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void dispatchTerminalRequestV1(
-        String jobId,
-        String paymentTerminalId,
-        String path,
-        String method,
-        JSONObject headers,
-        String body,
-        int timeoutMs
-    ) {
-        dispatchTerminalRequest(jobId, paymentTerminalId, path, method, headers, body, timeoutMs, null);
-    }
-
     private void dispatchTerminalRequestV2(
         String jobId,
         String paymentTerminalId,
@@ -1460,6 +1612,10 @@ public class ForwarderService extends Service {
         int timeoutMs,
         String deliveryToken
     ) {
+        if (deliveryToken.equals(cancelledTerminalJobs.remove(jobId))) {
+            postTerminalCancellation(jobId, deliveryToken, false);
+            return;
+        }
         if (!updateTerminalJobLifecycle(jobId, deliveryToken, "start")) {
             Log.i(TAG, "Server cancelled terminal job before start jobId=" + jobId);
             postTerminalCancellation(jobId, deliveryToken, false);
@@ -1479,12 +1635,11 @@ public class ForwarderService extends Service {
         String deliveryToken
     ) {
         HttpURLConnection conn = null;
-        TerminalJobExecution execution = deliveryToken == null ? null : new TerminalJobExecution();
-        Thread cancellationWatcher = null;
+        TerminalJobExecution execution = new TerminalJobExecution();
         try {
-            if (execution != null) {
-                activeTerminalJobs.put(jobId, execution);
-                cancellationWatcher = startTerminalJobCancellationWatcher(jobId, deliveryToken, execution);
+            activeTerminalJobs.put(jobId, execution);
+            if (deliveryToken.equals(cancelledTerminalJobs.remove(jobId))) {
+                execution.requestCancellation();
             }
             DiscoveredTerminal terminal = discoveredTerminals.get(paymentTerminalId);
             if (terminal == null) {
@@ -1499,11 +1654,9 @@ public class ForwarderService extends Service {
                     + " " + method + " " + url
             );
             conn = (HttpURLConnection) url.openConnection();
-            if (execution != null) {
-                execution.setConnection(conn);
-                if (execution.isCancellationRequested()) {
-                    throw new IOException("Forwarded terminal request was cancelled before dispatch.");
-                }
+            execution.setConnection(conn);
+            if (execution.isCancellationRequested()) {
+                throw new IOException("Forwarded terminal request was cancelled before dispatch.");
             }
             conn.setRequestMethod(method);
             conn.setConnectTimeout(5_000);
@@ -1542,20 +1695,16 @@ public class ForwarderService extends Service {
             postTerminalResult(jobId, deliveryToken, result, null);
         } catch (Exception e) {
             Log.w(TAG, "dispatchTerminalRequest failed jobId=" + jobId, e);
-            if (execution != null && execution.isCancellationRequested()) {
+            if (execution.isCancellationRequested()) {
                 postTerminalCancellation(jobId, deliveryToken, true);
             } else {
                 postTerminalError(jobId, deliveryToken, e.getMessage() == null
                     ? "Forwarded terminal request failed." : e.getMessage());
             }
         } finally {
-            if (execution != null) {
-                execution.markFinished();
-                activeTerminalJobs.remove(jobId, execution);
-            }
-            if (cancellationWatcher != null) {
-                cancellationWatcher.interrupt();
-            }
+            execution.markFinished();
+            activeTerminalJobs.remove(jobId, execution);
+            cancelledTerminalJobs.remove(jobId);
             if (conn != null) {
                 try {
                     conn.disconnect();
@@ -1566,67 +1715,17 @@ public class ForwarderService extends Service {
     }
 
     private boolean updateTerminalJobLifecycle(String jobId, String deliveryToken, String action) {
-        HttpURLConnection conn = null;
         try {
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward-job");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setRequestProperty("Content-Type", "application/json");
-            applyCookies(conn);
-
             JSONObject body = new JSONObject();
             body.put("jobId", jobId);
-            body.put("forwarderId", forwarderId);
             body.put("deliveryToken", deliveryToken);
             body.put("action", action);
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
-            }
-
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken) || status < 200 || status >= 300) {
-                return false;
-            }
-            String responseBody = readAll(conn.getInputStream());
-            JSONObject response = new JSONObject(responseBody);
-            return "poll".equals(action)
-                ? response.optBoolean("cancelRequested", false)
-                : response.optBoolean("accepted", false);
+            JSONObject response = sendSocketRequest("terminal.lifecycle", body);
+            return response.optBoolean("accepted", false) && !response.optBoolean("cancelRequested", false);
         } catch (Exception e) {
             Log.w(TAG, "terminal job lifecycle failed jobId=" + jobId + " action=" + action, e);
             return false;
-        } finally {
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
         }
-    }
-
-    private Thread startTerminalJobCancellationWatcher(
-        String jobId,
-        String deliveryToken,
-        TerminalJobExecution execution
-    ) {
-        Thread watcher = new Thread(() -> {
-            while (running.get() && !Thread.currentThread().isInterrupted() && !execution.isFinished()) {
-                if (updateTerminalJobLifecycle(jobId, deliveryToken, "poll")) {
-                    Log.i(TAG, "Cancelling active terminal request jobId=" + jobId);
-                    execution.requestCancellation();
-                    return;
-                }
-                sleepQuietly(TERMINAL_JOB_CONTROL_POLL_MS);
-            }
-        }, "ForwarderTerminalJobControl-" + jobId);
-        watcher.setDaemon(true);
-        watcher.start();
-        return watcher;
     }
 
     private void postTerminalCancellation(String jobId, String deliveryToken, boolean requestStarted) {
@@ -1643,114 +1742,78 @@ public class ForwarderService extends Service {
         if (jobId == null || jobId.isEmpty() || deliveryToken == null || deliveryToken.isEmpty()) {
             return false;
         }
-
-        long startedAt = System.currentTimeMillis();
-        while (running.get() && System.currentTimeMillis() - startedAt <= PRINT_RESULT_SUBMIT_MAX_MS) {
-            HttpURLConnection conn = null;
-            try {
-                final String usedToken = authToken;
-                URL url = new URL(baseUrl + "/api/_internal/print-forward-result");
-                conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-                conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-                conn.setRequestProperty("Content-Type", "application/json");
-                applyCookies(conn);
-
-                JSONObject body = new JSONObject();
-                body.put("jobId", jobId);
-                body.put("deliveryToken", deliveryToken);
-                body.put("status", status);
-                if (errorMessage != null && !errorMessage.isEmpty()) {
-                    body.put("errorMessage", errorMessage.substring(0, Math.min(errorMessage.length(), 1_000)));
-                }
-                try (OutputStream out = conn.getOutputStream()) {
-                    out.write(body.toString().getBytes(StandardCharsets.UTF_8));
-                }
-
-                int responseStatus = conn.getResponseCode();
-                if (handledUnauthorized(responseStatus, usedToken)) {
-                    return false;
-                }
-                if (responseStatus >= 200 && responseStatus < 300) {
-                    Log.i(TAG, "Submitted print result jobId=" + jobId + " status=" + status);
-                    return true;
-                }
-                Log.w(TAG, "Submit print result HTTP " + responseStatus + " jobId=" + jobId + " status=" + status);
-            } catch (Exception e) {
-                Log.w(TAG, "Submit print result failed jobId=" + jobId + " status=" + status, e);
-            } finally {
-                if (conn != null) {
-                    try {
-                        conn.disconnect();
-                    } catch (Exception ignored) {
-                    }
-                }
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("jobId", jobId);
+            payload.put("deliveryToken", deliveryToken);
+            payload.put("status", status);
+            if (errorMessage != null && !errorMessage.isEmpty()) {
+                payload.put("errorMessage", errorMessage.substring(0, Math.min(errorMessage.length(), 1_000)));
             }
-            sleepQuietly(RESPONSE_SUBMIT_RETRY_MS);
+            if (!"accepted".equals(status)) {
+                pendingPrintResults.put(jobId, payload);
+            }
+            return submitPrintResultPayload(payload);
+        } catch (Exception e) {
+            Log.w(TAG, "Could not submit print result jobId=" + jobId, e);
+            return false;
         }
+    }
 
-        Log.w(TAG, "Gave up submitting print result jobId=" + jobId + " status=" + status);
-        return false;
+    private boolean submitPrintResultPayload(JSONObject payload) {
+        String jobId = payload.optString("jobId", "");
+        try {
+            JSONObject response = sendSocketRequest("print.result", payload);
+            boolean accepted = response.optBoolean("accepted", false);
+            if (accepted) {
+                pendingPrintResults.remove(jobId, payload);
+            }
+            return accepted;
+        } catch (Exception e) {
+            Log.w(TAG, "Print result will be retried after reconnect jobId=" + jobId, e);
+            return false;
+        }
     }
 
     private void postTerminalResult(String jobId, String deliveryToken, JSONObject result, String errorMessage) {
-        long startedAt = System.currentTimeMillis();
-        while (running.get() && System.currentTimeMillis() - startedAt <= RESPONSE_SUBMIT_MAX_MS) {
-            HttpURLConnection conn = null;
-            try {
-                final String usedToken = authToken;
-                URL url = new URL(baseUrl + "/api/_internal/payment-terminal-forward-response");
-                conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-                conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-                conn.setRequestProperty("Content-Type", "application/json");
-                applyCookies(conn);
-                JSONObject body = new JSONObject();
-                body.put("jobId", jobId);
-                if (deliveryToken != null) {
-                    body.put("forwarderId", forwarderId);
-                    body.put("deliveryToken", deliveryToken);
-                }
-                if (errorMessage != null) {
-                    JSONObject errObj = new JSONObject();
-                    errObj.put("message", errorMessage);
-                    body.put("result", errObj);
-                } else {
-                    body.put("result", result);
-                }
-                try (OutputStream out = conn.getOutputStream()) {
-                    out.write(body.toString().getBytes(StandardCharsets.UTF_8));
-                }
-                int status = conn.getResponseCode();
-                if (handledUnauthorized(status, usedToken)) {
-                    return;
-                }
-                if (status >= 200 && status < 300) {
-                    Log.i(TAG, "Submitted terminal response jobId=" + jobId);
-                    return;
-                }
-                Log.w(TAG, "Submit terminal response HTTP " + status + " jobId=" + jobId);
-            } catch (Exception e) {
-                Log.w(TAG, "Submit terminal response failed jobId=" + jobId, e);
-            } finally {
-                if (conn != null) {
-                    try {
-                        conn.disconnect();
-                    } catch (Exception ignored) {
-                    }
-                }
-            }
-            sleepQuietly(RESPONSE_SUBMIT_RETRY_MS);
+        if (jobId == null || jobId.isEmpty() || deliveryToken == null || deliveryToken.isEmpty()) {
+            return;
         }
-        Log.w(TAG, "Gave up submitting terminal response jobId=" + jobId);
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("jobId", jobId);
+            payload.put("deliveryToken", deliveryToken);
+            if (errorMessage != null) {
+                JSONObject error = new JSONObject();
+                error.put("message", errorMessage);
+                payload.put("result", error);
+            } else {
+                payload.put("result", result);
+            }
+            pendingTerminalResults.put(jobId, payload);
+            submitTerminalResultPayload(payload);
+        } catch (Exception e) {
+            Log.w(TAG, "Could not encode terminal response jobId=" + jobId, e);
+        }
+    }
+
+    private boolean submitTerminalResultPayload(JSONObject payload) {
+        String jobId = payload.optString("jobId", "");
+        try {
+            JSONObject response = sendSocketRequest("terminal.result", payload);
+            boolean accepted = response.optBoolean("accepted", false);
+            if (accepted) {
+                pendingTerminalResults.remove(jobId, payload);
+            }
+            return accepted;
+        } catch (Exception e) {
+            Log.w(TAG, "Terminal response will be retried after reconnect jobId=" + jobId, e);
+            return false;
+        }
     }
 
     private void postTerminalError(String jobId, String message) {
-        postTerminalError(jobId, null, message);
+        Log.w(TAG, "Cannot submit terminal error without a delivery token jobId=" + jobId + ": " + message);
     }
 
     private void postTerminalError(String jobId, String deliveryToken, String message) {
@@ -1786,202 +1849,6 @@ public class ForwarderService extends Service {
             HttpURLConnection activeConnection = connection;
             if (activeConnection != null) {
                 activeConnection.disconnect();
-            }
-        }
-    }
-
-    // ========================================================================
-    // Discovery heartbeat (keeps server's lastSeenAt fresh while logged out)
-    // ========================================================================
-
-    private void startHeartbeatLoop() {
-        heartbeatThread = new Thread(this::runHeartbeatLoop, "ForwarderHeartbeat");
-        heartbeatThread.setDaemon(true);
-        heartbeatThread.start();
-    }
-
-    private void runHeartbeatLoop() {
-        while (running.get()) {
-            try {
-                if (networkCallback == null) {
-                    registerNetworkCallback();
-                }
-                acquireMulticastLock();
-                startDiscoveryThreadIfNeeded();
-                postDiscoveryHeartbeat();
-            } catch (Throwable t) {
-                Log.w(TAG, "heartbeat iteration failed", t);
-            }
-            sleepQuietly(HEARTBEAT_INTERVAL_MS);
-        }
-        Log.i(TAG, "Heartbeat loop exited");
-    }
-
-    private void postDiscoveryHeartbeat() {
-        List<DiscoveredTerminal> terminals = getDiscoveredTerminals();
-        if (terminals.isEmpty()) {
-            return;
-        }
-        HttpURLConnection conn = null;
-        try {
-            JSONArray arr = new JSONArray();
-            for (DiscoveredTerminal terminal : terminals) {
-                JSONObject obj = new JSONObject();
-                obj.put("terminalId", terminal.terminalId);
-                obj.put("ipAddress", terminal.ipAddress);
-                obj.put("port", terminal.port);
-                obj.put("lastSeenAt", formatIsoUtc(terminal.lastSeenAtMs));
-                arr.put(obj);
-            }
-            JSONObject body = new JSONObject();
-            body.put("terminals", arr);
-
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/payment-terminal-heartbeat");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setRequestProperty("Content-Type", "application/json");
-            applyCookies(conn);
-
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
-            }
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "heartbeat HTTP " + status);
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "heartbeat failed", e);
-        } finally {
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    // ========================================================================
-    // Takeaway order long-poll loop
-    // ========================================================================
-
-    private void startTakeawayOrderLoop() {
-        takeawayOrderThread = new Thread(this::runTakeawayOrderLoop, "ForwarderTakeawayOrders");
-        takeawayOrderThread.setDaemon(true);
-        takeawayOrderThread.start();
-    }
-
-    private void runTakeawayOrderLoop() {
-        while (running.get()) {
-            if (!takeawayEnabled.get()) {
-                waitForTakeawayOrderSignal();
-                continue;
-            }
-
-            try {
-                if (!longPollTakeawayOrder()) {
-                    sleepQuietly(RETRY_AFTER_ERROR_MS);
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "Takeaway order loop iteration failed", t);
-                sleepQuietly(RETRY_AFTER_ERROR_MS);
-            }
-        }
-        Log.i(TAG, "Takeaway order loop exited");
-    }
-
-    private void waitForTakeawayOrderSignal() {
-        synchronized (takeawayOrderSignal) {
-            if (!running.get() || takeawayEnabled.get()) {
-                return;
-            }
-            try {
-                takeawayOrderSignal.wait();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    private void signalTakeawayOrderLoop() {
-        synchronized (takeawayOrderSignal) {
-            takeawayOrderSignal.notifyAll();
-        }
-    }
-
-    private boolean longPollTakeawayOrder() {
-        HttpURLConnection conn = null;
-        try {
-            JSONObject body = new JSONObject();
-            String cursor = takeawayOrderCursor;
-            if (cursor != null && !cursor.isEmpty()) {
-                body.put("cursor", cursor);
-            } else {
-                body.put("startedAt", takeawayOrderStartedAt);
-            }
-
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/takeaway-orders");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Accept", "application/json");
-            applyCookies(conn);
-
-            synchronized (takeawayOrderLongPollLock) {
-                currentTakeawayOrderLongPoll = conn;
-            }
-
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
-            }
-
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return false;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "takeaway-orders HTTP " + status);
-                return false;
-            }
-
-            JSONObject response = new JSONObject(readAll(conn.getInputStream()));
-            String responseCursor = response.optString("cursor", "");
-            if (!responseCursor.isEmpty()) {
-                takeawayOrderCursor = responseCursor;
-            }
-
-            JSONObject event = response.optJSONObject("event");
-            if (event != null) {
-                handleTakeawayOrderEvent(event);
-            }
-            return true;
-        } catch (Exception e) {
-            if (running.get() && takeawayEnabled.get()) {
-                Log.w(TAG, "Takeaway order long poll failed", e);
-            }
-            return false;
-        } finally {
-            synchronized (takeawayOrderLongPollLock) {
-                if (currentTakeawayOrderLongPoll == conn) {
-                    currentTakeawayOrderLongPoll = null;
-                }
-            }
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
             }
         }
     }
@@ -2210,124 +2077,6 @@ public class ForwarderService extends Service {
         }
     }
 
-    // ========================================================================
-    // Table booking long-poll loop
-    // ========================================================================
-
-    private void startTableBookingLoop() {
-        tableBookingThread = new Thread(this::runTableBookingLoop, "ForwarderTableBookings");
-        tableBookingThread.setDaemon(true);
-        tableBookingThread.start();
-    }
-
-    private void runTableBookingLoop() {
-        while (running.get()) {
-            if (!tableBookingEnabled.get()) {
-                waitForTableBookingSignal();
-                continue;
-            }
-
-            try {
-                if (!longPollTableBooking()) {
-                    sleepQuietly(RETRY_AFTER_ERROR_MS);
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "Table booking loop iteration failed", t);
-                sleepQuietly(RETRY_AFTER_ERROR_MS);
-            }
-        }
-        Log.i(TAG, "Table booking loop exited");
-    }
-
-    private void waitForTableBookingSignal() {
-        synchronized (tableBookingSignal) {
-            if (!running.get() || tableBookingEnabled.get()) {
-                return;
-            }
-            try {
-                tableBookingSignal.wait();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    private void signalTableBookingLoop() {
-        synchronized (tableBookingSignal) {
-            tableBookingSignal.notifyAll();
-        }
-    }
-
-    private boolean longPollTableBooking() {
-        HttpURLConnection conn = null;
-        try {
-            JSONObject body = new JSONObject();
-            String cursor = tableBookingCursor;
-            if (cursor != null && !cursor.isEmpty()) {
-                body.put("cursor", cursor);
-            } else {
-                body.put("startedAt", tableBookingStartedAt);
-            }
-
-            final String usedToken = authToken;
-            URL url = new URL(baseUrl + "/api/_internal/table-bookings");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(LONG_POLL_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(LONG_POLL_READ_TIMEOUT_MS);
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Accept", "application/json");
-            applyCookies(conn);
-
-            synchronized (tableBookingLongPollLock) {
-                currentTableBookingLongPoll = conn;
-            }
-
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
-            }
-
-            int status = conn.getResponseCode();
-            if (handledUnauthorized(status, usedToken)) {
-                return false;
-            }
-            if (status < 200 || status >= 300) {
-                Log.w(TAG, "table-bookings HTTP " + status);
-                return false;
-            }
-
-            JSONObject response = new JSONObject(readAll(conn.getInputStream()));
-            String responseCursor = response.optString("cursor", "");
-            if (!responseCursor.isEmpty()) {
-                tableBookingCursor = responseCursor;
-            }
-
-            JSONObject event = response.optJSONObject("event");
-            if (event != null) {
-                handleTableBookingEvent(event);
-            }
-            return true;
-        } catch (Exception e) {
-            if (running.get() && tableBookingEnabled.get()) {
-                Log.w(TAG, "Table booking long poll failed", e);
-            }
-            return false;
-        } finally {
-            synchronized (tableBookingLongPollLock) {
-                if (currentTableBookingLongPoll == conn) {
-                    currentTableBookingLongPoll = null;
-                }
-            }
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
     private void handleTableBookingEvent(JSONObject event) {
         String type = event.optString("type", "");
         if ("deleted".equals(type)) {
@@ -2471,73 +2220,11 @@ public class ForwarderService extends Service {
     }
 
     // ========================================================================
-    // Long-poll response parsing
-    // ========================================================================
-    //
-    // The server replies with SSE framing (`event:` / `data:` lines, blank line
-    // separator) but exactly one event followed by `event: close` and a graceful
-    // socket close. We parse that as long-poll output: as soon as we receive the
-    // job event, we invoke the handler and return; the close event ends the loop.
-
-    private interface LongPollEventHandler {
-        void onEvent(String event, String data);
-    }
-
-    private void readLongPollResponse(HttpURLConnection conn, LongPollEventHandler handler) throws Exception {
-        try (BufferedReader reader = new BufferedReader(
-            new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            String eventName = "message";
-            StringBuilder dataBuf = new StringBuilder();
-            while (running.get() && (line = reader.readLine()) != null) {
-                if (line.isEmpty()) {
-                    if (dataBuf.length() > 0) {
-                        String dataStr = dataBuf.toString();
-                        dataBuf.setLength(0);
-                        String currentEvent = eventName;
-                        eventName = "message";
-                        if ("close".equals(currentEvent)) {
-                            return;
-                        }
-                        try {
-                            handler.onEvent(currentEvent, dataStr);
-                        } catch (Exception e) {
-                            Log.w(TAG, "Long-poll handler failed for event=" + currentEvent, e);
-                        }
-                    }
-                } else if (line.startsWith("event:")) {
-                    eventName = line.substring(6).trim();
-                } else if (line.startsWith("data:")) {
-                    if (dataBuf.length() > 0) {
-                        dataBuf.append('\n');
-                    }
-                    dataBuf.append(line.substring(5).trim());
-                }
-            }
-        }
-    }
-
-    // ========================================================================
-    // HTTP helpers
-    // ========================================================================
-
-    private void applyCookies(HttpURLConnection conn) {
-        String token = authToken;
-        if (token != null && !token.isEmpty()) {
-            conn.setRequestProperty("Authorization", "Bearer " + token);
-        }
-    }
-
-    // ========================================================================
     // Token rejection handling
     // ========================================================================
     //
-    // Every forwarder call authenticates with the androidsync Bearer token. Once
-    // the server rejects it (401 "Invalid or expired forwarder token") the token
-    // is dead for good — only an authenticated WebView can mint a new one. Rather
-    // than hammer every endpoint with a doomed token forever, the first loop to
-    // see a 401 clears the token, warns the operator, tells the WebView, and
-    // stops the service.
+    // The socket authenticates with the androidsync Bearer token. Once the
+    // server rejects it, only an authenticated WebView can mint a new one.
 
     /**
      * @return true when the status was a 401 for {@code usedToken} and the token
@@ -2694,6 +2381,11 @@ public class ForwarderService extends Service {
 
     public static void setAppFocused(boolean focused) {
         appFocused.set(focused);
+        ForwarderService service = activeService.get();
+        if (service != null) {
+            service.sendClientState();
+            service.wakeDeviceMonitor();
+        }
     }
 
     public static String getConfiguredBaseUrl(Context context) {
@@ -2729,7 +2421,43 @@ public class ForwarderService extends Service {
     // Container used internally for active LAN printer entries.
     private static class LanPrinter {
         String printerId;
+        String name;
         String ip;
+    }
+
+    private static class ConfiguredTerminal {
+        String terminalId;
+        String name;
+        String identity;
+        String ipAddress;
+        int port;
+        String protocolType;
+        String protocolVersion;
+        String probePath;
+        JSONObject probeHeaders;
+
+        static ConfiguredTerminal fromJson(JSONObject value) {
+            String terminalId = value.optString("terminalId", "");
+            String ipAddress = value.optString("ipAddress", "");
+            int port = value.optInt("port", 0);
+            if (terminalId.isEmpty() || ipAddress.isEmpty() || port < 1) {
+                return null;
+            }
+            ConfiguredTerminal terminal = new ConfiguredTerminal();
+            terminal.terminalId = terminalId;
+            terminal.name = value.optString("name", terminalId);
+            terminal.identity = value.optString("identity", null);
+            terminal.ipAddress = ipAddress;
+            terminal.port = port;
+            terminal.protocolType = value.optString("protocolType", null);
+            terminal.protocolVersion = value.optString("protocolVersion", null);
+            JSONObject probe = value.optJSONObject("probe");
+            if (probe != null) {
+                terminal.probePath = probe.optString("path", null);
+                terminal.probeHeaders = probe.optJSONObject("headers");
+            }
+            return terminal;
+        }
     }
 
     // ========================================================================
@@ -2821,7 +2549,7 @@ public class ForwarderService extends Service {
         unregisterNetworkCallback();
         releaseMulticastLock();
         discoveredTerminals.clear();
-        signalPaymentTerminalLoop();
+        wakeDeviceMonitor();
     }
 
     private void startDiscoveryThreadIfNeeded() {
@@ -2840,8 +2568,10 @@ public class ForwarderService extends Service {
     private void resetDiscoveryForNetworkChange(String reason) {
         Log.i(TAG, reason + "; resetting terminal discovery");
         discoveredTerminals.clear();
-        interruptPaymentTerminalLongPoll();
-        signalPaymentTerminalLoop();
+        synchronized (deviceConfigurationLock) {
+            terminalProbePending = true;
+        }
+        wakeDeviceMonitor();
         restartDiscoveryTransport();
     }
 
@@ -2918,6 +2648,74 @@ public class ForwarderService extends Service {
         }
     }
 
+    private void startNetworkLocationTracking() {
+        synchronized (networkLocationCallbackLock) {
+            if (networkLocationCallback != null) {
+                return;
+            }
+            try {
+                ConnectivityManager cm =
+                    (ConnectivityManager) getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm == null) {
+                    return;
+                }
+                Network activeNetwork = cm.getActiveNetwork();
+                networkLocationNetwork = activeNetwork;
+                ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {
+                    @Override
+                    public void onAvailable(Network network) {
+                        Network previous = networkLocationNetwork;
+                        networkLocationNetwork = network;
+                        if (previous == null || !previous.equals(network)) {
+                            networkAttestationToken = null;
+                            networkAttestationExpiresAt = 0;
+                            refreshNetworkLocation(network);
+                        }
+                    }
+
+                    @Override
+                    public void onLost(Network network) {
+                        if (network.equals(networkLocationNetwork)) {
+                            networkLocationNetwork = null;
+                            networkAttestationToken = null;
+                            networkAttestationExpiresAt = 0;
+                        }
+                    }
+                };
+                cm.registerDefaultNetworkCallback(callback);
+                networkLocationCallback = callback;
+                if (activeNetwork != null) {
+                    refreshNetworkLocation(activeNetwork);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to track network location changes", e);
+                networkLocationCallback = null;
+            }
+        }
+    }
+
+    private void stopNetworkLocationTracking() {
+        synchronized (networkLocationCallbackLock) {
+            ConnectivityManager.NetworkCallback callback = networkLocationCallback;
+            networkLocationCallback = null;
+            networkLocationNetwork = null;
+            networkAttestationToken = null;
+            networkAttestationExpiresAt = 0;
+            if (callback == null) {
+                return;
+            }
+            try {
+                ConnectivityManager cm =
+                    (ConnectivityManager) getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    cm.unregisterNetworkCallback(callback);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to stop network location tracking", e);
+            }
+        }
+    }
+
     private void registerScreenStateReceiver() {
         try {
             PowerManager pm = (PowerManager) getApplicationContext().getSystemService(Context.POWER_SERVICE);
@@ -2947,10 +2745,8 @@ public class ForwarderService extends Service {
                 }
                 screenOn.set(nowOn);
                 Log.i(TAG, "Screen state changed: " + (nowOn ? "ON" : "OFF"));
-                // Deliberately do NOT interrupt the open long-polls: each
-                // window is at most 25s, so the new value is picked up on the
-                // next reconnect anyway, and bouncing the connection risks
-                // dropping a job the server was about to push.
+                sendClientState();
+                wakeDeviceMonitor();
             }
         };
         IntentFilter filter = new IntentFilter();
@@ -2967,6 +2763,47 @@ public class ForwarderService extends Service {
     private void unregisterScreenStateReceiver() {
         BroadcastReceiver receiver = screenStateReceiver;
         screenStateReceiver = null;
+        if (receiver == null) {
+            return;
+        }
+        try {
+            getApplicationContext().unregisterReceiver(receiver);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void registerAttachedDeviceReceiver() {
+        attachedDeviceReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+                Log.i(TAG, "Attached device state changed: " + action);
+                wakeDeviceMonitor();
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                getApplicationContext().registerReceiver(
+                    attachedDeviceReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED
+                );
+            } else {
+                getApplicationContext().registerReceiver(attachedDeviceReceiver, filter);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to register attached device receiver", e);
+            attachedDeviceReceiver = null;
+        }
+    }
+
+    private void unregisterAttachedDeviceReceiver() {
+        BroadcastReceiver receiver = attachedDeviceReceiver;
+        attachedDeviceReceiver = null;
         if (receiver == null) {
             return;
         }
@@ -3078,7 +2915,7 @@ public class ForwarderService extends Service {
                 + " -> " + terminal.ipAddress + ":" + terminal.port + ")");
         }
         if (isNew || endpointChanged) {
-            signalPaymentTerminalLoop();
+            wakeDeviceMonitor();
         }
         for (DiscoveryListener listener : discoveryListeners) {
             try {

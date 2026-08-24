@@ -109,6 +109,15 @@ if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "io.sentry:sentry-android" "$APP_BUIL
     echo "🩹 Added Sentry Android dependency to android/app/build.gradle"
 fi
 
+# ForwarderService uses OkHttp's native WebSocket client for the persistent,
+# authenticated bidirectional connection to the POS server.
+if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "com.squareup.okhttp3:okhttp" "$APP_BUILD_GRADLE"; then
+    sed -i '' $'/implementation "io.sentry:sentry-android:8.35.0"/a\\
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+' "$APP_BUILD_GRADLE"
+    echo "🩹 Added OkHttp WebSocket dependency to android/app/build.gradle"
+fi
+
 # Release builds use APP_PRERELEASE=true when produced from an apk-x.y.z-pre tag.
 # Expose that immutable channel in BuildConfig so both the WebView bridge and the
 # scheduled native checker follow the same release stream.
