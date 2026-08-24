@@ -38,6 +38,15 @@ public class ForwarderServicePlugin extends Plugin {
     // token and re-mint after the next login.
     private final ForwarderService.TokenListener tokenListener =
         () -> notifyListeners("tokenRejected", new JSObject());
+    private final ForwarderService.StatusListener statusListener = (running, connected) -> {
+        JSObject status = new JSObject();
+        status.put("running", running);
+        status.put("connected", connected);
+        // A WebView reload briefly removes its Capacitor listeners. Retain the
+        // latest transition so the replacement listener cannot keep showing a
+        // stale green state after the native socket has gone offline.
+        notifyListeners("statusChanged", status, true);
+    };
     private final ForwarderService.TakeawayOrderListener takeawayOrderListener = event -> {
         try {
             notifyListeners("takeawayOrder", JSObject.fromJSONObject(event), true);
@@ -56,6 +65,7 @@ public class ForwarderServicePlugin extends Plugin {
     @Override
     public void load() {
         ForwarderService.registerTokenListener(tokenListener);
+        ForwarderService.registerStatusListener(statusListener);
         ForwarderService.registerTakeawayOrderListener(takeawayOrderListener);
         ForwarderService.registerTableBookingListener(tableBookingListener);
         handleTakeawayNotificationIntent(getActivity().getIntent());
@@ -66,6 +76,7 @@ public class ForwarderServicePlugin extends Plugin {
     protected void handleOnDestroy() {
         ForwarderService.setAppFocused(false);
         ForwarderService.unregisterTokenListener(tokenListener);
+        ForwarderService.unregisterStatusListener(statusListener);
         ForwarderService.unregisterTakeawayOrderListener(takeawayOrderListener);
         ForwarderService.unregisterTableBookingListener(tableBookingListener);
         super.handleOnDestroy();
@@ -108,6 +119,7 @@ public class ForwarderServicePlugin extends Plugin {
         ForwarderService.requestStart(context.getApplicationContext(), baseUrl, token);
         JSObject ret = new JSObject();
         ret.put("running", true);
+        ret.put("connected", ForwarderService.isConnected());
         ret.put("baseUrl", baseUrl);
         call.resolve(ret);
     }
@@ -122,6 +134,21 @@ public class ForwarderServicePlugin extends Plugin {
         ForwarderService.requestStop(context.getApplicationContext());
         JSObject ret = new JSObject();
         ret.put("running", false);
+        ret.put("connected", false);
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void reconnect(PluginCall call) {
+        Context context = getContext();
+        if (context == null) {
+            call.reject("No Android context");
+            return;
+        }
+        ForwarderService.requestReconnect(context.getApplicationContext());
+        JSObject ret = new JSObject();
+        ret.put("running", ForwarderService.isRunning());
+        ret.put("connected", ForwarderService.isConnected());
         call.resolve(ret);
     }
 
@@ -129,6 +156,7 @@ public class ForwarderServicePlugin extends Plugin {
     public void getStatus(PluginCall call) {
         JSObject ret = new JSObject();
         ret.put("running", ForwarderService.isRunning());
+        ret.put("connected", ForwarderService.isConnected());
         String activeBaseUrl = ForwarderService.getActiveBaseUrl();
         if (activeBaseUrl != null) {
             ret.put("baseUrl", activeBaseUrl);

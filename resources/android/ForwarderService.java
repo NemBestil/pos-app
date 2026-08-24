@@ -124,6 +124,8 @@ public class ForwarderService extends Service {
     public static final String ACTION_STOP = "com.nembestil.pos3.app.action.STOP_FORWARDER";
     public static final String ACTION_NOTIFY_CONFIG_CHANGED =
         "com.nembestil.pos3.app.action.NOTIFY_FORWARDER_CONFIG_CHANGED";
+    public static final String ACTION_RECONNECT =
+        "com.nembestil.pos3.app.action.RECONNECT_FORWARDER";
     public static final String ACTION_UPDATE_TAKEAWAY_STATE =
         "com.nembestil.pos3.app.action.UPDATE_TAKEAWAY_STATE";
     public static final String ACTION_UPDATE_TABLE_BOOKING_STATE =
@@ -155,7 +157,8 @@ public class ForwarderService extends Service {
     private static final long TERMINAL_STALE_AFTER_MS = 2 * 60_000;
     private static final long SOCKET_REQUEST_TIMEOUT_MS = 8_000;
     private static final long SOCKET_RECONNECT_MAX_MS = 15_000;
-    private static final long SOCKET_SERVER_PING_TIMEOUT_MS = 15_000;
+    private static final long SOCKET_SERVER_PING_INTERVAL_MS = 5_000;
+    private static final long SOCKET_SERVER_PING_TIMEOUT_MS = SOCKET_SERVER_PING_INTERVAL_MS * 2;
     private static final long SOCKET_WATCHDOG_INTERVAL_MS = 1_000;
     private static final String WHOAMI_URL = "https://whoami.nemkasse.com";
 
@@ -180,6 +183,7 @@ public class ForwarderService extends Service {
     // Listeners (the Capacitor plugin) that want to know when the server rejected
     // our token, so the WebView can drop its own copy and re-mint after login.
     private static final CopyOnWriteArrayList<TokenListener> tokenListeners = new CopyOnWriteArrayList<>();
+    private static final CopyOnWriteArrayList<StatusListener> statusListeners = new CopyOnWriteArrayList<>();
     private static final CopyOnWriteArrayList<TakeawayOrderListener> takeawayOrderListeners =
         new CopyOnWriteArrayList<>();
     private static final CopyOnWriteArrayList<TableBookingListener> tableBookingListeners =
@@ -255,6 +259,16 @@ public class ForwarderService extends Service {
         return running.get();
     }
 
+    public static boolean isConnected() {
+        ForwarderService service = activeService.get();
+        if (service == null || !service.socketRegistered.get()) {
+            return false;
+        }
+        long lastPing = service.lastServerPingElapsedAt;
+        return lastPing > 0
+            && SystemClock.elapsedRealtime() - lastPing < SOCKET_SERVER_PING_TIMEOUT_MS;
+    }
+
     public static String getActiveBaseUrl() {
         return activeBaseUrl.get();
     }
@@ -282,6 +296,12 @@ public class ForwarderService extends Service {
             sendSocketMessage("configuration.request", new JSONObject());
             wakeDeviceMonitor();
             return START_STICKY;
+        }
+
+        if (ACTION_RECONNECT.equals(action)) {
+            Log.i(TAG, "Immediate reconnect requested");
+            reconnectWebSocketNow();
+            return running.get() ? START_STICKY : START_NOT_STICKY;
         }
 
         if (ACTION_UPDATE_TAKEAWAY_STATE.equals(action)) {
@@ -341,6 +361,7 @@ public class ForwarderService extends Service {
         if (running.compareAndSet(false, true)) {
             Log.i(TAG, "Starting WebSocket forwarder baseUrl=" + baseUrl + " forwarderId=" + forwarderId);
             activeService.set(this);
+            notifyStatusChanged();
             registerScreenStateReceiver();
             registerAttachedDeviceReceiver();
             startDiscoveryListener();
@@ -428,6 +449,7 @@ public class ForwarderService extends Service {
         activeService.compareAndSet(this, null);
         activeBaseUrl.set(null);
         socketRegistered.set(false);
+        notifyStatusChanged();
         socketGeneration.incrementAndGet();
         socketConnectStartedElapsedAt = 0;
         lastServerPingElapsedAt = 0;
@@ -527,7 +549,7 @@ public class ForwarderService extends Service {
                 socketConnecting.set(false);
                 socketReconnectScheduled.set(false);
                 socketReconnectAttempt.set(0);
-                socketRegistered.set(false);
+                setSocketRegistered(false);
                 Log.i(TAG, "Android WebSocket connected");
                 sendSocketRegistration();
             }
@@ -593,7 +615,7 @@ public class ForwarderService extends Service {
         socketConnectStartedElapsedAt = 0;
         lastServerPingElapsedAt = 0;
         socketConnecting.set(false);
-        socketRegistered.set(false);
+        setSocketRegistered(false);
         for (CompletableFuture<JSONObject> future : pendingSocketRequests.values()) {
             future.completeExceptionally(new IOException("The Android WebSocket disconnected."));
         }
@@ -626,7 +648,7 @@ public class ForwarderService extends Service {
         webSocket = null;
         socketConnectStartedElapsedAt = 0;
         lastServerPingElapsedAt = 0;
-        socketRegistered.set(false);
+        setSocketRegistered(false);
         socketConnecting.set(false);
         socketReconnectAttempt.set(0);
         if (current != null) {
@@ -645,7 +667,7 @@ public class ForwarderService extends Service {
             if (socketConnecting.get()) {
                 long connectStarted = socketConnectStartedElapsedAt;
                 if (connectStarted > 0 && now - connectStarted >= SOCKET_SERVER_PING_TIMEOUT_MS) {
-                    Log.w(TAG, "Android WebSocket handshake exceeded 15 seconds; reconnecting");
+                    Log.w(TAG, "Android WebSocket handshake timed out; reconnecting");
                     reconnectWebSocketNow();
                 }
                 return;
@@ -769,7 +791,7 @@ public class ForwarderService extends Service {
                 return;
             }
             if ("connection.ready".equals(type)) {
-                socketRegistered.set(true);
+                setSocketRegistered(true);
                 // Force one post-registration snapshot so changes discovered
                 // during the handshake cannot be lost behind the ready gate.
                 lastAdvertisedDevices = "";
@@ -2317,6 +2339,36 @@ public class ForwarderService extends Service {
         void onTokenRejected();
     }
 
+    public interface StatusListener {
+        void onStatusChanged(boolean isRunning, boolean isConnected);
+    }
+
+    public static void registerStatusListener(StatusListener listener) {
+        statusListeners.addIfAbsent(listener);
+    }
+
+    public static void unregisterStatusListener(StatusListener listener) {
+        statusListeners.remove(listener);
+    }
+
+    private static void notifyStatusChanged() {
+        boolean isRunning = isRunning();
+        boolean isConnected = isConnected();
+        for (StatusListener listener : statusListeners) {
+            try {
+                listener.onStatusChanged(isRunning, isConnected);
+            } catch (Exception e) {
+                Log.w(TAG, "Status listener threw", e);
+            }
+        }
+    }
+
+    private void setSocketRegistered(boolean registered) {
+        if (socketRegistered.getAndSet(registered) != registered) {
+            notifyStatusChanged();
+        }
+    }
+
     public static void registerTokenListener(TokenListener listener) {
         tokenListeners.addIfAbsent(listener);
     }
@@ -3043,6 +3095,18 @@ public class ForwarderService extends Service {
         }
         Intent intent = new Intent(context, ForwarderService.class);
         intent.setAction(ACTION_NOTIFY_CONFIG_CHANGED);
+        try {
+            context.startService(intent);
+        } catch (IllegalStateException ignored) {
+        }
+    }
+
+    public static void requestReconnect(Context context) {
+        if (!isRunning()) {
+            return;
+        }
+        Intent intent = new Intent(context, ForwarderService.class);
+        intent.setAction(ACTION_RECONNECT);
         try {
             context.startService(intent);
         } catch (IllegalStateException ignored) {
