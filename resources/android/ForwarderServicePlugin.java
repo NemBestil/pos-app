@@ -3,13 +3,19 @@ package com.nembestil.pos3.app;
 import android.Manifest;
 import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Build;
+import android.os.PowerManager;
+import android.provider.Settings;
+
+import androidx.activity.result.ActivityResult;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
@@ -21,8 +27,9 @@ import org.json.JSONException;
  * needs to ask "turn it on/off" and "what's the state" — everything else lives
  * in the service itself.
  *
- * Notification permission is requested explicitly by the hosted POS after the
- * user has authenticated, never while the app shell is starting.
+ * Notification permission and the battery-optimization exemption are requested
+ * explicitly by the hosted POS after the user has authenticated, never while
+ * the app shell is starting.
  */
 @CapacitorPlugin(
     name = "ForwarderService",
@@ -33,6 +40,8 @@ import org.json.JSONException;
 public class ForwarderServicePlugin extends Plugin {
 
     private static final String NOTIFICATIONS_ALIAS = "notifications";
+    private static final String BACKGROUND_EXECUTION_PERMISSION_SUPPORTED =
+        "backgroundExecutionPermissionSupported";
 
     // Forwarded to the WebView so it can drop its own copy of the (now dead)
     // token and re-mint after the next login.
@@ -116,11 +125,17 @@ public class ForwarderServicePlugin extends Plugin {
         }
         String baseUrl = call.getString("baseUrl");
         String token = call.getString("token");
-        ForwarderService.requestStart(context.getApplicationContext(), baseUrl, token);
+        try {
+            ForwarderService.requestStart(context.getApplicationContext(), baseUrl, token);
+        } catch (RuntimeException exception) {
+            call.reject("Android did not allow the foreground forwarder service to start.", exception);
+            return;
+        }
         JSObject ret = new JSObject();
         ret.put("running", true);
         ret.put("connected", ForwarderService.isConnected());
         ret.put("baseUrl", baseUrl);
+        ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -135,6 +150,7 @@ public class ForwarderServicePlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("running", false);
         ret.put("connected", false);
+        ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -149,6 +165,7 @@ public class ForwarderServicePlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("running", ForwarderService.isRunning());
         ret.put("connected", ForwarderService.isConnected());
+        ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -157,6 +174,7 @@ public class ForwarderServicePlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("running", ForwarderService.isRunning());
         ret.put("connected", ForwarderService.isConnected());
+        ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         String activeBaseUrl = ForwarderService.getActiveBaseUrl();
         if (activeBaseUrl != null) {
             ret.put("baseUrl", activeBaseUrl);
@@ -236,6 +254,60 @@ public class ForwarderServicePlugin extends Plugin {
             Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
                 || getPermissionState(NOTIFICATIONS_ALIAS) == PermissionState.GRANTED
         );
+    }
+
+    @PluginMethod
+    public void checkBackgroundExecutionPermission(PluginCall call) {
+        resolveBackgroundExecutionPermission(call);
+    }
+
+    @PluginMethod
+    public void requestBackgroundExecutionPermission(PluginCall call) {
+        if (isIgnoringBatteryOptimizations()) {
+            resolveBackgroundExecutionPermission(call);
+            return;
+        }
+
+        Context context = getContext();
+        if (context == null) {
+            call.reject("No Android context");
+            return;
+        }
+
+        Intent intent = new Intent(
+            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.parse("package:" + context.getPackageName())
+        );
+        try {
+            startActivityForResult(call, intent, "backgroundExecutionPermissionCallback");
+        } catch (RuntimeException exception) {
+            call.reject("Android could not open the background execution permission dialog.", exception);
+        }
+    }
+
+    @ActivityCallback
+    private void backgroundExecutionPermissionCallback(PluginCall call, ActivityResult result) {
+        if (call != null) {
+            resolveBackgroundExecutionPermission(call);
+        }
+    }
+
+    private void resolveBackgroundExecutionPermission(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("granted", isIgnoringBatteryOptimizations());
+        call.resolve(ret);
+    }
+
+    private boolean isIgnoringBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return true;
+        }
+        Context context = getContext();
+        if (context == null) {
+            return false;
+        }
+        PowerManager powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        return powerManager != null && powerManager.isIgnoringBatteryOptimizations(context.getPackageName());
     }
 
     private void resolveNotificationPermission(PluginCall call, boolean granted) {

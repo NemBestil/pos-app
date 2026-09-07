@@ -30,6 +30,16 @@ npm run android:device
 - **API:** All requests use `CapacitorHttp` to bypass CORS.
 - **Native:** Bridges printers, scanners, and other native features via Capacitor.
 
+## Android background forwarding
+
+The native `ForwarderService` is a `connectedDevice` foreground service. It owns the persistent POS WebSocket and the direct printer/payment-terminal connections, and it displays an ongoing low-priority notification while enabled.
+
+Android's battery optimization can suspend network access after the screen has been locked. The hosted POS therefore checks `PowerManager.isIgnoringBatteryOptimizations()` and asks the user, through Android's system dialog, to allow unrestricted background execution. This exemption is required for reliable unattended forwarding; it is requested only from an explicit user action and can be revoked in Android's app battery settings.
+
+The plugin advertises this feature through the optional `backgroundExecutionPermissionSupported` field on the existing `getStatus()` response. This keeps staggered deployments safe: older hosted POS versions ignore the field, while newer hosted POS versions hide the permission and retain legacy startup when an older APK omits it.
+
+Do not add a permanent partial wake lock for the idle WebSocket. Android's network stack wakes the process when socket data arrives, while a long-held wake lock would create excessive battery usage. The service's `connectedDevice` type is not subject to Android 15's six-hour `dataSync` foreground-service limit and is still permitted from `BOOT_COMPLETED`.
+
 ## Release APK
 
 Pushing a tag named `apk-x.y.z` triggers `.github/workflows/release-apk.yml`. The workflow:

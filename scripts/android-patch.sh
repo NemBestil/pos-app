@@ -143,7 +143,9 @@ fi
 # ForwarderService maintains connections to local printers and payment terminals,
 # so it uses foregroundServiceType=connectedDevice. POST_NOTIFICATIONS is optional
 # for notification-drawer visibility and is not a prerequisite for starting the
-# service. The restart receiver restores a configured service after reboot/update.
+# service. REQUEST_IGNORE_BATTERY_OPTIMIZATIONS lets the authenticated hosted POS
+# ask from its permission modal for the exemption needed by the persistent socket.
+# The restart receiver restores a configured service after reboot/update.
 # Permissions and components are patched idempotently via Python because
 # multi-line XML insertions are brittle in BSD sed.
 if [ -f "$ANDROID_MANIFEST" ]; then
@@ -166,6 +168,7 @@ permissions = [
     "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
     "android.permission.RECEIVE_BOOT_COMPLETED",
     "android.permission.POST_NOTIFICATIONS",
+    "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
     "android.permission.REQUEST_INSTALL_PACKAGES",
 ]
 anchor = '<uses-permission android:name="android.permission.INTERNET" />'

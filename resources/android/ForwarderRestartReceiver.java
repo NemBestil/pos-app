@@ -21,7 +21,11 @@ public class ForwarderRestartReceiver extends BroadcastReceiver {
             return;
         }
         Log.i(TAG, "Restoring configured forwarder after " + action);
-        ForwarderService.requestStartIfConfigured(context.getApplicationContext());
+        try {
+            ForwarderService.requestStartIfConfigured(context.getApplicationContext());
+        } catch (RuntimeException exception) {
+            Log.e(TAG, "Android did not allow the configured foreground service to restart", exception);
+        }
         AppReleaseUpdateReceiver.schedule(context.getApplicationContext());
     }
 }
