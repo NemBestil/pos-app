@@ -29,7 +29,6 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
-import android.media.Ringtone;
 import android.media.RingtoneManager;
 import android.os.Build;
 import android.os.Handler;
@@ -1876,7 +1875,10 @@ public class ForwarderService extends Service {
     }
 
     private void handleTakeawayOrderEvent(JSONObject event) {
-        if (!"created".equals(event.optString("type", ""))) {
+        if (
+            !"created".equals(event.optString("type", ""))
+                || !event.optBoolean("notifyIncomingOrder", false)
+        ) {
             JSONObject updatedOrder = event.optJSONObject("order");
             if (updatedOrder != null) {
                 cancelTakeawayOrderNotification(updatedOrder.optString("id", ""));
@@ -1903,20 +1905,6 @@ public class ForwarderService extends Service {
                 order,
                 event.optString("notificationActionToken", "")
             );
-        } else {
-            playNotificationSound();
-        }
-    }
-
-    private void playNotificationSound() {
-        try {
-            Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
-            Ringtone ringtone = RingtoneManager.getRingtone(getApplicationContext(), sound);
-            if (ringtone != null) {
-                ringtone.play();
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "Could not play takeaway notification sound", e);
         }
     }
 
@@ -2135,8 +2123,6 @@ public class ForwarderService extends Service {
 
         if (showAndroidNotification) {
             showTableBookingNotification(booking);
-        } else {
-            playNotificationSound();
         }
     }
 

@@ -34,6 +34,8 @@ npm run android:device
 
 The native `ForwarderService` is a `connectedDevice` foreground service. It owns the persistent POS WebSocket and the direct printer/payment-terminal connections, and it displays an ongoing low-priority notification while enabled.
 
+Incoming takeaway and table-booking events use native Android notifications only while the app is unfocused or the screen is off. While the app is focused, the service forwards notification candidates to the hosted POS without playing Android's notification ringtone; the hosted POS is responsible for showing the in-app toast and playing its sound together.
+
 Android's battery optimization can suspend network access after the screen has been locked. The hosted POS therefore checks `PowerManager.isIgnoringBatteryOptimizations()` and asks the user, through Android's system dialog, to allow unrestricted background execution. This exemption is required for reliable unattended forwarding; it is requested only from an explicit user action and can be revoked in Android's app battery settings.
 
 The plugin advertises this feature through the optional `backgroundExecutionPermissionSupported` field on the existing `getStatus()` response. This keeps staggered deployments safe: older hosted POS versions ignore the field, while newer hosted POS versions hide the permission and retain legacy startup when an older APK omits it.
