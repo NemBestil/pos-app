@@ -42,6 +42,8 @@ public class ForwarderServicePlugin extends Plugin {
     private static final String NOTIFICATIONS_ALIAS = "notifications";
     private static final String BACKGROUND_EXECUTION_PERMISSION_SUPPORTED =
         "backgroundExecutionPermissionSupported";
+    private static final String NOTIFICATION_SOUND_PLAYBACK_SUPPORTED =
+        "notificationSoundPlaybackSupported";
 
     // Forwarded to the WebView so it can drop its own copy of the (now dead)
     // token and re-mint after the next login.
@@ -136,6 +138,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("connected", ForwarderService.isConnected());
         ret.put("baseUrl", baseUrl);
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -151,6 +154,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("running", false);
         ret.put("connected", false);
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -166,6 +170,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("running", ForwarderService.isRunning());
         ret.put("connected", ForwarderService.isConnected());
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -175,6 +180,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("running", ForwarderService.isRunning());
         ret.put("connected", ForwarderService.isConnected());
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         String activeBaseUrl = ForwarderService.getActiveBaseUrl();
         if (activeBaseUrl != null) {
             ret.put("baseUrl", activeBaseUrl);
@@ -220,6 +226,51 @@ public class ForwarderServicePlugin extends Plugin {
             context.getApplicationContext(),
             enabled
         );
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void playNotificationSound(PluginCall call) {
+        Context context = getContext();
+        if (context == null) {
+            call.reject("No Android context");
+            return;
+        }
+        String soundId = call.getString("soundId");
+        Integer repeatCount = call.getInt("repeatCount");
+        String sourceUrl = call.getString("sourceUrl");
+        if (soundId == null || !soundId.matches("[a-z0-9-]+")) {
+            call.reject("Invalid notification sound ID");
+            return;
+        }
+        NotificationSoundManager.play(
+            context,
+            soundId,
+            repeatCount == null ? 1 : repeatCount,
+            sourceUrl,
+            new NotificationSoundManager.PlaybackCallback() {
+                @Override
+                public void onComplete() {
+                    call.resolve();
+                }
+
+                @Override
+                public void onError(Exception exception) {
+                    call.reject("Android could not play the notification sound.", exception);
+                }
+            }
+        );
+    }
+
+    @PluginMethod
+    public void stopNotificationSound(PluginCall call) {
+        NotificationSoundManager.stop();
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void cancelNotificationSoundRepeats(PluginCall call) {
+        NotificationSoundManager.cancelRepeats();
         call.resolve();
     }
 

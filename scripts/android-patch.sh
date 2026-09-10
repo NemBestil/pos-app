@@ -65,6 +65,7 @@ MAIN_ACTIVITY="$ANDROID_JAVA_DIR/MainActivity.java"
 cat > "$MAIN_ACTIVITY" <<EOF
 package com.nembestil.pos3.app;
 
+import android.media.AudioManager;
 import android.os.Bundle;
 
 import com.getcapacitor.BridgeActivity;
@@ -73,6 +74,7 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
 ${REG_LINES}        super.onCreate(savedInstanceState);
+        setVolumeControlStream(AudioManager.STREAM_NOTIFICATION);
         WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);
     }

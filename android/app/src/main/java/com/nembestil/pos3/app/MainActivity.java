@@ -1,5 +1,6 @@
 package com.nembestil.pos3.app;
 
+import android.media.AudioManager;
 import android.os.Bundle;
 
 import com.getcapacitor.BridgeActivity;
@@ -16,6 +17,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(SecondaryDisplayPlugin.class);
         registerPlugin(UsbPrinterPlugin.class);
         super.onCreate(savedInstanceState);
+        setVolumeControlStream(AudioManager.STREAM_NOTIFICATION);
         WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);
     }

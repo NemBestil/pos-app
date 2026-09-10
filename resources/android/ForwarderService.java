@@ -27,9 +27,7 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
-import android.net.Uri;
 import android.net.wifi.WifiManager;
-import android.media.RingtoneManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Handler;
@@ -111,9 +109,9 @@ public class ForwarderService extends Service {
     // It must outlive the ongoing service notification, so it can't share an id.
     private static final String ALERT_CHANNEL_ID = "nembestil_forwarder_alerts";
     private static final int ALERT_NOTIFICATION_ID = 0x4E43;
-    private static final String TAKEAWAY_CHANNEL_ID = "nembestil_takeaway_orders";
+    private static final String TAKEAWAY_CHANNEL_ID = "nembestil_takeaway_orders_native_sound_v1";
     private static final int TAKEAWAY_NOTIFICATION_ID_BASE = 0x540000;
-    private static final String TABLE_BOOKING_CHANNEL_ID = "nembestil_table_bookings";
+    private static final String TABLE_BOOKING_CHANNEL_ID = "nembestil_table_bookings_native_sound_v1";
     private static final int TABLE_BOOKING_NOTIFICATION_ID_BASE = 0x550000;
     public static final String EXTRA_OPEN_TAKEAWAY_ORDERS = "openTakeawayOrders";
     public static final String EXTRA_TAKEAWAY_ORDER_ID = "takeawayOrderId";
@@ -151,7 +149,7 @@ public class ForwarderService extends Service {
     private static final int BLUETOOTH_PRINT_TIMEOUT_MS = 8_000;
     private static final int TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS = 5 * 60_000;
 
-    private static final int ANDROID_SOCKET_PROTOCOL = 4;
+    private static final int ANDROID_SOCKET_PROTOCOL = 3;
     private static final long DEVICE_REFRESH_INTERVAL_MS = 15_000;
     private static final long IDLE_DEVICE_REFRESH_INTERVAL_MS = 2 * 60_000;
     private static final long TERMINAL_STALE_AFTER_MS = 2 * 60_000;
@@ -451,6 +449,7 @@ public class ForwarderService extends Service {
         }
         activeService.compareAndSet(this, null);
         activeBaseUrl.set(null);
+        NotificationSoundManager.stop();
         socketRegistered.set(false);
         notifyStatusChanged();
         socketGeneration.incrementAndGet();
@@ -930,6 +929,11 @@ public class ForwarderService extends Service {
     }
 
     private void applyConfigurationSnapshot(JSONObject payload) {
+        JSONObject notificationSounds = payload.optJSONObject("notificationSounds");
+        if (notificationSounds != null) {
+            NotificationSoundManager.configure(this, notificationSounds, baseUrl);
+        }
+
         List<LanPrinter> nextLanPrinters = new ArrayList<>();
         List<LocalPrinter> nextLocalPrinters = new ArrayList<>();
         List<ConfiguredTerminal> nextTerminals = new ArrayList<>();
@@ -1941,6 +1945,35 @@ public class ForwarderService extends Service {
                 order,
                 event.optString("notificationActionToken", "")
             );
+            NotificationSoundManager.playConfigured(
+                this,
+                isTakeawayPreOrder(order, event.optString("occurredAt", ""))
+                    ? "takeawayPreOrder"
+                    : "takeawayOrder"
+            );
+        }
+    }
+
+    private boolean isTakeawayPreOrder(JSONObject order, String occurredAtValue) {
+        long scheduledAt = parseIsoTimestamp(order.optString("scheduledAt", ""));
+        long occurredAt = parseIsoTimestamp(occurredAtValue);
+        if (scheduledAt <= 0 || occurredAt <= 0) {
+            return false;
+        }
+        long thresholdMs = NotificationSoundManager.getTakeawayPreOrderHours(this) * 60L * 60L * 1_000L;
+        return scheduledAt - occurredAt >= thresholdMs;
+    }
+
+    private long parseIsoTimestamp(String timestamp) {
+        if (timestamp.isEmpty()) {
+            return 0;
+        }
+        try {
+            SimpleDateFormat parser = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX", Locale.US);
+            Date parsed = parser.parse(timestamp);
+            return parsed == null ? 0 : parsed.getTime();
+        } catch (Exception exception) {
+            return 0;
         }
     }
 
@@ -1951,7 +1984,6 @@ public class ForwarderService extends Service {
             return;
         }
 
-        Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                 TAKEAWAY_CHANNEL_ID,
@@ -1960,7 +1992,7 @@ public class ForwarderService extends Service {
             );
             channel.setDescription("New takeaway orders received by NemBestil POS.");
             channel.enableVibration(true);
-            channel.setSound(sound, null);
+            channel.setSound(null, null);
             manager.createNotificationChannel(channel);
         }
 
@@ -1995,8 +2027,8 @@ public class ForwarderService extends Service {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setSound(sound)
-            .setDefaults(Notification.DEFAULT_ALL);
+            .setSound(null)
+            .setDefaults(Notification.DEFAULT_VIBRATE | Notification.DEFAULT_LIGHTS);
         if (contentIntent != null) {
             builder.setContentIntent(contentIntent);
         }
@@ -2159,6 +2191,7 @@ public class ForwarderService extends Service {
 
         if (showAndroidNotification) {
             showTableBookingNotification(booking);
+            NotificationSoundManager.playConfigured(this, "tableBooking");
         }
     }
 
@@ -2173,7 +2206,6 @@ public class ForwarderService extends Service {
             return;
         }
 
-        Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                 TABLE_BOOKING_CHANNEL_ID,
@@ -2182,7 +2214,7 @@ public class ForwarderService extends Service {
             );
             channel.setDescription("New table bookings awaiting confirmation in NemBestil POS.");
             channel.enableVibration(true);
-            channel.setSound(sound, null);
+            channel.setSound(null, null);
             manager.createNotificationChannel(channel);
         }
 
@@ -2212,8 +2244,8 @@ public class ForwarderService extends Service {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setSound(sound)
-            .setDefaults(Notification.DEFAULT_ALL);
+            .setSound(null)
+            .setDefaults(Notification.DEFAULT_VIBRATE | Notification.DEFAULT_LIGHTS);
         if (contentIntent != null) {
             builder.setContentIntent(contentIntent);
             builder.addAction(0, "Review booking", contentIntent);
