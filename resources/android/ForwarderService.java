@@ -30,6 +30,7 @@ import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.media.RingtoneManager;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -150,7 +151,7 @@ public class ForwarderService extends Service {
     private static final int BLUETOOTH_PRINT_TIMEOUT_MS = 8_000;
     private static final int TERMINAL_REQUEST_DEFAULT_TIMEOUT_MS = 5 * 60_000;
 
-    private static final int ANDROID_SOCKET_PROTOCOL = 3;
+    private static final int ANDROID_SOCKET_PROTOCOL = 4;
     private static final long DEVICE_REFRESH_INTERVAL_MS = 15_000;
     private static final long IDLE_DEVICE_REFRESH_INTERVAL_MS = 2 * 60_000;
     private static final long TERMINAL_STALE_AFTER_MS = 2 * 60_000;
@@ -225,6 +226,7 @@ public class ForwarderService extends Service {
     private volatile long socketConnectStartedElapsedAt = 0;
     private volatile long lastServerPingElapsedAt = 0;
     private volatile String lastAdvertisedDevices = "";
+    private volatile String lastAdvertisedSnapshot = "";
 
     private volatile String baseUrl;
     private volatile String authToken;
@@ -245,6 +247,7 @@ public class ForwarderService extends Service {
      *  immediately so the server can prefer screen-on tablets for dispatch. */
     private final AtomicBoolean screenOn = new AtomicBoolean(true);
     private BroadcastReceiver screenStateReceiver;
+    private BroadcastReceiver batteryStateReceiver;
     private BroadcastReceiver attachedDeviceReceiver;
 
     private final Object discoveryThreadLock = new Object();
@@ -362,6 +365,7 @@ public class ForwarderService extends Service {
             activeService.set(this);
             notifyStatusChanged();
             registerScreenStateReceiver();
+            registerBatteryStateReceiver();
             registerAttachedDeviceReceiver();
             startDiscoveryListener();
             startNetworkLocationTracking();
@@ -465,6 +469,7 @@ public class ForwarderService extends Service {
         pendingTerminalResults.clear();
         wakeDeviceMonitor();
         unregisterScreenStateReceiver();
+        unregisterBatteryStateReceiver();
         unregisterAttachedDeviceReceiver();
         stopDiscoveryListener();
         stopNetworkLocationTracking();
@@ -794,6 +799,7 @@ public class ForwarderService extends Service {
                 // Force one post-registration snapshot so changes discovered
                 // during the handshake cannot be lost behind the ready gate.
                 lastAdvertisedDevices = "";
+                lastAdvertisedSnapshot = "";
                 socketWorkExecutor.execute(this::flushPendingSocketResults);
                 if (!sendNetworkLocation()) {
                     refreshNetworkLocation(networkLocationNetwork);
@@ -1147,14 +1153,44 @@ public class ForwarderService extends Service {
 
         availableDeviceCount.set(devices.length());
         String serialized = devices.toString();
-        boolean changed = !serialized.equals(lastAdvertisedDevices);
         lastAdvertisedDevices = serialized;
+
+        JSONObject payload = new JSONObject();
+        payload.put("screenOn", screenOn.get());
+        payload.put("battery", readBatterySnapshot());
+        payload.put("devices", devices);
+        String serializedSnapshot = payload.toString();
+        boolean changed = !serializedSnapshot.equals(lastAdvertisedSnapshot);
+        lastAdvertisedSnapshot = serializedSnapshot;
         if ((changed || !socketRegistered.get()) && webSocket != null) {
-            JSONObject payload = new JSONObject();
-            payload.put("screenOn", screenOn.get());
-            payload.put("devices", devices);
             sendSocketMessage("devices.snapshot", payload);
         }
+    }
+
+    private JSONObject readBatterySnapshot() throws Exception {
+        Intent batteryIntent = getApplicationContext().registerReceiver(
+            null,
+            new IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        );
+        JSONObject battery = new JSONObject();
+        if (batteryIntent == null) {
+            battery.put("levelPercent", JSONObject.NULL);
+            battery.put("powerSource", "unknown");
+            return battery;
+        }
+
+        int level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+        if (level >= 0 && scale > 0) {
+            int levelPercent = Math.max(0, Math.min(100, Math.round(level * 100f / scale)));
+            battery.put("levelPercent", levelPercent);
+        } else {
+            battery.put("levelPercent", JSONObject.NULL);
+        }
+
+        int plugged = batteryIntent.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1);
+        battery.put("powerSource", plugged > 0 ? "external" : plugged == 0 ? "battery" : "unknown");
+        return battery;
     }
 
     private boolean probeConfiguredTerminal(ConfiguredTerminal terminal) {
@@ -2801,6 +2837,36 @@ public class ForwarderService extends Service {
     private void unregisterScreenStateReceiver() {
         BroadcastReceiver receiver = screenStateReceiver;
         screenStateReceiver = null;
+        if (receiver == null) {
+            return;
+        }
+        try {
+            getApplicationContext().unregisterReceiver(receiver);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void registerBatteryStateReceiver() {
+        batteryStateReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                wakeDeviceMonitor();
+            }
+        };
+        try {
+            getApplicationContext().registerReceiver(
+                batteryStateReceiver,
+                new IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            );
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to register battery state receiver", e);
+            batteryStateReceiver = null;
+        }
+    }
+
+    private void unregisterBatteryStateReceiver() {
+        BroadcastReceiver receiver = batteryStateReceiver;
+        batteryStateReceiver = null;
         if (receiver == null) {
             return;
         }

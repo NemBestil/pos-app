@@ -38,6 +38,8 @@ Incoming takeaway and table-booking events use native Android notifications only
 
 Android's battery optimization can suspend network access after the screen has been locked. The hosted POS therefore checks `PowerManager.isIgnoringBatteryOptimizations()` and asks the user, through Android's system dialog, to allow unrestricted background execution. This exemption is required for reliable unattended forwarding; it is requested only from an explicit user action and can be revoked in Android's app battery settings.
 
+Socket protocol 4 adds the tablet's battery percentage and power source to every `devices.snapshot`. Android battery broadcasts wake the device monitor, so changes between battery power and external power are reported immediately to the POS admin-tools overview.
+
 The plugin advertises this feature through the optional `backgroundExecutionPermissionSupported` field on the existing `getStatus()` response. This keeps staggered deployments safe: older hosted POS versions ignore the field, while newer hosted POS versions hide the permission and retain legacy startup when an older APK omits it.
 
 Do not add a permanent partial wake lock for the idle WebSocket. Android's network stack wakes the process when socket data arrives, while a long-held wake lock would create excessive battery usage. The service's `connectedDevice` type is not subject to Android 15's six-hour `dataSync` foreground-service limit and is still permitted from `BOOT_COMPLETED`.

@@ -10,8 +10,8 @@ android {
         applicationId "com.nembestil.pos3.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 101034
-        versionName "1.3.3"
+        versionCode 101035
+        versionName "1.3.4"
         buildConfigField "boolean", "APP_PRERELEASE", System.getenv("APP_PRERELEASE") ?: "false"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
