@@ -8,6 +8,7 @@ const config: CapacitorConfig = {
   appendUserAgent: `NemBestil/POS/${pkg.version}`,
   server: {
     allowNavigation: [
+      '*.nbpos.eu',
       '*.pos3.nemkasse.com',
       '*.nemkasse.com',
       'nbpos3.ngrok.dev',

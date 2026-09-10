@@ -218,15 +218,15 @@ async function verifyInstallation() {
   isFetchingInstallation.value = true
 
   const id = sanitizedInstallationId.value
-  const baseUrl = getInstallationBaseUrl(id)
+  const preferredBaseUrl = getPreferredInstallationBaseUrl(id)
 
   addSentryBreadcrumb('app.installation', 'Installation verification started', {
     installationId: id,
-    baseUrl
+    baseUrl: preferredBaseUrl
   })
 
   try {
-    const data = await fetchInstallationDetails(baseUrl)
+    const { baseUrl, details } = await resolveInstallation(id)
 
     candidateInstallation.value = {
       id,
@@ -234,8 +234,8 @@ async function verifyInstallation() {
       addedAt: new Date().toISOString(),
       lastUsedAt: null,
       isDefault: false,
-      organization: data.organization,
-      branding: data.branding
+      organization: details.organization,
+      branding: details.branding
     }
 
     screen.value = 'wizard-review'
@@ -246,7 +246,7 @@ async function verifyInstallation() {
   } catch (error) {
     addSentryBreadcrumb('app.installation', 'Installation verification failed', {
       installationId: id,
-      baseUrl,
+      baseUrl: preferredBaseUrl,
       error: getErrorMessage(error)
     }, 'warning')
     fetchError.value = 'That installation could not be verified. Check the ID and try again.'
@@ -331,9 +331,24 @@ async function openSelectedInstallation() {
   })
 
   try {
-    await fetchInstallationDetails(selectedInstallation.value.baseUrl)
+    const { baseUrl, details } = await resolveInstallation(selectedInstallation.value.id)
+
+    installations.value = installations.value.map((installation) => {
+      if (installation.id !== selectedInstallation.value?.id) {
+        return installation
+      }
+
+      return {
+        ...installation,
+        baseUrl,
+        organization: details.organization,
+        branding: details.branding
+      }
+    })
+
+    persistInstallations()
     markInstallationAsLastUsed(selectedInstallation.value.id)
-    openInstallation(selectedInstallation.value.baseUrl)
+    openInstallation(baseUrl)
   } catch (error) {
     addSentryBreadcrumb('app.launch', 'Selected installation launch failed', {
       installationId: selectedInstallation.value.id,
@@ -435,12 +450,46 @@ function openInstallation(url: string) {
   window.location.assign(url)
 }
 
-function getInstallationBaseUrl(id: string) {
+function getPreferredInstallationBaseUrl(id: string) {
+  if (id === 'NGROK') {
+    return 'https://nbpos3.ngrok.dev'
+  }
+
+  return `https://${id}.nbpos.eu`
+}
+
+function getLegacyInstallationBaseUrl(id: string) {
   if (id === 'NGROK') {
     return 'https://nbpos3.ngrok.dev'
   }
 
   return `https://${id}.pos3.nemkasse.com`
+}
+
+async function resolveInstallation(id: string) {
+  const baseUrls = [...new Set([
+    getPreferredInstallationBaseUrl(id),
+    getLegacyInstallationBaseUrl(id)
+  ])]
+  let lastError: unknown
+
+  for (const baseUrl of baseUrls) {
+    try {
+      return {
+        baseUrl,
+        details: await fetchInstallationDetails(baseUrl)
+      }
+    } catch (error) {
+      lastError = error
+      addSentryBreadcrumb('app.installation', 'Installation domain unavailable', {
+        installationId: id,
+        baseUrl,
+        error: getErrorMessage(error)
+      }, 'warning')
+    }
+  }
+
+  throw lastError
 }
 
 async function fetchInstallationDetails(baseUrl: string) {
@@ -457,17 +506,17 @@ async function fetchInstallationDetails(baseUrl: string) {
     status: response.status
   }, response.status >= 400 ? 'warning' : 'info')
 
-  if (response.status < 200 || response.status >= 300) {
+  if (response.status !== 200) {
     throw new Error('Installation lookup failed')
   }
 
   const data = normalizeInstallationResponse(response.data)
 
-  if (!data.organization || !data.branding) {
+  if (!isRecord(data.organization) || !isRecord(data.branding)) {
     throw new Error('Installation response is incomplete')
   }
 
-  return data
+  return data as unknown as InstallationResponse
 }
 
 async function synchronizeInstallationMetadata() {
@@ -475,18 +524,24 @@ async function synchronizeInstallationMetadata() {
   const results = await Promise.allSettled(
     savedInstallations.map(async (installation) => ({
       id: installation.id,
-      details: await fetchInstallationDetails(installation.baseUrl)
+      ...await resolveInstallation(installation.id)
     }))
   )
 
-  const metadataByInstallationId = new Map<string, InstallationResponse>()
+  const resolvedInstallations = new Map<string, {
+    baseUrl: string
+    details: InstallationResponse
+  }>()
   let failedCount = 0
 
   results.forEach((result, index) => {
-    const installation = savedInstallations[index]
+    const installation = savedInstallations[index]!
 
     if (result.status === 'fulfilled') {
-      metadataByInstallationId.set(result.value.id, result.value.details)
+      resolvedInstallations.set(result.value.id, {
+        baseUrl: result.value.baseUrl,
+        details: result.value.details
+      })
       return
     }
 
@@ -498,38 +553,45 @@ async function synchronizeInstallationMetadata() {
     }, 'warning')
   })
 
-  if (metadataByInstallationId.size === 0) {
+  if (resolvedInstallations.size === 0) {
     return
   }
 
   installations.value = installations.value.map((installation) => {
-    const metadata = metadataByInstallationId.get(installation.id)
+    const resolvedInstallation = resolvedInstallations.get(installation.id)
 
-    if (!metadata) {
+    if (!resolvedInstallation) {
       return installation
     }
 
     return {
       ...installation,
-      organization: metadata.organization,
-      branding: metadata.branding
+      baseUrl: resolvedInstallation.baseUrl,
+      organization: resolvedInstallation.details.organization,
+      branding: resolvedInstallation.details.branding
     }
   })
 
   persistInstallations()
   setSentryInstallationContext(selectedInstallation.value)
   addSentryBreadcrumb('app.installation', 'Installation metadata synchronized', {
-    synchronizedCount: metadataByInstallationId.size,
+    synchronizedCount: resolvedInstallations.size,
     failedCount
   })
 }
 
-function normalizeInstallationResponse(data: unknown): InstallationResponse {
-  if (typeof data === 'string') {
-    return JSON.parse(data) as InstallationResponse
+function normalizeInstallationResponse(data: unknown) {
+  const normalizedData = typeof data === 'string' ? JSON.parse(data) : data
+
+  if (!isRecord(normalizedData)) {
+    throw new Error('Installation response is not valid JSON')
   }
 
-  return data as InstallationResponse
+  return normalizedData
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function readInstallations() {
@@ -593,7 +655,7 @@ function normalizeSavedInstallations(savedInstallations: Partial<SavedInstallati
   return savedInstallations
     .map((installation) => ({
       id: installation.id ?? '',
-      baseUrl: installation.baseUrl ?? getInstallationBaseUrl(installation.id ?? ''),
+      baseUrl: installation.baseUrl ?? getPreferredInstallationBaseUrl(installation.id ?? ''),
       addedAt: installation.addedAt ?? new Date().toISOString(),
       lastUsedAt: installation.lastUsedAt ?? null,
       isDefault: hasStoredDefault ? installation.isDefault === true : installation.id === fallbackDefaultId,
