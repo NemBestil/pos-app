@@ -294,19 +294,17 @@ public class ForwarderServicePlugin extends Plugin {
 
     @PluginMethod
     public void setNotificationSoundVolume(PluginCall call) {
-        Integer volumePercent = call.getInt("volumePercent");
-        if (volumePercent == null || volumePercent < 0 || volumePercent > 100) {
-            call.reject("Notification sound volume must be between 0 and 100");
-            return;
-        }
-
         AudioManager audioManager = getNotificationAudioManager(call);
         if (audioManager == null) {
             return;
         }
 
         int maximumVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_NOTIFICATION);
-        int volumeIndex = Math.round(maximumVolume * volumePercent / 100f);
+        Integer volumeIndex = call.getInt("volumeIndex");
+        if (volumeIndex == null || volumeIndex < 0 || volumeIndex > maximumVolume) {
+            call.reject("Notification sound volume index is outside the supported range");
+            return;
+        }
         try {
             audioManager.setStreamVolume(AudioManager.STREAM_NOTIFICATION, volumeIndex, 0);
         } catch (SecurityException exception) {
@@ -344,6 +342,8 @@ public class ForwarderServicePlugin extends Plugin {
         int volumePercent = maximumVolume <= 0 ? 0 : Math.round(currentVolume * 100f / maximumVolume);
         JSObject ret = new JSObject();
         ret.put("volumePercent", volumePercent);
+        ret.put("volumeIndex", currentVolume);
+        ret.put("maximumVolumeIndex", maximumVolume);
         call.resolve(ret);
     }
 
