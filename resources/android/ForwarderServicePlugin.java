@@ -42,6 +42,8 @@ public class ForwarderServicePlugin extends Plugin {
     private static final String NOTIFICATIONS_ALIAS = "notifications";
     private static final String BACKGROUND_EXECUTION_PERMISSION_SUPPORTED =
         "backgroundExecutionPermissionSupported";
+    private static final String BACKGROUND_EXECUTION_SETTINGS_SUPPORTED =
+        "backgroundExecutionSettingsSupported";
     private static final String NOTIFICATION_SOUND_PLAYBACK_SUPPORTED =
         "notificationSoundPlaybackSupported";
 
@@ -138,6 +140,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("connected", ForwarderService.isConnected());
         ret.put("baseUrl", baseUrl);
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         call.resolve(ret);
     }
@@ -154,6 +157,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("running", false);
         ret.put("connected", false);
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         call.resolve(ret);
     }
@@ -170,6 +174,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("running", ForwarderService.isRunning());
         ret.put("connected", ForwarderService.isConnected());
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         call.resolve(ret);
     }
@@ -180,6 +185,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put("running", ForwarderService.isRunning());
         ret.put("connected", ForwarderService.isConnected());
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
+        ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
         String activeBaseUrl = ForwarderService.getActiveBaseUrl();
         if (activeBaseUrl != null) {
@@ -336,8 +342,31 @@ public class ForwarderServicePlugin extends Plugin {
         }
     }
 
+    @PluginMethod
+    public void openBackgroundExecutionSettings(PluginCall call) {
+        Context context = getContext();
+        if (context == null) {
+            call.reject("No Android context");
+            return;
+        }
+
+        Intent intent = new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+        try {
+            startActivityForResult(call, intent, "backgroundExecutionSettingsCallback");
+        } catch (RuntimeException exception) {
+            call.reject("Android could not open the battery optimization settings.", exception);
+        }
+    }
+
     @ActivityCallback
     private void backgroundExecutionPermissionCallback(PluginCall call, ActivityResult result) {
+        if (call != null) {
+            resolveBackgroundExecutionPermission(call);
+        }
+    }
+
+    @ActivityCallback
+    private void backgroundExecutionSettingsCallback(PluginCall call, ActivityResult result) {
         if (call != null) {
             resolveBackgroundExecutionPermission(call);
         }
