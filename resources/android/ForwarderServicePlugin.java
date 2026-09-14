@@ -3,6 +3,7 @@ package com.nembestil.pos3.app;
 import android.Manifest;
 import android.content.Context;
 import android.content.Intent;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.PowerManager;
@@ -46,6 +47,8 @@ public class ForwarderServicePlugin extends Plugin {
         "backgroundExecutionSettingsSupported";
     private static final String NOTIFICATION_SOUND_PLAYBACK_SUPPORTED =
         "notificationSoundPlaybackSupported";
+    private static final String NOTIFICATION_SOUND_VOLUME_SUPPORTED =
+        "notificationSoundVolumeSupported";
 
     // Forwarded to the WebView so it can drop its own copy of the (now dead)
     // token and re-mint after the next login.
@@ -142,6 +145,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_VOLUME_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -159,6 +163,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_VOLUME_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -176,6 +181,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_VOLUME_SUPPORTED, true);
         call.resolve(ret);
     }
 
@@ -187,6 +193,7 @@ public class ForwarderServicePlugin extends Plugin {
         ret.put(BACKGROUND_EXECUTION_PERMISSION_SUPPORTED, true);
         ret.put(BACKGROUND_EXECUTION_SETTINGS_SUPPORTED, true);
         ret.put(NOTIFICATION_SOUND_PLAYBACK_SUPPORTED, true);
+        ret.put(NOTIFICATION_SOUND_VOLUME_SUPPORTED, true);
         String activeBaseUrl = ForwarderService.getActiveBaseUrl();
         if (activeBaseUrl != null) {
             ret.put("baseUrl", activeBaseUrl);
@@ -278,6 +285,66 @@ public class ForwarderServicePlugin extends Plugin {
     public void cancelNotificationSoundRepeats(PluginCall call) {
         NotificationSoundManager.cancelRepeats();
         call.resolve();
+    }
+
+    @PluginMethod
+    public void getNotificationSoundVolume(PluginCall call) {
+        resolveNotificationSoundVolume(call);
+    }
+
+    @PluginMethod
+    public void setNotificationSoundVolume(PluginCall call) {
+        Integer volumePercent = call.getInt("volumePercent");
+        if (volumePercent == null || volumePercent < 0 || volumePercent > 100) {
+            call.reject("Notification sound volume must be between 0 and 100");
+            return;
+        }
+
+        AudioManager audioManager = getNotificationAudioManager(call);
+        if (audioManager == null) {
+            return;
+        }
+
+        int maximumVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_NOTIFICATION);
+        int volumeIndex = Math.round(maximumVolume * volumePercent / 100f);
+        try {
+            audioManager.setStreamVolume(AudioManager.STREAM_NOTIFICATION, volumeIndex, 0);
+        } catch (SecurityException exception) {
+            call.reject("Android did not allow the notification volume to be changed.", exception);
+            return;
+        }
+        resolveNotificationSoundVolume(call, audioManager);
+    }
+
+    private AudioManager getNotificationAudioManager(PluginCall call) {
+        Context context = getContext();
+        if (context == null) {
+            call.reject("No Android context");
+            return null;
+        }
+
+        AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        if (audioManager == null) {
+            call.reject("Android audio service is unavailable");
+            return null;
+        }
+        return audioManager;
+    }
+
+    private void resolveNotificationSoundVolume(PluginCall call) {
+        AudioManager audioManager = getNotificationAudioManager(call);
+        if (audioManager != null) {
+            resolveNotificationSoundVolume(call, audioManager);
+        }
+    }
+
+    private void resolveNotificationSoundVolume(PluginCall call, AudioManager audioManager) {
+        int maximumVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_NOTIFICATION);
+        int currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_NOTIFICATION);
+        int volumePercent = maximumVolume <= 0 ? 0 : Math.round(currentVolume * 100f / maximumVolume);
+        JSObject ret = new JSObject();
+        ret.put("volumePercent", volumePercent);
+        call.resolve(ret);
     }
 
     @PluginMethod

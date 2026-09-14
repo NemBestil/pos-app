@@ -172,6 +172,7 @@ permissions = [
     "android.permission.POST_NOTIFICATIONS",
     "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
     "android.permission.REQUEST_INSTALL_PACKAGES",
+    "android.permission.MODIFY_AUDIO_SETTINGS",
 ]
 anchor = '<uses-permission android:name="android.permission.INTERNET" />'
 usb_host_feature = '<uses-feature android:name="android.hardware.usb.host" android:required="false" />'

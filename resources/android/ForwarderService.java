@@ -1947,11 +1947,19 @@ public class ForwarderService extends Service {
             );
             NotificationSoundManager.playConfigured(
                 this,
-                isTakeawayPreOrder(order, event.optString("occurredAt", ""))
-                    ? "takeawayPreOrder"
-                    : "takeawayOrder"
+                getTakeawayNotificationSoundEventKey(order, event.optString("occurredAt", ""))
             );
         }
+    }
+
+    private String getTakeawayNotificationSoundEventKey(JSONObject order, String occurredAtValue) {
+        if (isTakeawayPreOrder(order, occurredAtValue)) {
+            return "takeawayPreOrder";
+        }
+        if ("delivery".equals(order.optString("deliveryPickupType", ""))) {
+            return "takeawayDeliveryOrder";
+        }
+        return "takeawayOrder";
     }
 
     private boolean isTakeawayPreOrder(JSONObject order, String occurredAtValue) {

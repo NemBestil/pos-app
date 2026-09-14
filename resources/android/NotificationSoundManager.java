@@ -39,7 +39,6 @@ public final class NotificationSoundManager {
     private static final String PREFS_CONFIGURATION = "configuration";
     private static final String PREFS_SOURCE_PREFIX = "source.";
     private static final String STANDARD_SOUND_ID = "standard";
-    private static final long REPEAT_DELAY_MS = 1_000;
     private static final int MAX_SOUND_BYTES = 10 * 1024 * 1024;
 
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
@@ -48,7 +47,6 @@ public final class NotificationSoundManager {
 
     private static PlaybackSession activeSession;
     private static MediaPlayer activePlayer;
-    private static Runnable pendingRepeat;
 
     private NotificationSoundManager() {}
 
@@ -57,7 +55,15 @@ public final class NotificationSoundManager {
         JSONObject configuration = new JSONObject();
         try {
             configuration.put("takeawayPreOrderHours", rawConfiguration.optInt("takeawayPreOrderHours", 12));
-            for (String eventKey : new String[] { "takeawayOrder", "takeawayPreOrder", "tableBooking" }) {
+            for (
+                String eventKey :
+                    new String[] {
+                        "takeawayOrder",
+                        "takeawayDeliveryOrder",
+                        "takeawayPreOrder",
+                        "tableBooking"
+                    }
+            ) {
                 JSONObject rawSelection = rawConfiguration.optJSONObject(eventKey);
                 if (rawSelection == null) {
                     continue;
@@ -87,6 +93,9 @@ public final class NotificationSoundManager {
         JSONObject selection = configuration.optJSONObject(eventKey);
         if (selection == null) {
             play(context, STANDARD_SOUND_ID, 2, null, null);
+            return;
+        }
+        if (!selection.optBoolean("enabled", true)) {
             return;
         }
         play(
@@ -138,11 +147,6 @@ public final class NotificationSoundManager {
                 return;
             }
             session.cancelRemaining = true;
-            if (pendingRepeat != null) {
-                MAIN_HANDLER.removeCallbacks(pendingRepeat);
-                pendingRepeat = null;
-                finishActivePlayback();
-            }
         });
     }
 
@@ -317,11 +321,7 @@ public final class NotificationSoundManager {
             finishActivePlayback();
             return;
         }
-        pendingRepeat = () -> {
-            pendingRepeat = null;
-            startCurrentPlay(context, session);
-        };
-        MAIN_HANDLER.postDelayed(pendingRepeat, REPEAT_DELAY_MS);
+        startCurrentPlay(context, session);
     }
 
     private static void fail(PlaybackSession session, Exception exception) {
@@ -331,7 +331,6 @@ public final class NotificationSoundManager {
         PlaybackCallback callback = session.callback;
         releasePlayer();
         activeSession = null;
-        pendingRepeat = null;
         if (callback != null) {
             callback.onError(exception);
         } else {
@@ -340,10 +339,6 @@ public final class NotificationSoundManager {
     }
 
     private static void finishActivePlayback() {
-        if (pendingRepeat != null) {
-            MAIN_HANDLER.removeCallbacks(pendingRepeat);
-            pendingRepeat = null;
-        }
         releasePlayer();
         PlaybackSession session = activeSession;
         activeSession = null;
