@@ -2,6 +2,7 @@
 import { CapacitorHttp } from '@capacitor/core'
 import * as Sentry from '@sentry/capacitor'
 import packageJson from '../package.json'
+import type { InstallationAppVersions } from './utils/app-version'
 
 type Screen = 'launcher' | 'wizard-input' | 'wizard-review' | 'manage'
 type WizardMode = 'launch' | 'manage'
@@ -23,7 +24,7 @@ interface InstallationBranding {
   brandColor: string
 }
 
-interface InstallationResponse {
+interface InstallationResponse extends InstallationAppVersions {
   organization: InstallationOrganization
   branding: InstallationBranding
 }
@@ -54,6 +55,7 @@ const isFetchingInstallation = ref(false)
 const isLaunchingInstallation = ref(false)
 const fetchError = ref('')
 const launcherError = ref('')
+const launcherNotice = ref('')
 const selectedInstallationId = ref('')
 const installations = ref<SavedInstallation[]>([])
 const candidateInstallation = ref<SavedInstallation | null>(null)
@@ -138,16 +140,27 @@ const showTopShellLogo = computed(() => screen.value !== 'launcher')
 
 const showLauncherBranding = computed(() => screen.value === 'launcher' && !!selectedInstallation.value)
 const {
-  availableRelease,
+  targetAppVersion,
+  minAppVersion,
+  isMandatoryUpdate,
+  updateError,
+  updateMessage,
+  startupError,
+  isStartupReady,
   isUpdatePromptOpen,
   isUpdateBusyOpen,
   updateBusyMessage,
-  initializeUpdateChecks,
+  initializeUpdatePermissions,
+  requestInstallationAccess,
   postponeUpdate,
   acceptUpdate
 } = useAppReleaseUpdate()
 
 onMounted(() => {
+  if (new URL(window.location.href).searchParams.get('reason') === 'app-version') {
+    launcherNotice.value = 'You were logged out because this installation requires a different app version. Install the required app update before continuing.'
+    window.history.replaceState(null, '', '/')
+  }
   installations.value = readInstallations()
 
   if (installations.value.length > 0) {
@@ -165,7 +178,7 @@ onMounted(() => {
     void synchronizeInstallationMetadata()
   }
 
-  void initializeUpdateChecks()
+  void initializeUpdatePermissions()
 
   addSentryBreadcrumb('app.lifecycle', 'Shell loaded', {
     screen: screen.value,
@@ -270,7 +283,7 @@ function goBackToInput() {
   screen.value = 'wizard-input'
 }
 
-function confirmInstallation() {
+async function confirmInstallation() {
   if (!candidateInstallation.value) {
     return
   }
@@ -314,12 +327,12 @@ function confirmInstallation() {
     return
   }
 
-  markInstallationAsLastUsed(nextInstallation.id)
-  openInstallation(nextInstallation.baseUrl)
+  screen.value = 'launcher'
+  await openSelectedInstallation()
 }
 
 async function openSelectedInstallation() {
-  if (!selectedInstallation.value) {
+  if (!selectedInstallation.value || isLaunchingInstallation.value || !isStartupReady.value) {
     return
   }
 
@@ -347,15 +360,14 @@ async function openSelectedInstallation() {
     })
 
     persistInstallations()
-    markInstallationAsLastUsed(selectedInstallation.value.id)
-    openInstallation(baseUrl)
+    await openInstallation(baseUrl, details)
   } catch (error) {
     addSentryBreadcrumb('app.launch', 'Selected installation launch failed', {
       installationId: selectedInstallation.value.id,
       baseUrl: selectedInstallation.value.baseUrl,
       error: getErrorMessage(error)
     }, 'warning')
-    launcherError.value = 'This installation is not responding right now. Try again in a moment.'
+    launcherError.value = getErrorMessage(error)
   } finally {
     isLaunchingInstallation.value = false
   }
@@ -442,7 +454,12 @@ function markInstallationAsLastUsed(id: string) {
   })
 }
 
-function openInstallation(url: string) {
+async function openInstallation(url: string, details: InstallationResponse) {
+  if (!(await requestInstallationAccess(details))) {
+    launcherError.value = `This app is not the correct version for this installation. Install app version ${targetAppVersion.value} to continue.`
+    return
+  }
+  markInstallationAsLastUsed(selectedInstallationId.value)
   addSentryBreadcrumb('app.launch', 'Handing off to POS webview', {
     url,
     installationId: selectedInstallationId.value || null
@@ -752,6 +769,16 @@ function getErrorMessage(error: unknown) {
 
       <main class="relative flex min-h-screen items-center justify-center px-4 py-10 sm:px-6">
         <div class="w-full max-w-5xl">
+          <UAlert
+            v-if="launcherNotice"
+            color="warning"
+            variant="soft"
+            icon="i-lucide-log-out"
+            title="App update required"
+            :description="launcherNotice"
+            class="mb-6"
+          />
+          <UAlert v-if="startupError" color="error" :title="startupError" class="mb-6" />
           <div v-if="showTopShellLogo" class="mb-10 flex flex-col items-center text-center">
             <img
               src="/logo-singleline.svg"
@@ -924,6 +951,7 @@ function getErrorMessage(error: unknown) {
                       <button
                         type="button"
                         class="inline-flex min-h-13 items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800"
+                        :disabled="!isStartupReady || isLaunchingInstallation"
                         @click="confirmInstallation"
                       >
                         {{ reviewConfirmLabel }}
@@ -954,6 +982,7 @@ function getErrorMessage(error: unknown) {
                     <div>
                       <USelect
                         v-model="launcherSelectionValue"
+                        :disabled="isLaunchingInstallation"
                         :items="installationOptions"
                         size="xl"
                         color="neutral"
@@ -992,7 +1021,7 @@ function getErrorMessage(error: unknown) {
                     <button
                       type="button"
                       class="inline-flex min-h-13 w-full items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
-                      :disabled="isLaunchingInstallation"
+                      :disabled="isLaunchingInstallation || !isStartupReady"
                       @click="openSelectedInstallation"
                     >
                       {{ isLaunchingInstallation ? 'Checking installation...' : 'Open POS' }}
@@ -1134,18 +1163,23 @@ function getErrorMessage(error: unknown) {
         body: 'px-6 pb-4',
         footer: 'px-6 pb-6 pt-0'
       }"
-      title="Update available"
-      :description="availableRelease ? `App version ${availableRelease.version} is ready to install.` : ''"
+      :title="isMandatoryUpdate ? 'App version required' : 'App update recommended'"
     >
       <template #body>
         <div class="space-y-3 text-sm leading-6 text-slate-600">
-          <p>
-            Install the latest APK now, or postpone and continue with the current version.
+          <p v-if="isMandatoryUpdate">
+            This app is not the correct version for this installation. Supported versions are {{ minAppVersion }}–{{ targetAppVersion }}.
+            Install version {{ targetAppVersion }} before you can open the POS.
           </p>
-          <p v-if="availableRelease" class="space-y-1 font-medium">
+          <p v-else>
+            We recommend installing app version {{ targetAppVersion }} for this installation. You can postpone and continue with your current version.
+          </p>
+          <p class="space-y-1 font-medium">
             <span class="block text-warning">Current version {{ appVersion }}.</span>
-            <span class="block text-primary">New version {{ availableRelease.version }}.</span>
+            <span class="block text-primary">Required target version {{ targetAppVersion }}.</span>
           </p>
+          <p v-if="updateError" role="alert" class="text-error">{{ updateError }}</p>
+          <p v-if="updateMessage" role="status">{{ updateMessage }}</p>
         </div>
       </template>
 
@@ -1156,14 +1190,14 @@ function getErrorMessage(error: unknown) {
             class="inline-flex min-h-12 items-center justify-center rounded-2xl border border-slate-200 px-5 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-50"
             @click="postponeUpdate"
           >
-            Postpone
+            {{ isMandatoryUpdate ? 'Cancel' : 'Postpone' }}
           </button>
           <button
             type="button"
             class="inline-flex min-h-12 items-center justify-center rounded-2xl bg-slate-950 px-5 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800"
             @click="acceptUpdate"
           >
-            Upgrade now
+            Install version {{ targetAppVersion }}
           </button>
         </div>
       </template>

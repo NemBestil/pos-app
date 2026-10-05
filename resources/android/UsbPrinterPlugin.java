@@ -23,7 +23,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
-/** Enumerates attached USB devices and obtains access to the one selected in the POS UI. */
+/** Enumerates USB devices and handles user grants and Android's remembered USB handler. */
 @CapacitorPlugin(name = "UsbPrinter")
 public class UsbPrinterPlugin extends Plugin {
 
@@ -74,6 +74,26 @@ public class UsbPrinterPlugin extends Plugin {
         } else {
             getContext().registerReceiver(permissionReceiver, filter);
         }
+    }
+
+    @Override
+    protected void handleOnNewIntent(Intent intent) {
+        if (!UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())) {
+            return;
+        }
+
+        UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+        UsbManager manager = resolveUsbManager();
+        if (device == null || manager == null || !manager.hasPermission(device)) {
+            return;
+        }
+
+        // Capacitor delivers both cold-start and singleTask attachment intents here.
+        // Android grants access before opening the user's default USB handler;
+        // the attachment broadcast can arrive before that grant, so refresh again.
+        Context context = getContext().getApplicationContext();
+        ForwarderService.requestStartIfConfigured(context);
+        ForwarderService.requestNotifyConfigChanged(context);
     }
 
     @Override

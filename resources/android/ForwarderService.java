@@ -1048,14 +1048,27 @@ public class ForwarderService extends Service {
     }
 
     private void runDeviceMonitor() {
+        long nextIdleConfigurationRequestElapsedAt =
+            SystemClock.elapsedRealtime() + IDLE_DEVICE_REFRESH_INTERVAL_MS;
         while (running.get()) {
             try {
                 refreshAndAdvertiseDevices();
             } catch (Throwable error) {
                 Log.w(TAG, "Device availability refresh failed", error);
             }
-            long waitMs = availableDeviceCount.get() == 0
-                ? IDLE_DEVICE_REFRESH_INTERVAL_MS
+            boolean idle = availableDeviceCount.get() == 0;
+            long now = SystemClock.elapsedRealtime();
+            if (!idle) {
+                nextIdleConfigurationRequestElapsedAt = now + IDLE_DEVICE_REFRESH_INTERVAL_MS;
+            } else if (now >= nextIdleConfigurationRequestElapsedAt) {
+                // Snapshots and hardware events wake this monitor immediately.
+                // Only elapsed time may trigger another idle configuration request.
+                sendSocketMessage("configuration.request", new JSONObject());
+                now = SystemClock.elapsedRealtime();
+                nextIdleConfigurationRequestElapsedAt = now + IDLE_DEVICE_REFRESH_INTERVAL_MS;
+            }
+            long waitMs = idle
+                ? nextIdleConfigurationRequestElapsedAt - now
                 : DEVICE_REFRESH_INTERVAL_MS;
             synchronized (deviceMonitorSignal) {
                 if (!running.get()) break;
@@ -1065,9 +1078,6 @@ public class ForwarderService extends Service {
                     Thread.currentThread().interrupt();
                     break;
                 }
-            }
-            if (running.get() && availableDeviceCount.get() == 0) {
-                sendSocketMessage("configuration.request", new JSONObject());
             }
         }
     }

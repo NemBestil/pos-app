@@ -2,6 +2,7 @@ package com.nembestil.pos3.app;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.provider.Settings;
@@ -24,39 +25,10 @@ import java.net.URL;
 @CapacitorPlugin(name = "ApkUpdater")
 public class ApkUpdaterPlugin extends Plugin {
 
-    @Override
-    public void load() {
-        AppReleaseUpdateReceiver.schedule(getContext());
-        handleUpdateIntent(getActivity().getIntent());
-    }
-
-    @Override
-    protected void handleOnNewIntent(Intent intent) {
-        handleUpdateIntent(intent);
-    }
-
     @PluginMethod
     public void getReleaseInfo(PluginCall call) {
         JSObject result = new JSObject();
         result.put("prerelease", BuildConfig.APP_PRERELEASE);
-        call.resolve(result);
-    }
-
-    @PluginMethod
-    public void schedulePeriodicChecks(PluginCall call) {
-        AppReleaseUpdateReceiver.schedule(getContext());
-        call.resolve();
-    }
-
-    @PluginMethod
-    public void getPendingUpdateAction(PluginCall call) {
-        JSObject action = consumeUpdateIntent(getActivity().getIntent());
-        JSObject result = new JSObject();
-
-        if (action != null) {
-            result.put("action", action);
-        }
-
         call.resolve(result);
     }
 
@@ -87,86 +59,20 @@ public class ApkUpdaterPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void openExternalUrl(PluginCall call) {
-        String url = call.getString("url");
-
-        if (url == null || url.trim().isEmpty()) {
-            call.reject("url is required");
-            return;
-        }
-
-        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-        intent.addCategory(Intent.CATEGORY_BROWSABLE);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        getContext().startActivity(intent);
-        call.resolve();
-    }
-
-    @PluginMethod
     public void installFromUrl(PluginCall call) {
         String url = call.getString("url");
         String fileName = call.getString("fileName");
+        String version = call.getString("version");
 
-        if (url == null || url.trim().isEmpty()) {
-            call.reject("url is required");
+        if (url == null || url.trim().isEmpty() || version == null || version.trim().isEmpty()) {
+            call.reject("url and version are required");
             return;
         }
 
-        new Thread(() -> downloadAndInstall(call, url, fileName)).start();
+        new Thread(() -> downloadAndInstall(call, url, fileName, version)).start();
     }
 
-    private void handleUpdateIntent(Intent intent) {
-        JSObject action = consumeUpdateIntent(intent);
-
-        if (action != null) {
-            notifyListeners("updateNotificationAction", action, true);
-        }
-    }
-
-    private JSObject consumeUpdateIntent(Intent intent) {
-        if (
-            intent == null
-                || !intent.getBooleanExtra(AppReleaseUpdateReceiver.EXTRA_OPEN_UPDATE, false)
-        ) {
-            return null;
-        }
-
-        String version = intent.getStringExtra(AppReleaseUpdateReceiver.EXTRA_VERSION);
-        String downloadUrl = intent.getStringExtra(AppReleaseUpdateReceiver.EXTRA_DOWNLOAD_URL);
-        String releaseUrl = intent.getStringExtra(AppReleaseUpdateReceiver.EXTRA_RELEASE_URL);
-        String fileName = intent.getStringExtra(AppReleaseUpdateReceiver.EXTRA_FILE_NAME);
-        boolean prerelease = intent.getBooleanExtra(
-            AppReleaseUpdateReceiver.EXTRA_PRERELEASE,
-            false
-        );
-        boolean accept = intent.getBooleanExtra(AppReleaseUpdateReceiver.EXTRA_ACCEPT_UPDATE, false);
-
-        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_OPEN_UPDATE);
-        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_VERSION);
-        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_DOWNLOAD_URL);
-        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_RELEASE_URL);
-        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_FILE_NAME);
-        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_PRERELEASE);
-        intent.removeExtra(AppReleaseUpdateReceiver.EXTRA_ACCEPT_UPDATE);
-
-        if (version == null || downloadUrl == null || releaseUrl == null || fileName == null) {
-            return null;
-        }
-
-        JSObject release = new JSObject();
-        release.put("version", version);
-        release.put("prerelease", prerelease);
-        release.put("downloadUrl", downloadUrl);
-        release.put("releaseUrl", releaseUrl);
-        release.put("fileName", fileName);
-
-        JSObject action = new JSObject();
-        action.put("release", release);
-        action.put("accept", accept);
-        return action;
-    }
-
-    private void downloadAndInstall(PluginCall call, String url, String fileName) {
+    private void downloadAndInstall(PluginCall call, String url, String fileName, String version) {
         HttpURLConnection connection = null;
 
         try {
@@ -202,6 +108,22 @@ public class ApkUpdaterPlugin extends Plugin {
                 }
             }
 
+            PackageInfo downloaded = getContext().getPackageManager().getPackageArchiveInfo(apkFile.getAbsolutePath(), 0);
+            PackageInfo installed = getContext().getPackageManager().getPackageInfo(getContext().getPackageName(), 0);
+            if (downloaded == null || !getContext().getPackageName().equals(downloaded.packageName)) {
+                throw new IllegalStateException("The downloaded APK is not the NemBestil POS app.");
+            }
+            if (!version.equals(downloaded.versionName)) {
+                throw new IllegalStateException("The downloaded APK does not match required app version " + version + ".");
+            }
+            long downloadedCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                ? downloaded.getLongVersionCode() : downloaded.versionCode;
+            long installedCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                ? installed.getLongVersionCode() : installed.versionCode;
+            if (downloadedCode < installedCode) {
+                throw new IllegalStateException("Android cannot install this older app version over the current version. Contact NemBestil to reinstall the required version.");
+            }
+
             Activity activity = getActivity();
             if (activity == null) {
                 throw new IllegalStateException("Activity unavailable");
@@ -216,7 +138,7 @@ public class ApkUpdaterPlugin extends Plugin {
                 }
             });
         } catch (Exception exception) {
-            call.reject("Could not download APK", exception);
+            call.reject(exception.getMessage(), exception);
         } finally {
             if (connection != null) {
                 connection.disconnect();

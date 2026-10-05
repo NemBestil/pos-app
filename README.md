@@ -32,7 +32,13 @@ npm run android:device
 
 ## Android background forwarding
 
+USB access supports Android's **Always use** choice so the system can restore printer access after a reconnect or reboot. Existing installations need the updated APK and one new approval with this option; see [USB setup and implementation](docs/usb-access.md).
+
+### Service lifecycle
+
 The native `ForwarderService` is a `connectedDevice` foreground service. It owns the persistent POS WebSocket and the direct printer/payment-terminal connections, and it displays an ongoing low-priority notification while enabled.
+
+The POS sends `configuration.snapshot` on socket registration and after configuration changes; explicit configuration/permission refreshes send `configuration.request`. When no hardware is available, `resources/android/ForwarderService.java` also requests configuration at most once every two minutes, using a monotonic deadline independent of device-monitor wakeups. Applying a snapshot or receiving a hardware/battery event wakes device discovery immediately but must not trigger another configuration request. Otherwise an unavailable printer (including one without USB permission) creates a request/snapshot feedback loop.
 
 Incoming takeaway and table-booking events use native Android notifications only while the app is unfocused or the screen is off. While the app is focused, the service forwards notification candidates to the hosted POS so it can show the in-app toast. Sound playback always stays native in this app version: the server includes the installation's active flag and event-specific sound choice for non-pre-order pickup, non-pre-order delivery, pre-orders, and table bookings in the existing configuration snapshot. Pre-orders take precedence over delivery when the service selects an event sound, and inactive selections keep the visual notification while skipping audio. Custom MP3s are downloaded into app-private storage using versioned asset URLs, and active events plus sound-editor previews play with Android's notification-audio usage. Repeated plays start immediately when the previous sound finishes; any desired spacing is part of the audio asset. While the app activity is open, the hardware volume buttons control Android's notification stream so they adjust the same channel used by these sounds. The hosted sound editor can also read and write that stream through the `notificationSoundVolumeSupported` bridge capability; the bridge returns the current and maximum discrete stream-volume indexes alongside the percentage so the slider can expose exactly the device's supported levels. Volume is not persisted as an installation setting. Notification channels themselves are silent to prevent double playback. The `notificationSoundPlaybackSupported` field on `ForwarderService.getStatus()` lets hosted POS versions retain browser playback with older APKs.
 
@@ -44,20 +50,17 @@ The plugin advertises this feature through the optional `backgroundExecutionPerm
 
 Do not add a permanent partial wake lock for the idle WebSocket. Android's network stack wakes the process when socket data arrives, while a long-held wake lock would create excessive battery usage. The service's `connectedDevice` type is not subject to Android 15's six-hour `dataSync` foreground-service limit and is still permitted from `BOOT_COMPLETED`.
 
-## Release APK
+## App versions and releases
 
-Pushing a tag named `apk-x.y.z` triggers `.github/workflows/release-apk.yml`. The workflow:
+The launcher requests Android installation permission at startup and checks the selected POS installation's minimum/target range before opening it. Required updates block opening; recommended updates can be postponed. Releases are read from and published to [NemBestil/pos-app-releases](https://github.com/NemBestil/pos-app-releases).
 
-- Validates that the tag version matches both `package.json` and `android/app/build.gradle`
-- Builds a signed Android release APK
-- Creates a GitHub Release and uploads the APK as a release asset
-
-Create the tag after running the version bump script and committing the result:
+Set the source repository's `APP_RELEASES_TOKEN` Actions secret with Contents write access to that release repository. Existing Android signing secrets stay in the source repository. Create annotated release tags with the existing release-details script:
 
 ```bash
 npm run version:bump patch
-git add package.json android/app/build.gradle
-git commit -m "Bump version to 1.0.1"
-git tag apk-1.0.1
-git push origin main --follow-tags
+# Commit the version and implementation changes before tagging.
+npm run tag:apk -- full
+# Or: npm run tag:apk -- pre
 ```
+
+Tags `apk-x.y.z` / `apk-x.y.z-pre` trigger `.github/workflows/release-apk.yml`, which validates the version/release metadata, builds a signed APK, and publishes it to the release repository. See [app version protocol, rollout, and validation](docs/app-versions.md).

@@ -25,6 +25,11 @@ Light app shell for the POS system, responsible for making the POS available on 
 - Platform Bridging: Use Capacitor for native features (printers, scanners, etc.).
 - Flow: Login Screen -> Webview/URL Load -> Capacitor Interop.
 - android/ is ephemeral: Place new Android source files in resources/, symlink it into android/... and apply changes to other android/-files using scripts/android-patch.sh.
+- USB access: Read `docs/usb-access.md` before changing USB permissions or reconnection. Keep the attachment filter in `resources/android/xml/usb_device_filter.xml` and its manifest registration in `scripts/android-patch.sh`; Android's remembered handler grants access per device, not through an app-wide runtime permission. Never infer USB access from stored consent or add automatic permission-prompt loops.
+
+## App versions and updates
+
+Read `docs/app-versions.md` for installation version requirements, startup install permission, launcher handoff, and release publishing. Updates must use the selected installation's exact target from `NemBestil/pos-app-releases`; no independent latest-release checker.
 
 ## Fetching & API
 

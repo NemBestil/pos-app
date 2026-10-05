@@ -1,460 +1,203 @@
-import {
-  Capacitor,
-  CapacitorHttp,
-  registerPlugin,
-  type PluginListenerHandle
-} from '@capacitor/core'
+import { Capacitor, CapacitorHttp, registerPlugin } from '@capacitor/core'
 import * as Sentry from '@sentry/capacitor'
 import packageJson from '../../package.json'
+import { isAppVersionInRange, resolveAppVersionRange, type InstallationAppVersions } from '../utils/app-version'
 
-interface GithubReleaseAsset {
-  name: string
-  browser_download_url: string
-}
-
-interface GithubReleaseResponse {
+interface GithubRelease {
   tag_name: string
-  html_url: string
   draft: boolean
   prerelease: boolean
-  assets: GithubReleaseAsset[]
-}
-
-interface AvailableRelease {
-  version: string
-  prerelease: boolean
-  downloadUrl: string
-  releaseUrl: string
-  fileName: string
-}
-
-interface UpdateNotificationAction {
-  release: AvailableRelease
-  accept: boolean
+  assets: { name: string; browser_download_url: string }[]
 }
 
 interface ApkUpdaterPlugin {
   getReleaseInfo(): Promise<{ prerelease: boolean }>
-  schedulePeriodicChecks(): Promise<void>
-  getPendingUpdateAction(): Promise<{ action?: UpdateNotificationAction }>
-  addListener(
-    eventName: 'updateNotificationAction',
-    listener: (action: UpdateNotificationAction) => void
-  ): Promise<PluginListenerHandle>
   canRequestPackageInstalls(): Promise<{ value: boolean }>
   openInstallPermissionSettings(): Promise<void>
-  openExternalUrl(options: { url: string }): Promise<void>
-  installFromUrl(options: { url: string, fileName?: string }): Promise<void>
+  installFromUrl(options: { url: string; fileName: string; version: string }): Promise<void>
 }
 
 const apkUpdater = registerPlugin<ApkUpdaterPlugin>('ApkUpdater')
-
-const currentVersion = packageJson.version
-const stableReleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app/releases/latest'
-const prereleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app/releases?per_page=100'
-let updateNotificationListener: PluginListenerHandle | null = null
-let initializationPromise: Promise<void> | null = null
-let hasHandledUpdateNotificationAction = false
+const releasesEndpoint = 'https://api.github.com/repos/NemBestil/pos-app-releases/releases'
 
 export function useAppReleaseUpdate() {
-  const availableRelease = useState<AvailableRelease | null>('app-release-update-available', () => null)
-  const isUpdatePromptOpen = useState('app-release-update-prompt-open', () => false)
-  const isUpdateBusyOpen = useState('app-release-update-busy-open', () => false)
-  const updateBusyMessage = useState('app-release-update-busy-message', () => 'Please wait')
-  const isCheckingForUpdate = useState('app-release-update-checking', () => false)
+  const isUpdatePromptOpen = ref(false)
+  const isUpdateBusyOpen = ref(false)
+  const updateBusyMessage = ref('Please wait')
+  const targetAppVersion = ref('')
+  const minAppVersion = ref('')
+  const isMandatoryUpdate = ref(false)
+  const updateError = ref('')
+  const updateMessage = ref('')
+  const startupError = ref('')
+  const isStartupReady = ref(false)
+  let startupPromise: Promise<void> | null = null
+  let resolveAccess: ((allowed: boolean) => void) | null = null
 
-  async function initializeUpdateChecks() {
-    if (!isAndroidNative()) {
-      return
+  function initializeUpdatePermissions() {
+    if (!startupPromise) {
+      startupPromise = (async () => {
+        try {
+          if (isAndroidNative()) await ensureInstallPermission()
+        } catch (error) {
+          startupError.value = getErrorMessage(error)
+        } finally {
+          isStartupReady.value = true
+        }
+      })()
     }
-
-    if (!initializationPromise) {
-      initializationPromise = initializeNativeUpdateChecks()
-    }
-
-    await initializationPromise
-
-    if (!hasHandledUpdateNotificationAction) {
-      await checkForUpdate()
-    }
+    return startupPromise
   }
 
-  async function initializeNativeUpdateChecks() {
-    updateNotificationListener = await apkUpdater.addListener(
-      'updateNotificationAction',
-      handleUpdateNotificationAction
-    )
+  async function requestInstallationAccess(versions: InstallationAppVersions): Promise<boolean> {
+    await initializeUpdatePermissions()
+    if (!isAndroidNative()) return true
 
-    await apkUpdater.schedulePeriodicChecks()
+    const range = resolveAppVersionRange(versions)
+    if (packageJson.version === range.targetAppVersion) return true
 
-    const pendingAction = await apkUpdater.getPendingUpdateAction()
-    if (pendingAction.action) {
-      handleUpdateNotificationAction(pendingAction.action)
-    }
-  }
-
-  function handleUpdateNotificationAction(action: UpdateNotificationAction) {
-    hasHandledUpdateNotificationAction = true
-    availableRelease.value = action.release
-
-    if (action.accept) {
-      void acceptUpdate()
-      return
-    }
-
+    minAppVersion.value = range.minAppVersion
+    targetAppVersion.value = range.targetAppVersion
+    isMandatoryUpdate.value = !isAppVersionInRange(packageJson.version, range)
+    updateError.value = ''
+    updateMessage.value = ''
     isUpdatePromptOpen.value = true
-  }
-
-  async function checkForUpdate() {
-    if (!isAndroidNative() || isCheckingForUpdate.value) {
-      return
-    }
-
-    const { prerelease } = await apkUpdater.getReleaseInfo()
-    isCheckingForUpdate.value = true
-    addUpdateBreadcrumb('Update check started', {
-      currentVersion,
-      channel: prerelease ? 'prerelease' : 'stable'
+    Sentry.addBreadcrumb({
+      category: 'app.update',
+      message: 'Installation app version checked',
+      data: { installedVersion: packageJson.version, ...range, mandatory: isMandatoryUpdate.value },
     })
 
-    try {
-      const response = await CapacitorHttp.get({
-        url: prerelease ? prereleaseEndpoint : stableReleaseEndpoint,
-        headers: {
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28'
-        }
-      })
-
-      if (response.status < 200 || response.status >= 300) {
-        addUpdateBreadcrumb('Update check returned non-success status', {
-          status: response.status
-        }, 'warning')
-        return
-      }
-
-      const releases = normalizeReleaseResponse(response.data)
-      const releaseCandidates = releases
-        .map((release) => extractAvailableRelease(release, prerelease))
-        .filter((release): release is AvailableRelease => release !== null)
-      const nextRelease = selectNextRelease(releaseCandidates, currentVersion, prerelease)
-
-      if (!nextRelease) {
-        addUpdateBreadcrumb('No newer app release found', {
-          currentVersion
-        })
-        return
-      }
-
-      availableRelease.value = nextRelease
-      isUpdatePromptOpen.value = true
-      addUpdateBreadcrumb('New app release found', {
-        releaseVersion: nextRelease.version,
-        releaseChannel: nextRelease.prerelease ? 'prerelease' : 'stable',
-        currentVersion
-      })
-    } catch (error) {
-      addUpdateBreadcrumb('Update check failed', {
-        error: getErrorMessage(error)
-      }, 'warning')
-      availableRelease.value = null
-      isUpdatePromptOpen.value = false
-    } finally {
-      isCheckingForUpdate.value = false
-    }
+    return new Promise<boolean>((resolve) => {
+      resolveAccess = resolve
+    })
   }
 
   function postponeUpdate() {
-    addUpdateBreadcrumb('Update postponed', {
-      releaseVersion: availableRelease.value?.version ?? null
-    })
+    const allowed = !isMandatoryUpdate.value
     isUpdatePromptOpen.value = false
+    resolveAccess?.(allowed)
+    resolveAccess = null
   }
 
   async function acceptUpdate() {
-    const release = availableRelease.value
-
-    if (!release) {
-      return
-    }
-
+    if (isUpdateBusyOpen.value) return
     isUpdatePromptOpen.value = false
     isUpdateBusyOpen.value = true
-    addUpdateBreadcrumb('Update accepted', {
-      releaseVersion: release.version
-    })
+    updateError.value = ''
+    updateMessage.value = ''
 
     try {
-      const hasInstallPermission = await ensureInstallPermission()
-
-      if (!hasInstallPermission) {
-        addUpdateBreadcrumb('Update install permission unavailable', {
-          releaseVersion: release.version
-        }, 'warning')
-        await openExternalReleaseLink(release.downloadUrl)
-        return
+      if (!(await ensureInstallPermission())) {
+        throw new Error('Allow this app to install updates in Android settings, then try again.')
       }
-
-      updateBusyMessage.value = 'Please wait'
-
+      updateBusyMessage.value = `Downloading app version ${targetAppVersion.value}…`
+      const release = await fetchTargetRelease(targetAppVersion.value)
       await apkUpdater.installFromUrl({
-        url: release.downloadUrl,
-        fileName: release.fileName
+        url: release.browser_download_url,
+        fileName: release.name,
+        version: targetAppVersion.value,
       })
-      addUpdateBreadcrumb('Update install started', {
-        releaseVersion: release.version,
-        fileName: release.fileName
-      })
+      updateMessage.value = 'Complete the installation in Android, then reopen the app.'
     } catch (error) {
-      addUpdateBreadcrumb('Update install failed, opening external link', {
-        releaseVersion: release.version,
-        error: getErrorMessage(error)
-      }, 'warning')
-      await openExternalReleaseLink(release.downloadUrl)
+      updateError.value = getErrorMessage(error)
+      Sentry.addBreadcrumb({
+        category: 'app.update',
+        message: 'App update failed',
+        level: 'warning',
+        data: { error: updateError.value },
+      })
     } finally {
       isUpdateBusyOpen.value = false
+      isUpdatePromptOpen.value = true
     }
   }
 
   async function ensureInstallPermission() {
-    if (!isAndroidNative()) {
-      return false
-    }
-
-    const permissionStatus = await apkUpdater.canRequestPackageInstalls()
-
-    if (permissionStatus.value) {
-      addUpdateBreadcrumb('Update install permission already granted')
-      return true
-    }
-
-    updateBusyMessage.value = 'Allow app installs for this app, then return here to continue.'
-    addUpdateBreadcrumb('Opening update install permission settings')
-
+    const permission = await apkUpdater.canRequestPackageInstalls()
+    if (permission.value) return true
+    updateBusyMessage.value = 'Allow app installs for NemBestil POS, then return to the app.'
+    // Attach the visibility listener before opening Android's settings.
+    const returned = waitForAppReturn()
     try {
       await apkUpdater.openInstallPermissionSettings()
-    } catch (error) {
-      addUpdateBreadcrumb('Could not open update install permission settings', {
-        error: getErrorMessage(error)
-      }, 'warning')
-      return false
+      await returned.promise
+    } finally {
+      returned.cancel()
     }
-
-    await waitForAppReturn()
-
-    const nextPermissionStatus = await apkUpdater.canRequestPackageInstalls()
-
-    addUpdateBreadcrumb('Update install permission rechecked', {
-      granted: nextPermissionStatus.value
-    })
-
-    return nextPermissionStatus.value
-  }
-
-  async function openExternalReleaseLink(url: string) {
-    if (isAndroidNative()) {
-      try {
-        await apkUpdater.openExternalUrl({ url })
-        addUpdateBreadcrumb('Opened update link externally', {
-          url
-        })
-        return
-      } catch (error) {
-        addUpdateBreadcrumb('Native external update link failed', {
-          error: getErrorMessage(error)
-        }, 'warning')
-        window.open(url, '_blank', 'noopener,noreferrer')
-        return
-      }
-    }
-
-    addUpdateBreadcrumb('Opened update link in browser', {
-      url
-    })
-    window.open(url, '_blank', 'noopener,noreferrer')
+    return (await apkUpdater.canRequestPackageInstalls()).value
   }
 
   return {
-    availableRelease,
     isUpdatePromptOpen,
     isUpdateBusyOpen,
     updateBusyMessage,
-    initializeUpdateChecks,
-    checkForUpdate,
+    targetAppVersion,
+    minAppVersion,
+    isMandatoryUpdate,
+    updateError,
+    updateMessage,
+    startupError,
+    isStartupReady,
+    initializeUpdatePermissions,
+    requestInstallationAccess,
     postponeUpdate,
-    acceptUpdate
+    acceptUpdate,
   }
+}
+
+async function fetchTargetRelease(version: string) {
+  const stableTag = `apk-${version}`
+  const fetchTag = (tag: string) =>
+    CapacitorHttp.get({
+      url: `${releasesEndpoint}/tags/${tag}`,
+      headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+    })
+  const [{ prerelease }, stableResponse] = await Promise.all([apkUpdater.getReleaseInfo(), fetchTag(stableTag)])
+  const response = stableResponse.status === 404 && prerelease ? await fetchTag(`${stableTag}-pre`) : stableResponse
+  if (response.status === 404) {
+    throw new Error(`App version ${version} is not available for download. Contact NemBestil or try again later.`)
+  }
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Could not fetch app release (HTTP ${response.status}). Try again.`)
+  }
+  const release = (typeof response.data === 'string' ? JSON.parse(response.data) : response.data) as GithubRelease
+  const isTargetRelease =
+    (release.tag_name === stableTag && !release.prerelease) ||
+    (prerelease && release.tag_name === `${stableTag}-pre` && release.prerelease)
+  const asset = release.assets.find((candidate) => candidate.browser_download_url.toLowerCase().endsWith('.apk'))
+  if (release.draft || !isTargetRelease || !asset) {
+    throw new Error(`App version ${version} has no valid APK release. Contact NemBestil or try again later.`)
+  }
+  return asset
 }
 
 function isAndroidNative() {
   return Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android'
 }
 
-function normalizeReleaseResponse(data: unknown) {
-  const normalized = typeof data === 'string' ? JSON.parse(data) : data
-
-  if (Array.isArray(normalized)) {
-    return normalized as GithubReleaseResponse[]
-  }
-
-  return [normalized as GithubReleaseResponse]
-}
-
-function extractAvailableRelease(release: GithubReleaseResponse, includePrereleases: boolean) {
-  if (!release || release.draft || (!includePrereleases && release.prerelease)) {
-    return null
-  }
-
-  const version = extractVersionFromTag(release.tag_name, release.prerelease)
-  const apkAsset = release.assets.find((asset) => asset.browser_download_url?.toLowerCase().endsWith('.apk'))
-
-  if (!version || !apkAsset) {
-    return null
-  }
-
-  return {
-    version,
-    prerelease: release.prerelease,
-    downloadUrl: apkAsset.browser_download_url,
-    releaseUrl: release.html_url,
-    fileName: apkAsset.name
-  } satisfies AvailableRelease
-}
-
-function extractVersionFromTag(tagName: string, prerelease: boolean) {
-  const match = tagName.match(/^apk-(\d+\.\d+\.\d+)(-pre)?$/)
-
-  if (!match || Boolean(match[2]) !== prerelease) {
-    return null
-  }
-
-  return match[1]
-}
-
-function selectNextRelease(
-  releases: AvailableRelease[],
-  installedVersion: string,
-  installedPrerelease: boolean
-) {
-  const newerReleases = releases.filter((release) => {
-    const versionComparison = compareVersions(release.version, installedVersion)
-    return versionComparison > 0
-      || (versionComparison === 0 && installedPrerelease && !release.prerelease)
-  })
-
-  if (installedPrerelease) {
-    const stableRelease = findLatestRelease(newerReleases.filter((release) => !release.prerelease))
-    if (stableRelease) {
-      return stableRelease
-    }
-  }
-
-  return findLatestRelease(newerReleases)
-}
-
-function findLatestRelease(releases: AvailableRelease[]) {
-  return releases.reduce<AvailableRelease | null>((latestRelease, release) => {
-    if (!latestRelease) {
-      return release
-    }
-
-    const versionComparison = compareVersions(release.version, latestRelease.version)
-    if (versionComparison !== 0) {
-      return versionComparison > 0 ? release : latestRelease
-    }
-
-    return latestRelease.prerelease && !release.prerelease ? release : latestRelease
-  }, null)
-}
-
-function compareVersions(left: string, right: string) {
-  const leftParts = left.split('.').map((part) => Number.parseInt(part, 10))
-  const rightParts = right.split('.').map((part) => Number.parseInt(part, 10))
-
-  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
-    const leftValue = leftParts[index] ?? 0
-    const rightValue = rightParts[index] ?? 0
-
-    if (leftValue > rightValue) {
-      return 1
-    }
-
-    if (leftValue < rightValue) {
-      return -1
-    }
-  }
-
-  return 0
-}
-
-function waitForAppReturn(timeoutMs = 120000) {
-  return new Promise<boolean>((resolve) => {
+function waitForAppReturn() {
+  let finish!: () => void
+  const promise = new Promise<void>((resolve) => {
     let wasHidden = document.visibilityState === 'hidden'
-
-    const finish = (value: boolean) => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange)
-      window.removeEventListener('focus', handleFocus)
+    finish = () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('focus', onFocus)
       window.clearTimeout(timeoutId)
-      resolve(value)
+      resolve()
     }
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
-        wasHidden = true
-        return
-      }
-
-      if (wasHidden && document.visibilityState === 'visible') {
-        finish(true)
-      }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') wasHidden = true
+      else if (wasHidden) finish()
     }
-
-    const handleFocus = () => {
-      if (wasHidden && document.visibilityState === 'visible') {
-        finish(true)
-      }
+    const onFocus = () => {
+      if (wasHidden) finish()
     }
-
-    const timeoutId = window.setTimeout(() => finish(false), timeoutMs)
-
-    document.addEventListener('visibilitychange', handleVisibilityChange)
-    window.addEventListener('focus', handleFocus)
+    const timeoutId = window.setTimeout(finish, 120_000)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('focus', onFocus)
   })
-}
-
-function addUpdateBreadcrumb(
-  message: string,
-  data?: Record<string, unknown>,
-  level: Sentry.SeverityLevel = 'info'
-) {
-  Sentry.addBreadcrumb({
-    category: 'app.update',
-    message,
-    level,
-    data: data ? scrubSentryData(data) : undefined
-  })
-}
-
-function scrubSentryData(data: Record<string, unknown>) {
-  return Object.fromEntries(
-    Object.entries(data).map(([key, value]) => {
-      if (key === 'url' && typeof value === 'string') {
-        return [key, stripUrlDetails(value)]
-      }
-
-      return [key, value]
-    })
-  )
-}
-
-function stripUrlDetails(url: string) {
-  try {
-    const parsedUrl = new URL(url)
-
-    return `${parsedUrl.origin}${parsedUrl.pathname}`
-  } catch {
-    return url
-  }
+  return { promise, cancel: finish }
 }
 
 function getErrorMessage(error: unknown) {

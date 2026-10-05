@@ -152,6 +152,7 @@ fi
 # multi-line XML insertions are brittle in BSD sed.
 if [ -f "$ANDROID_MANIFEST" ]; then
     python3 - "$ANDROID_MANIFEST" <<'PY'
+import re
 import sys, pathlib
 
 path = pathlib.Path(sys.argv[1])
@@ -164,6 +165,21 @@ if soft_input_mode not in text:
     text = text.replace(activity_name, activity_name + soft_input_mode, 1)
     changed = True
     print("🩹 Enabled adjustResize for MainActivity in AndroidManifest.xml")
+
+# Matching USB attachment metadata lets Android offer "Always use" in both
+# attachment and requestPermission dialogs, then restore access on reattachment.
+usb_action = "android.hardware.usb.action.USB_DEVICE_ATTACHED"
+if usb_action not in text:
+    usb_handler_xml = (
+        '            <intent-filter>\n'
+        f'                <action android:name="{usb_action}" />\n'
+        '            </intent-filter>\n'
+        f'            <meta-data android:name="{usb_action}"\n'
+        '                android:resource="@xml/usb_device_filter" />\n'
+    )
+    text = text.replace('        </activity>', usb_handler_xml + '        </activity>', 1)
+    changed = True
+    print("🩹 Registered MainActivity as an Android USB attachment handler")
 
 permissions = [
     "android.permission.FOREGROUND_SERVICE",
@@ -257,19 +273,15 @@ if "TakeawayNotificationActionReceiver" not in text and "</application>" in text
     changed = True
     print("🩹 Registered TakeawayNotificationActionReceiver in AndroidManifest.xml")
 
-app_release_update_receiver_xml = (
-    '        <receiver\n'
-    '            android:name=".AppReleaseUpdateReceiver"\n'
-    '            android:exported="false" />\n'
+# Updates are checked against the selected installation in the launcher.
+text, removed_update_receivers = re.subn(
+    r'\s*<receiver\s+android:name="\.AppReleaseUpdateReceiver"\s+android:exported="false"\s*/>',
+    "",
+    text,
 )
-if "AppReleaseUpdateReceiver" not in text and "    </application>" in text:
-    text = text.replace(
-        "    </application>",
-        app_release_update_receiver_xml + "    </application>",
-        1,
-    )
+if removed_update_receivers:
     changed = True
-    print("🩹 Registered AppReleaseUpdateReceiver in AndroidManifest.xml")
+    print("🩹 Removed installation-independent app update receiver")
 
 if changed:
     path.write_text(text)

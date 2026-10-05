@@ -6,7 +6,7 @@ on:
       - 'apk-*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-apk-${{ github.ref }}
@@ -17,6 +17,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Validate release repository token
+        env:
+          APP_RELEASES_TOKEN: ${{ secrets.APP_RELEASES_TOKEN }}
+        run: test -n "$APP_RELEASES_TOKEN" || { echo "Missing APP_RELEASES_TOKEN for NemBestil/pos-app-releases"; exit 1; }
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -193,6 +198,9 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          repository: NemBestil/pos-app-releases
+          token: ${{ secrets.APP_RELEASES_TOKEN }}
+          target_commitish: main
           tag_name: ${{ github.ref_name }}
           name: ${{ steps.release_details.outputs.release_title }}
           prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}

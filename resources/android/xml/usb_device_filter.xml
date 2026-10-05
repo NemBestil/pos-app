@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- USB printer ports can use vendor-specific interfaces instead of class 7.
+         Match all devices so Android can remember the user's chosen handler.
+         Access is still granted per device; forwarding uses configured printers only. -->
+    <usb-device />
+</resources>
