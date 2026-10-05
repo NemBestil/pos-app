@@ -14,4 +14,8 @@ The first version with this protocol is `1.4.0`. Existing APKs retain their embe
 
 The release workflow in the source repository publishes to `NemBestil/pos-app-releases`, using its `main` branch for release tags. Set `APP_RELEASES_TOKEN` as an Actions secret in the source repository with Contents write access to the release repository. Keep existing Android signing secrets there and preserve the signing certificate and application ID. Use `npm run tag:apk -- full` or `npm run tag:apk -- pre` to create the annotated tag with release metadata; unsigned/lightweight manual tags do not satisfy CI.
 
+CI SDK setup uses `android-actions/setup-android@v4` with the explicit packages `platform-tools`, `platforms;android-36`, and `build-tools;36.0.0`. The action installs command-line tools and accepts SDK licenses itself. Do not request the removed legacy `tools` package or duplicate license acceptance in a shell pipeline; v3's default package list can fail before the APK build starts.
+
+Workflow fixes must be committed into the release tag's source commit. Re-running an existing GitHub Actions run uses its original commit/ref and does not pick up a newer workflow from the default branch.
+
 Validation: generate the Nuxt shell, sync Capacitor, run `scripts/android-patch.sh`, and compile Android Java with JDK 21. On a physical Android device, verify first-start install permission, legacy/malformed ranges, minimum/target/too-new versions, optional Postpone, mandatory Cancel, installer cancellation, missing APK/network failure, and hosted-POS return-to-launcher messaging.
