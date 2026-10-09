@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
-import java.net.SocketTimeoutException;
 import java.util.List;
 
 /** Owns paper boundaries for all direct printers. No transport may start the
@@ -13,7 +12,7 @@ final class PrinterJobWriter {
     private static final int CHUNK_BYTES = 2_048;
     private static final long BLUETOOTH_CHUNK_PAUSE_MS = 20;
     private static final long CUT_RECOVERY_PAUSE_MS = 1_000;
-    private static final long STATUS_TIMEOUT_MS = 30_000;
+    private static final long DOCUMENT_RECOVERY_TIMEOUT_MS = 15_000;
     private static final long STATUS_POLL_MS = 10;
 
     static final class Document {
@@ -54,16 +53,10 @@ final class PrinterJobWriter {
     void writeTo(OutputStream output, boolean bluetooth, InputStream printerStatus) throws IOException {
         boolean awaitCompletion = "esc-pos".equals(language)
             && documents.stream().anyMatch(document -> document.cut != null);
-        if (awaitCompletion) {
-            if (printerStatus == null) throw new IOException("The ESC/POS printer has no readable status channel.");
-            // Verify bidirectional status before printing any paper. Disable
-            // unsolicited ASB so it cannot be mistaken for our queued reply.
-            while (printerStatus.available() > 0) {
-                checkInterrupted();
-                if (printerStatus.read() < 0) throw new IOException("The printer disconnected.");
-            }
+        if (awaitCompletion && printerStatus != null) {
+            // Disable unsolicited ASB; status support is optional and must not
+            // prevent a printer from receiving its document.
             output.write(new byte[] {0x1d, 0x61, 0x00});
-            awaitPrinted(output, printerStatus);
         }
         for (Document document : documents) {
             for (int offset = 0; offset < document.bytes.length; offset += CHUNK_BYTES) {
@@ -80,7 +73,11 @@ final class PrinterJobWriter {
             // Bluetooth flush only hands bytes to Android. GS r is queued by
             // the printer after the preceding print data; DLE EOT is real-time
             // and cannot establish this boundary.
-            if (awaitCompletion) awaitPrinted(output, printerStatus);
+            // Body and cutter status share one deadline, reserving the final
+            // second for cutter recovery. No reply may block later jobs forever.
+            long statusDeadline = System.nanoTime()
+                + (DOCUMENT_RECOVERY_TIMEOUT_MS - CUT_RECOVERY_PAUSE_MS) * 1_000_000;
+            boolean bodyAcknowledged = awaitCompletion && awaitPrinted(output, printerStatus, statusDeadline);
             checkInterrupted();
             // Send the cutter separately, on the same connection, after every
             // body byte. Reset line spacing after column graphics; never reset
@@ -94,26 +91,39 @@ final class PrinterJobWriter {
                 output.write(new byte[] {0x1b, 0x64, (byte) mode});
             }
             output.flush();
-            if (awaitCompletion) awaitPrinted(output, printerStatus);
+            boolean cutAcknowledged = bodyAcknowledged && awaitPrinted(output, printerStatus, statusDeadline);
+            // A late reply after a timeout cannot acknowledge a later document
+            // on this connection. Use timed recovery for the remaining pages.
+            if (awaitCompletion && !cutAcknowledged) printerStatus = null;
             // Keep the connection and printer turn until this pause finishes,
             // including between multiple pages/copies in a single server job.
             pause(CUT_RECOVERY_PAUSE_MS);
         }
     }
 
-    private static void awaitPrinted(OutputStream output, InputStream input) throws IOException {
-        output.write(new byte[] {0x1d, 0x72, 0x01}); // Queued paper status: GS r 1.
-        output.flush();
-        long deadline = System.nanoTime() + STATUS_TIMEOUT_MS * 1_000_000;
+    private static boolean awaitPrinted(OutputStream output, InputStream input, long deadline) throws IOException {
+        if (input != null && System.nanoTime() < deadline) {
+            output.write(new byte[] {0x1d, 0x72, 0x01}); // Queued paper status: GS r 1.
+            output.flush();
+        }
         int automaticStatusBytes = 0;
         while (System.nanoTime() < deadline) {
             checkInterrupted();
-            if (input.available() == 0) {
-                pause(STATUS_POLL_MS);
+            int status = -1;
+            if (input != null) {
+                try {
+                    if (input.available() > 0) status = input.read();
+                } catch (IOException ignored) {
+                    // Missing/broken status is advisory. Actual output writes
+                    // still propagate errors through the transport handler.
+                    input = null;
+                }
+            }
+            if (status < 0) {
+                long remainingMs = (deadline - System.nanoTime()) / 1_000_000;
+                if (remainingMs > 0) pause(Math.min(STATUS_POLL_MS, remainingMs));
                 continue;
             }
-            int status = input.read();
-            if (status < 0) throw new IOException("The printer disconnected before acknowledging the print.");
             if (automaticStatusBytes > 0) {
                 automaticStatusBytes--;
                 continue;
@@ -124,11 +134,9 @@ final class PrinterJobWriter {
             }
             if ((status & 0x90) != 0) continue; // Real-time/power-on replies are not completion.
             if ((status & 0x0c) != 0) throw new IOException("The printer is out of paper.");
-            return;
+            return true;
         }
-        // Never report success or send the next document after an unconfirmed
-        // body. A guessed delay would recreate the overlapping-job problem.
-        throw new SocketTimeoutException("The printer did not acknowledge print completion within 30 seconds.");
+        return false;
     }
 
     private static void checkInterrupted() throws InterruptedIOException {

@@ -6,7 +6,7 @@ In Android's USB permission/open-app dialog, select **Always use** for NemBestil
 
 When upgrading from a one-time grant, reconnect or power-cycle the printer after installing the new APK, then approve once with **Always use**. Merely approving without that option remains temporary. There is no public Android permission for permanent access to every USB device; resetting app defaults, changing devices, or manufacturer firmware behavior can require another approval. Verify on the customer's Android POS: approve with **Always use**, power-cycle the printer, reboot with it connected, and repeat with the app closed and running. Also verify denial and two printers of the same model; printer identity matching must stay unambiguous.
 
-Receipt delivery in app 1.4.2 reads queued ESC/POS completion status through bulk IN on the same claimed interface as bulk OUT. USB ESC/POS printers need both endpoints; missing bulk IN fails before paper data is sent. This does not alter permission or reconnect handling. See [receipt completion and cutter ownership](receipt-printing.md).
+Receipt delivery in app 1.4.2 reads queued ESC/POS completion status through bulk IN on the same claimed interface as bulk OUT. From app 1.4.3, missing bulk IN still prints and uses bounded timed recovery instead of failing; queued status is advisory. This does not alter permission or reconnect handling. See [receipt completion and cutter ownership](receipt-printing.md).
 
 ## Platform reference
 
