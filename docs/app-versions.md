@@ -19,3 +19,5 @@ CI SDK setup uses `android-actions/setup-android@v4` with the explicit packages 
 Workflow fixes must be committed into the release tag's source commit. Re-running an existing GitHub Actions run uses its original commit/ref and does not pick up a newer workflow from the default branch.
 
 Validation: generate the Nuxt shell, sync Capacitor, run `scripts/android-patch.sh`, and compile Android Java with JDK 21. On a physical Android device, verify first-start install permission, legacy/malformed ranges, minimum/target/too-new versions, optional Postpone, mandatory Cancel, installer cancellation, missing APK/network failure, and hosted-POS return-to-launcher messaging.
+
+App `1.4.1` introduces receipt-delivery socket protocol `4`: document frames replace the old root raw payload and the APK owns native feed/CUT and its 500 ms pause. The APK accepts the framed contract; the hosted POS also accepts older protocol 3 APKs and selects raw payloads with CUT commands for those receivers. Publish `apk-1.4.1` before the hosted installation requires it. See [receipt printing](receipt-printing.md).

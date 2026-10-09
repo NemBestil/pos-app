@@ -34,6 +34,8 @@ npm run android:device
 
 USB access supports Android's **Always use** choice so the system can restore printer access after a reconnect or reboot. Existing installations need the updated APK and one new approval with this option; see [USB setup and implementation](docs/usb-access.md).
 
+Direct receipts use app-owned feed/CUT and a 500 ms pause between documents/jobs; see [receipt printing and native transfer ownership](docs/receipt-printing.md). This requires app 1.4.1 and the matching POS socket protocol 4.
+
 ### Service lifecycle
 
 The native `ForwarderService` is a `connectedDevice` foreground service. It owns the persistent POS WebSocket and the direct printer/payment-terminal connections, and it displays an ongoing low-priority notification while enabled.
@@ -44,7 +46,7 @@ Incoming takeaway and table-booking events use native Android notifications only
 
 Android's battery optimization can suspend network access after the screen has been locked on some devices. Forwarding normally runs with battery optimization enabled. If printers or payment terminals actually lose connectivity after the operator leaves the app or locks the screen, the hosted POS offers optional extended background operation and asks the user, through Android's system dialog, to exempt the app. The exemption prevents normal low-power operation and can materially increase battery use. Android does not let the app revoke its own exemption, so switching extended background operation off opens the system battery-optimization list and the hosted POS rechecks `PowerManager.isIgnoringBatteryOptimizations()` when the user returns. The `backgroundExecutionSettingsSupported` status capability tells the hosted POS that this navigation method exists; with an older APK, an active exemption is shown without a switch and with an update instruction.
 
-The existing socket protocol 3 `devices.snapshot` may include the tablet's battery percentage and power source. The server keeps this object optional so older app versions remain compatible. Android battery broadcasts wake the device monitor, so newer apps report changes between battery power and external power immediately to the POS admin-tools overview.
+The socket protocol 4 `devices.snapshot` may include the tablet's battery percentage and power source. Battery metadata remains optional; native-cut printing uses this protocol 4 APK, while the hosted server sends server-encoded CUT payloads to older protocol 3 receivers. Android battery broadcasts wake the device monitor, so newer apps report changes between battery power and external power immediately to the POS admin-tools overview.
 
 The plugin advertises this feature through the optional `backgroundExecutionPermissionSupported` field on the existing `getStatus()` response. This keeps staggered deployments safe: older hosted POS versions ignore the field, while newer hosted POS versions hide the permission and retain legacy startup when an older APK omits it.
 
