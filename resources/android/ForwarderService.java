@@ -1355,17 +1355,8 @@ public class ForwarderService extends Service {
             socket.setSoLinger(true, lingerSeconds);
 
             OutputStream out = socket.getOutputStream();
-            content.writeTo(out, false);
+            content.writeTo(out, false, socket.getInputStream());
             socket.shutdownOutput();
-
-            InputStream in = socket.getInputStream();
-            byte[] sink = new byte[256];
-            try {
-                while (in.read(sink) > 0) {
-                    // drain whatever the printer sends back
-                }
-            } catch (Exception ignored) {
-            }
             Log.i(TAG, "LAN print delivered jobId=" + jobId + " ip=" + ip + " bytes=" + content.byteCount());
             return null;
         } catch (Exception e) {
@@ -1522,8 +1513,11 @@ public class ForwarderService extends Service {
             socket.connect();
 
             OutputStream out = socket.getOutputStream();
-            content.writeTo(out, true);
+            long startedAt = System.nanoTime();
+            Log.i(TAG, "Bluetooth print started jobId=" + jobId + " address=" + address);
+            content.writeTo(out, true, socket.getInputStream());
             Log.i(TAG, "Bluetooth print delivered jobId=" + jobId + " address=" + address + " bytes=" + content.byteCount());
+            Log.i(TAG, "Bluetooth print completion jobId=" + jobId + " elapsedMs=" + ((System.nanoTime() - startedAt) / 1_000_000));
             return null;
         } catch (SecurityException e) {
             Log.w(TAG, "Bluetooth print denied jobId=" + jobId + " address=" + address, e);
@@ -1551,17 +1545,22 @@ public class ForwarderService extends Service {
 
         UsbInterface selectedInterface = null;
         UsbEndpoint outputEndpoint = null;
+        UsbEndpoint inputEndpoint = null;
         for (int interfaceIndex = 0; interfaceIndex < device.getInterfaceCount(); interfaceIndex++) {
             UsbInterface candidate = device.getInterface(interfaceIndex);
+            UsbEndpoint candidateOutput = null;
+            UsbEndpoint candidateInput = null;
             for (int endpointIndex = 0; endpointIndex < candidate.getEndpointCount(); endpointIndex++) {
                 UsbEndpoint endpoint = candidate.getEndpoint(endpointIndex);
-                if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK
-                    && endpoint.getDirection() == UsbConstants.USB_DIR_OUT) {
-                    if (outputEndpoint == null || candidate.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER) {
-                        selectedInterface = candidate;
-                        outputEndpoint = endpoint;
-                    }
-                }
+                if (endpoint.getType() != UsbConstants.USB_ENDPOINT_XFER_BULK) continue;
+                if (endpoint.getDirection() == UsbConstants.USB_DIR_OUT) candidateOutput = endpoint;
+                if (endpoint.getDirection() == UsbConstants.USB_DIR_IN) candidateInput = endpoint;
+            }
+            if (candidateOutput != null
+                && (outputEndpoint == null || candidate.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER)) {
+                selectedInterface = candidate;
+                outputEndpoint = candidateOutput;
+                inputEndpoint = candidateInput;
             }
             if (selectedInterface != null && selectedInterface.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER) {
                 break;
@@ -1581,7 +1580,30 @@ public class ForwarderService extends Service {
         }
 
         final UsbEndpoint endpoint = outputEndpoint;
+        final UsbEndpoint returnEndpoint = inputEndpoint;
         try {
+            InputStream statusInput = returnEndpoint == null ? null : new InputStream() {
+                private final byte[] buffer = new byte[returnEndpoint.getMaxPacketSize()];
+                private int offset;
+                private int length;
+
+                @Override
+                public int available() {
+                    if (offset == length) {
+                        // A bounded bulk IN read is polling, not an EOF. Android
+                        // returns a negative count when no packet arrives.
+                        int received = connection.bulkTransfer(returnEndpoint, buffer, buffer.length, 10);
+                        offset = 0;
+                        length = Math.max(received, 0);
+                    }
+                    return length - offset;
+                }
+
+                @Override
+                public int read() {
+                    return available() > 0 ? buffer[offset++] & 0xff : -1;
+                }
+            };
             content.writeTo(new OutputStream() {
                 @Override
                 public void write(int value) throws IOException {
@@ -1597,7 +1619,7 @@ public class ForwarderService extends Service {
                         offset += transferred;
                     }
                 }
-            }, false);
+            }, false, statusInput);
             Log.i(TAG, "USB print delivered jobId=" + jobId + " device=" + deviceName + " bytes=" + content.byteCount());
             return null;
         } catch (IOException e) {

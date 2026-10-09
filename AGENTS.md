@@ -25,7 +25,7 @@ Light app shell for the POS system, responsible for making the POS available on 
 - Platform Bridging: Use Capacitor for native features (printers, scanners, etc.).
 - Flow: Login Screen -> Webview/URL Load -> Capacitor Interop.
 - android/ is ephemeral: Place new Android source files in resources/, symlink it into android/... and apply changes to other android/-files using scripts/android-patch.sh.
-- Receipt printing: Read `docs/receipt-printing.md` before changing direct print delivery, printer queues, byte transfers or cuts. `ForwarderService` owns per-printer FIFO/ACKs and `PrinterJobWriter` owns body/feed/CUT order and Bluetooth pacing.
+- Receipt printing: Read `docs/receipt-printing.md` before changing direct print delivery, printer queues, byte transfers or cuts. `ForwarderService` owns per-printer FIFO/ACKs and `PrinterJobWriter` owns queued ESC/POS completion checks, body/feed/CUT order and Bluetooth pacing.
 - USB access: Read `docs/usb-access.md` before changing USB permissions or reconnection. Keep the attachment filter in `resources/android/xml/usb_device_filter.xml` and its manifest registration in `scripts/android-patch.sh`; Android's remembered handler grants access per device, not through an app-wide runtime permission. Never infer USB access from stored consent or add automatic permission-prompt loops.
 
 ## App versions and updates

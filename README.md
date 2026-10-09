@@ -34,7 +34,7 @@ npm run android:device
 
 USB access supports Android's **Always use** choice so the system can restore printer access after a reconnect or reboot. Existing installations need the updated APK and one new approval with this option; see [USB setup and implementation](docs/usb-access.md).
 
-Direct receipts use app-owned feed/CUT and a 500 ms pause between documents/jobs; see [receipt printing and native transfer ownership](docs/receipt-printing.md). This requires app 1.4.1 and the matching POS socket protocol 4.
+Direct receipts use app-owned feed/CUT and a 1,000 ms pause between documents/jobs from app 1.4.2. ESC/POS receipts over Bluetooth, LAN and USB wait for the printer's queued completion response before cutting and continuing; see [receipt printing and native transfer ownership](docs/receipt-printing.md). Native cuts require app 1.4.1 or newer and the matching POS socket protocol 4.
 
 ### Service lifecycle
 
