@@ -1,0 +1,1 @@
+../../../../../../../../../resources/android/PaymentTerminalReachability.java

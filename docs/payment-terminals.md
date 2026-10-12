@@ -1,0 +1,15 @@
+# Payment-terminal monitoring
+
+UDP on port 8000 supplies candidate IDs/addresses only. `PaymentTerminalReachability.java` independently monitors every configured terminal with credentials; `ForwarderService.java` owns discovery, Wi-Fi-bound network calls and POS socket reporting.
+
+Each tablet opens and closes TCP port **8080** once per minute with a **10-second connect timeout**. Before its first check, after a failed check, and after Wi-Fi/endpoint changes, it verifies `GET /api/v2/DeviceInformation`. Later successful checks use TCP alone. TCP, identity calls and forwarded terminal operations use the current Wi-Fi network. The newer of local discovery and server address observations supplies the target.
+
+The POS supplies fresh signed GETs through `terminal.probe-request`; Android returns raw HTTP replies through `terminal.probe-result`. The POS verifies the signature, matching request timestamp and `terminal.id`, using a connection-bound, single-use probe expiring after 30 seconds. Signing secrets never leave the server. Identity GETs use three-second connect/read timeouts.
+
+A failed check allows three retries after the first attempt, with at least 10 seconds from completion of one attempt to the next. Previously confirmed availability remains during retries and is removed after all four attempts fail. Offline monitoring continues every minute and can recover without UDP. Wi-Fi/endpoint changes immediately clear old availability; in-flight results from replaced states are discarded.
+
+Monotonic per-terminal deadlines launch independent workers; printer availability never gates terminal checks. A separate timer sends `devices.snapshot` every minute, including an empty available list. Observations and membership changes also report immediately without waiting for printer scans. Successful TCP checks supply `lastSeenAt`; UDP timestamps never expire availability.
+
+Registration/snapshots report `terminalCandidates` separately from available `devices`. Only signed GET `/api/v2/DeviceInformation` setup requests may use unverified candidates, preserving automatic authorization and manual credential edits. Payments and other operations require confirmed endpoints. The Capacitor discovery plugin exposes UDP observations only.
+
+Configuration supplies `canVerifyIdentity` and `lastSeenAt`; deploy the matching POS API before releasing this APK. The POS also retains its legacy signed configuration probe and accepts protocol 3/4 clients without `terminalCandidates`, so older APKs can coexist with this one. Older clients keep UDP-based availability and their existing HTTP fallback; they require an APK update to gain TCP monitoring. This APK ignores the legacy probe and always requests fresh signatures. Physical validation should cover mixed old/new clients, missing UDP, TCP retries/exhaustion, identity mismatch, recovery without UDP, Wi-Fi/IP changes during I/O, and adding/authorizing a terminal. Compile Java through the existing source-linking script with JDK 21.
