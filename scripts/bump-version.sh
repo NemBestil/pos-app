@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage: ./scripts/bump-version.sh <major|minor|patch>
-# Bumps the version in package.json and android/app/build.gradle
+# Bumps the version in package.json, package-lock.json and android/app/build.gradle
 
 BUMP_TYPE="${1:-}"
 
@@ -16,6 +16,7 @@ fi
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PACKAGE_JSON="$PROJECT_ROOT/package.json"
+PACKAGE_LOCK="$PROJECT_ROOT/package-lock.json"
 BUILD_GRADLE="$PROJECT_ROOT/android/app/build.gradle"
 
 # Read current version from package.json
@@ -38,12 +39,16 @@ NEW_CODE=$((CURRENT_CODE + 1))
 echo "Bumping version: $CURRENT_VERSION -> $NEW_VERSION"
 echo "Bumping versionCode: $CURRENT_CODE -> $NEW_CODE"
 
-# Update package.json
+# Update package.json and the lockfile's root package version
 node -e "
 const fs = require('fs');
 const pkg = JSON.parse(fs.readFileSync('$PACKAGE_JSON', 'utf8'));
 pkg.version = '$NEW_VERSION';
 fs.writeFileSync('$PACKAGE_JSON', JSON.stringify(pkg, null, 2) + '\n');
+const lock = JSON.parse(fs.readFileSync('$PACKAGE_LOCK', 'utf8'));
+lock.version = '$NEW_VERSION';
+lock.packages[''].version = '$NEW_VERSION';
+fs.writeFileSync('$PACKAGE_LOCK', JSON.stringify(lock, null, 2) + '\n');
 "
 
 # Update build.gradle

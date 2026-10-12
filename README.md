@@ -68,3 +68,5 @@ npm run tag:apk -- full
 ```
 
 Tags `apk-x.y.z` / `apk-x.y.z-pre` trigger `.github/workflows/release-apk.yml`, which validates the version/release metadata, builds a signed APK, and publishes it to the release repository. See [app version protocol, rollout, and validation](docs/app-versions.md).
+
+App 1.4.4 adds verified TCP availability checks for payment terminals so intermittent UDP discovery does not take an already-known reachable terminal offline. See [payment-terminal discovery and availability](docs/payment-terminals.md).
