@@ -152,7 +152,6 @@ public class ForwarderService extends Service {
     private static final int ANDROID_SOCKET_PROTOCOL = 4;
     private static final long DEVICE_REFRESH_INTERVAL_MS = 15_000;
     private static final long IDLE_DEVICE_REFRESH_INTERVAL_MS = 2 * 60_000;
-    private static final long TERMINAL_STALE_AFTER_MS = 2 * 60_000;
     private static final long SOCKET_REQUEST_TIMEOUT_MS = 8_000;
     private static final long SOCKET_RECONNECT_MAX_MS = 15_000;
     private static final long SOCKET_SERVER_PING_INTERVAL_MS = 5_000;
@@ -203,6 +202,35 @@ public class ForwarderService extends Service {
     private final ConcurrentMap<String, String> seenPrintDeliveries = new ConcurrentHashMap<>();
     private final ExecutorService socketWorkExecutor = Executors.newCachedThreadPool();
     private final ScheduledExecutorService socketScheduler = Executors.newSingleThreadScheduledExecutor();
+    private final PaymentTerminalReachability terminalReachability = new PaymentTerminalReachability(
+        socketScheduler,
+        socketWorkExecutor,
+        new PaymentTerminalReachability.Probe() {
+            public void onError(PaymentTerminalReachability.Target target, Exception error) {
+                Log.w(TAG, "Payment terminal monitor failed terminal=" + target.terminalId, error);
+            }
+            public boolean verifyIdentity(PaymentTerminalReachability.Target target) {
+                return verifyPaymentTerminalIdentity(target);
+            }
+            public boolean connect(PaymentTerminalReachability.Target target) {
+                Network network = currentNetwork;
+                if (network == null) return false;
+                try (Socket socket = network.getSocketFactory().createSocket()) {
+                    socket.connect(
+                        new InetSocketAddress(target.ipAddress, PaymentTerminalReachability.TCP_PORT),
+                        PaymentTerminalReachability.TCP_TIMEOUT_MS
+                    );
+                    return true;
+                } catch (IOException error) {
+                    Log.i(TAG, "Payment terminal TCP check failed terminal=" + target.terminalId);
+                    return false;
+                }
+            }
+        },
+        this::requestDeviceReport,
+        SystemClock::elapsedRealtime,
+        System::currentTimeMillis
+    );
     private final OkHttpClient socketClient = new OkHttpClient.Builder()
         .callTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -217,16 +245,17 @@ public class ForwarderService extends Service {
     private final AtomicLong socketGeneration = new AtomicLong(0);
     private final AtomicInteger availableDeviceCount = new AtomicInteger(0);
     private final Object deviceMonitorSignal = new Object();
+    private final Object deviceReportLock = new Object();
     private final Object deviceConfigurationLock = new Object();
     private final List<LanPrinter> configuredLanPrinters = new ArrayList<>();
     private final List<LocalPrinter> configuredLocalPrinters = new ArrayList<>();
     private final List<ConfiguredTerminal> configuredPaymentTerminals = new ArrayList<>();
-    private volatile boolean terminalProbePending = false;
     private volatile WebSocket webSocket;
     private volatile long socketConnectStartedElapsedAt = 0;
     private volatile long lastServerPingElapsedAt = 0;
     private volatile String lastAdvertisedDevices = "";
     private volatile String lastAdvertisedSnapshot = "";
+    private volatile String availablePrinterDevices = "[]";
 
     private volatile String baseUrl;
     private volatile String authToken;
@@ -488,6 +517,7 @@ public class ForwarderService extends Service {
         }
         paymentTerminalExecutors.clear();
         cancelledTerminalJobs.clear();
+        terminalReachability.close();
         for (ExecutorService executor : printerExecutors.values()) executor.shutdownNow();
         printerExecutors.clear();
         seenPrintDeliveries.clear();
@@ -772,6 +802,7 @@ public class ForwarderService extends Service {
             payload.put("devices", lastAdvertisedDevices.isEmpty()
                 ? new JSONArray()
                 : new JSONArray(lastAdvertisedDevices));
+            payload.put("terminalCandidates", buildTerminalCandidates());
             sendSocketMessage("connection.register", payload);
         } catch (Exception e) {
             Log.e(TAG, "Could not register Android WebSocket", e);
@@ -804,6 +835,7 @@ public class ForwarderService extends Service {
                 // during the handshake cannot be lost behind the ready gate.
                 lastAdvertisedDevices = "";
                 lastAdvertisedSnapshot = "";
+                requestDeviceReport();
                 socketWorkExecutor.execute(this::flushPendingSocketResults);
                 if (!sendNetworkLocation()) {
                     refreshNetworkLocation(networkLocationNetwork);
@@ -995,8 +1027,9 @@ public class ForwarderService extends Service {
             configuredLocalPrinters.addAll(nextLocalPrinters);
             configuredPaymentTerminals.clear();
             configuredPaymentTerminals.addAll(nextTerminals);
-            terminalProbePending = true;
         }
+        updatePaymentTerminalTargets();
+        requestDeviceReport();
         wakeDeviceMonitor();
     }
 
@@ -1089,6 +1122,12 @@ public class ForwarderService extends Service {
         deviceMonitorThread = new Thread(this::runDeviceMonitor, "ForwarderDeviceMonitor");
         deviceMonitorThread.setDaemon(true);
         deviceMonitorThread.start();
+        socketScheduler.scheduleAtFixedRate(
+            () -> socketWorkExecutor.execute(() -> reportDeviceSnapshot(true)),
+            PaymentTerminalReachability.CHECK_INTERVAL_MS,
+            PaymentTerminalReachability.CHECK_INTERVAL_MS,
+            TimeUnit.MILLISECONDS
+        );
     }
 
     private void runDeviceMonitor() {
@@ -1135,43 +1174,13 @@ public class ForwarderService extends Service {
     private void refreshAndAdvertiseDevices() throws Exception {
         List<LanPrinter> lanPrinters;
         List<LocalPrinter> localPrinters;
-        List<ConfiguredTerminal> terminals;
-        boolean shouldProbeTerminals;
         synchronized (deviceConfigurationLock) {
             lanPrinters = new ArrayList<>(configuredLanPrinters);
             localPrinters = new ArrayList<>(configuredLocalPrinters);
-            terminals = new ArrayList<>(configuredPaymentTerminals);
-            shouldProbeTerminals = terminalProbePending;
-            terminalProbePending = false;
         }
 
         List<LanPrinter> reachableLan = filterReachableLanPrinters(lanPrinters);
         List<LocalPrinter> reachableLocal = filterAvailableLocalPrinters(localPrinters);
-        if (shouldProbeTerminals) {
-            for (ConfiguredTerminal terminal : terminals) {
-                if (probeConfiguredTerminal(terminal)) {
-                    discoveredTerminals.put(
-                        terminal.terminalId,
-                        new DiscoveredTerminal(
-                            terminal.terminalId,
-                            terminal.identity,
-                            terminal.ipAddress,
-                            terminal.port,
-                            terminal.protocolType,
-                            terminal.protocolVersion,
-                            System.currentTimeMillis()
-                        )
-                    );
-                }
-            }
-        }
-
-        long staleBefore = System.currentTimeMillis() - TERMINAL_STALE_AFTER_MS;
-        for (Map.Entry<String, DiscoveredTerminal> entry : discoveredTerminals.entrySet()) {
-            if (entry.getValue().lastSeenAtMs < staleBefore) {
-                discoveredTerminals.remove(entry.getKey(), entry.getValue());
-            }
-        }
 
         JSONArray devices = new JSONArray();
         for (LanPrinter printer : reachableLan) {
@@ -1192,11 +1201,35 @@ public class ForwarderService extends Service {
             device.put("target", printer.target);
             devices.put(device);
         }
-        Map<String, String> terminalNames = new java.util.HashMap<>();
-        for (ConfiguredTerminal terminal : terminals) {
-            terminalNames.put(terminal.terminalId, terminal.name);
+        availablePrinterDevices = devices.toString();
+        reportDeviceSnapshot(false);
+    }
+
+    private void requestDeviceReport() {
+        if (running.get()) socketWorkExecutor.execute(() -> reportDeviceSnapshot(false));
+    }
+
+    private void reportDeviceSnapshot(boolean force) {
+        if (!running.get()) return;
+        synchronized (deviceReportLock) {
+            try {
+                advertiseDevices(force);
+            } catch (Exception error) {
+                Log.w(TAG, "Device snapshot report failed", error);
+            }
         }
-        for (DiscoveredTerminal terminal : getDiscoveredTerminals()) {
+    }
+
+    private void advertiseDevices(boolean force) throws Exception {
+        JSONArray devices = new JSONArray(availablePrinterDevices);
+        Map<String, String> terminalNames = new java.util.HashMap<>();
+        synchronized (deviceConfigurationLock) {
+            for (ConfiguredTerminal terminal : configuredPaymentTerminals) {
+                terminalNames.put(terminal.terminalId, terminal.name);
+            }
+        }
+        for (PaymentTerminalReachability.AvailableTerminal observation : terminalReachability.getAvailable()) {
+            PaymentTerminalReachability.Target terminal = observation.target;
             JSONObject device = new JSONObject();
             device.put("kind", "payment_terminal");
             device.put("id", terminal.terminalId);
@@ -1205,7 +1238,7 @@ public class ForwarderService extends Service {
             device.put("target", terminal.ipAddress + ":" + terminal.port);
             device.put("ipAddress", terminal.ipAddress);
             device.put("port", terminal.port);
-            device.put("lastSeenAt", formatIsoUtc(terminal.lastSeenAtMs));
+            device.put("lastSeenAt", formatIsoUtc(observation.lastSeenAtMs));
             devices.put(device);
         }
 
@@ -1217,10 +1250,11 @@ public class ForwarderService extends Service {
         payload.put("screenOn", screenOn.get());
         payload.put("battery", readBatterySnapshot());
         payload.put("devices", devices);
+        payload.put("terminalCandidates", buildTerminalCandidates());
         String serializedSnapshot = payload.toString();
         boolean changed = !serializedSnapshot.equals(lastAdvertisedSnapshot);
         lastAdvertisedSnapshot = serializedSnapshot;
-        if ((changed || !socketRegistered.get()) && webSocket != null) {
+        if ((changed || force || !socketRegistered.get()) && webSocket != null) {
             sendSocketMessage("devices.snapshot", payload);
         }
     }
@@ -1251,33 +1285,94 @@ public class ForwarderService extends Service {
         return battery;
     }
 
-    private boolean probeConfiguredTerminal(ConfiguredTerminal terminal) {
-        if (terminal.probePath == null || terminal.probeHeaders == null) {
-            return false;
+    private void updatePaymentTerminalTargets() {
+        synchronized (deviceConfigurationLock) {
+            List<PaymentTerminalReachability.Target> targets = new ArrayList<>();
+            for (ConfiguredTerminal terminal : configuredPaymentTerminals) {
+                if (!terminal.hasCredentials) continue;
+                targets.add(getTerminalCandidate(terminal.terminalId));
+            }
+            terminalReachability.updateTargets(targets);
         }
+    }
+
+    private JSONArray buildTerminalCandidates() {
+        Set<String> ids = new HashSet<>(discoveredTerminals.keySet());
+        synchronized (deviceConfigurationLock) {
+            for (ConfiguredTerminal terminal : configuredPaymentTerminals) ids.add(terminal.terminalId);
+        }
+        List<String> sortedIds = new ArrayList<>(ids);
+        sortedIds.sort(String::compareTo);
+        return new JSONArray(sortedIds);
+    }
+
+    private PaymentTerminalReachability.Target getTerminalCandidate(String terminalId) {
+        DiscoveredTerminal discovered = discoveredTerminals.get(terminalId);
+        synchronized (deviceConfigurationLock) {
+            for (ConfiguredTerminal terminal : configuredPaymentTerminals) {
+                if (terminal.terminalId.equals(terminalId)) {
+                    if (discovered != null && discovered.lastSeenAtMs >= terminal.lastSeenAtMs) {
+                        return new PaymentTerminalReachability.Target(terminalId, discovered.ipAddress, discovered.port);
+                    }
+                    return new PaymentTerminalReachability.Target(terminalId, terminal.ipAddress, terminal.port);
+                }
+            }
+        }
+        if (discovered != null) {
+            return new PaymentTerminalReachability.Target(terminalId, discovered.ipAddress, discovered.port);
+        }
+        return null;
+    }
+
+    private boolean verifyPaymentTerminalIdentity(PaymentTerminalReachability.Target terminal) {
+        Network network = currentNetwork;
+        if (network == null || !socketRegistered.get()) return false;
         HttpURLConnection connection = null;
         try {
-            URL url = new URL("http", terminal.ipAddress, terminal.port, terminal.probePath);
-            connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("GET");
+            JSONObject request = new JSONObject();
+            request.put("terminalId", terminal.terminalId);
+            // Obtain a fresh signature for each verification: Samport rejects old request timestamps.
+            JSONObject probe = sendSocketRequest("terminal.probe-request", request);
+            String probeId = probe.optString("probeId", "");
+            if (probeId.isEmpty()) return false;
+            URL url = new URL("http", terminal.ipAddress, terminal.port, probe.getString("path"));
+            connection = (HttpURLConnection) network.openConnection(url);
+            connection.setInstanceFollowRedirects(false);
+            connection.setRequestMethod(probe.getString("method"));
             connection.setConnectTimeout(3_000);
             connection.setReadTimeout(3_000);
-            Iterator<String> names = terminal.probeHeaders.keys();
+            JSONObject headers = probe.getJSONObject("headers");
+            Iterator<String> names = headers.keys();
             while (names.hasNext()) {
                 String name = names.next();
-                connection.setRequestProperty(name, terminal.probeHeaders.optString(name, ""));
+                connection.setRequestProperty(name, headers.getString(name));
             }
             int status = connection.getResponseCode();
-            if (status >= 200 && status < 300) {
-                InputStream stream = connection.getInputStream();
-                if (stream != null) stream.close();
-                Log.i(TAG, "Payment terminal startup probe succeeded terminal=" + terminal.terminalId);
-                return true;
+            if (status < 200 || status >= 300) return false;
+            String body;
+            try (InputStream stream = connection.getInputStream()) {
+                body = readAll(stream);
             }
-            Log.w(TAG, "Payment terminal startup probe returned HTTP " + status
+            JSONObject responseHeaders = new JSONObject();
+            for (Map.Entry<String, List<String>> entry : connection.getHeaderFields().entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null && !entry.getValue().isEmpty()) {
+                    responseHeaders.put(entry.getKey().toLowerCase(Locale.ROOT), entry.getValue().get(0));
+                }
+            }
+            JSONObject result = new JSONObject();
+            result.put("status", status);
+            result.put("headers", responseHeaders);
+            result.put("body", body);
+            JSONObject verification = new JSONObject();
+            verification.put("terminalId", terminal.terminalId);
+            verification.put("probeId", probeId);
+            verification.put("result", result);
+            boolean verified = sendSocketRequest("terminal.probe-result", verification).optBoolean("verified", false);
+            Log.i(TAG, "Payment terminal identity " + (verified ? "verified" : "rejected")
                 + " terminal=" + terminal.terminalId);
+            return verified;
         } catch (Exception e) {
-            Log.i(TAG, "Payment terminal startup probe failed terminal=" + terminal.terminalId);
+            Log.i(TAG, "Payment terminal identity check failed terminal=" + terminal.terminalId);
         } finally {
             if (connection != null) connection.disconnect();
         }
@@ -1778,10 +1873,15 @@ public class ForwarderService extends Service {
             if (deliveryToken.equals(cancelledTerminalJobs.remove(jobId))) {
                 execution.requestCancellation();
             }
-            DiscoveredTerminal terminal = discoveredTerminals.get(paymentTerminalId);
+            PaymentTerminalReachability.AvailableTerminal observation = terminalReachability.getAvailable(paymentTerminalId);
+            PaymentTerminalReachability.Target terminal = observation == null ? null : observation.target;
+            if (terminal == null && "GET".equals(method) && "/api/v2/DeviceInformation".equals(path)) {
+                // Allow the existing credential-setup probe before a terminal can pass monitoring.
+                terminal = getTerminalCandidate(paymentTerminalId);
+            }
             if (terminal == null) {
                 throw new IOException(
-                    "Payment terminal " + paymentTerminalId + " is not discovered on the current Wi-Fi network."
+                    "Payment terminal " + paymentTerminalId + " is not reachable on the current Wi-Fi network."
                 );
             }
             URL url = new URL("http", terminal.ipAddress, terminal.port, path);
@@ -1790,7 +1890,9 @@ public class ForwarderService extends Service {
                 "dispatch terminal request jobId=" + jobId + " terminal=" + paymentTerminalId
                     + " " + method + " " + url
             );
-            conn = (HttpURLConnection) url.openConnection();
+            Network network = currentNetwork;
+            if (network == null) throw new IOException("The Wi-Fi network is unavailable.");
+            conn = (HttpURLConnection) network.openConnection(url);
             execution.setConnection(conn);
             if (execution.isCancellationRequested()) {
                 throw new IOException("Forwarded terminal request was cancelled before dispatch.");
@@ -2048,7 +2150,7 @@ public class ForwarderService extends Service {
         return scheduledAt - occurredAt >= thresholdMs;
     }
 
-    private long parseIsoTimestamp(String timestamp) {
+    private static long parseIsoTimestamp(String timestamp) {
         if (timestamp.isEmpty()) {
             return 0;
         }
@@ -2621,10 +2723,10 @@ public class ForwarderService extends Service {
         String identity;
         String ipAddress;
         int port;
+        long lastSeenAtMs;
         String protocolType;
         String protocolVersion;
-        String probePath;
-        JSONObject probeHeaders;
+        boolean hasCredentials;
 
         static ConfiguredTerminal fromJson(JSONObject value) {
             String terminalId = value.optString("terminalId", "");
@@ -2639,13 +2741,10 @@ public class ForwarderService extends Service {
             terminal.identity = value.optString("identity", null);
             terminal.ipAddress = ipAddress;
             terminal.port = port;
+            terminal.lastSeenAtMs = parseIsoTimestamp(value.optString("lastSeenAt", ""));
             terminal.protocolType = value.optString("protocolType", null);
             terminal.protocolVersion = value.optString("protocolVersion", null);
-            JSONObject probe = value.optJSONObject("probe");
-            if (probe != null) {
-                terminal.probePath = probe.optString("path", null);
-                terminal.probeHeaders = probe.optJSONObject("headers");
-            }
+            terminal.hasCredentials = value.optBoolean("canVerifyIdentity", false);
             return terminal;
         }
     }
@@ -2702,7 +2801,7 @@ public class ForwarderService extends Service {
         return discoveredTerminals.size();
     }
 
-    /** Snapshot of terminals announced on the current Wi-Fi network. */
+        /** Snapshot of terminals announced on the current Wi-Fi network. */
     public static List<DiscoveredTerminal> getDiscoveredTerminals() {
         List<DiscoveredTerminal> snapshot = new ArrayList<>(discoveredTerminals.values());
         snapshot.sort(Comparator.comparing(t -> t.terminalId));
@@ -2758,9 +2857,8 @@ public class ForwarderService extends Service {
     private void resetDiscoveryForNetworkChange(String reason) {
         Log.i(TAG, reason + "; resetting terminal discovery");
         discoveredTerminals.clear();
-        synchronized (deviceConfigurationLock) {
-            terminalProbePending = true;
-        }
+        terminalReachability.reset();
+        updatePaymentTerminalTargets();
         wakeDeviceMonitor();
         restartDiscoveryTransport();
     }
@@ -3135,6 +3233,8 @@ public class ForwarderService extends Service {
                 + " -> " + terminal.ipAddress + ":" + terminal.port + ")");
         }
         if (isNew || endpointChanged) {
+            updatePaymentTerminalTargets();
+            requestDeviceReport();
             wakeDeviceMonitor();
         }
         for (DiscoveryListener listener : discoveryListeners) {

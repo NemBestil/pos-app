@@ -32,6 +32,8 @@ npm run android:device
 
 ## Android background forwarding
 
+Payment terminals use UDP for discovery and independent TCP checks every minute for availability, with identity verification and bounded retries; see [payment-terminal monitoring](docs/payment-terminals.md).
+
 USB access supports Android's **Always use** choice so the system can restore printer access after a reconnect or reboot. Existing installations need the updated APK and one new approval with this option; see [USB setup and implementation](docs/usb-access.md).
 
 Direct receipts use app-owned feed/CUT and a 1,000 ms pause between documents/jobs from app 1.4.2. ESC/POS receipts over Bluetooth, LAN and USB use queued completion status when available. App 1.4.3 caps recovery at 15 seconds per receipt, including the final 1-second pause, and proceeds without a status reply; see [receipt printing and native transfer ownership](docs/receipt-printing.md). Native cuts require app 1.4.1 or newer and the matching POS socket protocol 4.
