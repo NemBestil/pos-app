@@ -44,7 +44,7 @@ public class AppReleaseUpdateReceiver extends BroadcastReceiver {
     private static final String TAG = "AppReleaseUpdate";
     private static final String CHECK_ACTION = "com.nembestil.pos3.app.CHECK_RELEASE_UPDATE";
     private static final String RELEASES_ENDPOINT =
-        "https://api.github.com/repos/NemBestil/pos-app/releases?per_page=100";
+        "https://api.github.com/repos/NemBestil/pos-app-releases/releases?per_page=100";
     private static final String CHANNEL_ID = "app-release-updates";
     private static final String PREFERENCES = "app-release-updates";
     private static final String LAST_NOTIFIED_RELEASE = "last-notified-release";

@@ -3,10 +3,10 @@ name: Release APK
 on:
   push:
     tags:
-      - 'apk-*'
+      - "apk-*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-apk-${{ github.ref }}
@@ -17,6 +17,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Validate release repository token
+        env:
+          APP_RELEASES_TOKEN: ${{ secrets.APP_RELEASES_TOKEN }}
+        run: test -n "$APP_RELEASES_TOKEN" || { echo "Missing APP_RELEASES_TOKEN for NemBestil/pos-app-releases"; exit 1; }
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -30,15 +35,12 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: "21"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        run: |
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
 
       - name: Validate tag and version
         id: version
@@ -193,6 +195,9 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          repository: NemBestil/pos-app-releases
+          token: ${{ secrets.APP_RELEASES_TOKEN }}
+          target_commitish: main
           tag_name: ${{ github.ref_name }}
           name: ${{ steps.release_details.outputs.release_title }}
           prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}

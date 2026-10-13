@@ -50,8 +50,8 @@ interface ApkUpdaterPlugin {
 const apkUpdater = registerPlugin<ApkUpdaterPlugin>('ApkUpdater')
 
 const currentVersion = packageJson.version
-const stableReleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app/releases/latest'
-const prereleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app/releases?per_page=100'
+const stableReleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app-releases/releases/latest'
+const prereleaseEndpoint = 'https://api.github.com/repos/NemBestil/pos-app-releases/releases?per_page=100'
 let updateNotificationListener: PluginListenerHandle | null = null
 let initializationPromise: Promise<void> | null = null
 let hasHandledUpdateNotificationAction = false
