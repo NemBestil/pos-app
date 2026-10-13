@@ -209,9 +209,6 @@ public class ForwarderService extends Service {
             public void onError(PaymentTerminalReachability.Target target, Exception error) {
                 Log.w(TAG, "Payment terminal monitor failed terminal=" + target.terminalId, error);
             }
-            public boolean verifyIdentity(PaymentTerminalReachability.Target target) {
-                return verifyPaymentTerminalIdentity(target);
-            }
             public boolean connect(PaymentTerminalReachability.Target target) {
                 Network network = currentNetwork;
                 if (network == null) return false;
@@ -1293,6 +1290,16 @@ public class ForwarderService extends Service {
                 targets.add(getTerminalCandidate(terminal.terminalId));
             }
             terminalReachability.updateTargets(targets);
+            for (PaymentTerminalReachability.Target target : targets) {
+                DiscoveredTerminal discovered = discoveredTerminals.get(target.terminalId);
+                if (discovered != null) {
+                    terminalReachability.observeUdp(
+                        new PaymentTerminalReachability.Target(discovered.terminalId, discovered.ipAddress, discovered.port),
+                        discovered.lastSeenAtMs,
+                        discovered.lastSeenElapsedMs
+                    );
+                }
+            }
         }
     }
 
@@ -1322,61 +1329,6 @@ public class ForwarderService extends Service {
             return new PaymentTerminalReachability.Target(terminalId, discovered.ipAddress, discovered.port);
         }
         return null;
-    }
-
-    private boolean verifyPaymentTerminalIdentity(PaymentTerminalReachability.Target terminal) {
-        Network network = currentNetwork;
-        if (network == null || !socketRegistered.get()) return false;
-        HttpURLConnection connection = null;
-        try {
-            JSONObject request = new JSONObject();
-            request.put("terminalId", terminal.terminalId);
-            // Obtain a fresh signature for each verification: Samport rejects old request timestamps.
-            JSONObject probe = sendSocketRequest("terminal.probe-request", request);
-            String probeId = probe.optString("probeId", "");
-            if (probeId.isEmpty()) return false;
-            URL url = new URL("http", terminal.ipAddress, terminal.port, probe.getString("path"));
-            connection = (HttpURLConnection) network.openConnection(url);
-            connection.setInstanceFollowRedirects(false);
-            connection.setRequestMethod(probe.getString("method"));
-            connection.setConnectTimeout(3_000);
-            connection.setReadTimeout(3_000);
-            JSONObject headers = probe.getJSONObject("headers");
-            Iterator<String> names = headers.keys();
-            while (names.hasNext()) {
-                String name = names.next();
-                connection.setRequestProperty(name, headers.getString(name));
-            }
-            int status = connection.getResponseCode();
-            if (status < 200 || status >= 300) return false;
-            String body;
-            try (InputStream stream = connection.getInputStream()) {
-                body = readAll(stream);
-            }
-            JSONObject responseHeaders = new JSONObject();
-            for (Map.Entry<String, List<String>> entry : connection.getHeaderFields().entrySet()) {
-                if (entry.getKey() != null && entry.getValue() != null && !entry.getValue().isEmpty()) {
-                    responseHeaders.put(entry.getKey().toLowerCase(Locale.ROOT), entry.getValue().get(0));
-                }
-            }
-            JSONObject result = new JSONObject();
-            result.put("status", status);
-            result.put("headers", responseHeaders);
-            result.put("body", body);
-            JSONObject verification = new JSONObject();
-            verification.put("terminalId", terminal.terminalId);
-            verification.put("probeId", probeId);
-            verification.put("result", result);
-            boolean verified = sendSocketRequest("terminal.probe-result", verification).optBoolean("verified", false);
-            Log.i(TAG, "Payment terminal identity " + (verified ? "verified" : "rejected")
-                + " terminal=" + terminal.terminalId);
-            return verified;
-        } catch (Exception e) {
-            Log.i(TAG, "Payment terminal identity check failed terminal=" + terminal.terminalId);
-        } finally {
-            if (connection != null) connection.disconnect();
-        }
-        return false;
     }
 
     // ========================================================================
@@ -2765,6 +2717,7 @@ public class ForwarderService extends Service {
         public final String protocolType;
         public final String protocolVersion;
         public final long lastSeenAtMs;
+        public final long lastSeenElapsedMs;
 
         DiscoveredTerminal(
             String terminalId,
@@ -2782,6 +2735,7 @@ public class ForwarderService extends Service {
             this.protocolType = protocolType;
             this.protocolVersion = protocolVersion;
             this.lastSeenAtMs = lastSeenAtMs;
+            this.lastSeenElapsedMs = SystemClock.elapsedRealtime();
         }
     }
 
@@ -3232,8 +3186,9 @@ public class ForwarderService extends Service {
                 + terminal.terminalId + " (" + previous.ipAddress + ":" + previous.port
                 + " -> " + terminal.ipAddress + ":" + terminal.port + ")");
         }
+        // Every broadcast refreshes availability, including an unchanged terminal/address.
+        updatePaymentTerminalTargets();
         if (isNew || endpointChanged) {
-            updatePaymentTerminalTargets();
             requestDeviceReport();
             wakeDeviceMonitor();
         }

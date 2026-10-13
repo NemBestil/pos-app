@@ -10,16 +10,16 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
-/** Per-tablet terminal availability. UDP observations only supply candidate addresses. */
+/** Per-tablet terminal availability from recent local UDP or TCP observations. */
 final class PaymentTerminalReachability {
     static final long CHECK_INTERVAL_MS = 60_000;
+    static final long AVAILABILITY_WINDOW_MS = 5 * 60_000;
     static final long RETRY_DELAY_MS = 10_000;
     static final int TCP_PORT = 8080;
     static final int TCP_TIMEOUT_MS = 10_000;
     private static final int MAX_ATTEMPTS = 4;
 
     interface Probe {
-        boolean verifyIdentity(Target target);
         boolean connect(Target target);
         void onError(Target target, Exception error);
     }
@@ -52,8 +52,9 @@ final class PaymentTerminalReachability {
 
     private static final class State {
         final Target target;
-        boolean identityVerified;
         AvailableTerminal available;
+        long availableUntil;
+        ScheduledFuture<?> expiry;
         ScheduledFuture<?> scheduled;
         int attempts;
         long cycleStartedAt;
@@ -110,19 +111,44 @@ final class PaymentTerminalReachability {
     synchronized List<AvailableTerminal> getAvailable() {
         List<AvailableTerminal> available = new ArrayList<>();
         for (State state : states.values()) {
-            if (state.available != null) available.add(state.available);
+            if (state.available != null && elapsedTime.getAsLong() < state.availableUntil) available.add(state.available);
         }
         return available;
     }
 
     synchronized AvailableTerminal getAvailable(String terminalId) {
         State state = states.get(terminalId);
-        return state == null ? null : state.available;
+        return state == null || elapsedTime.getAsLong() >= state.availableUntil ? null : state.available;
+    }
+
+    synchronized void observeUdp(Target target, long lastSeenAtMs, long lastSeenElapsedMs) {
+        State state = states.get(target.terminalId);
+        if (state == null || !state.target.sameEndpoint(target)) return;
+        observe(state, lastSeenAtMs, lastSeenElapsedMs);
+    }
+
+    private void observe(State state, long lastSeenAtMs, long lastSeenElapsedMs) {
+        long availableUntil = lastSeenElapsedMs + AVAILABILITY_WINDOW_MS;
+        long now = elapsedTime.getAsLong();
+        // Reapplying configuration must not renew an old UDP observation or replace newer TCP evidence.
+        if (availableUntil <= now || availableUntil <= state.availableUntil) return;
+        state.available = new AvailableTerminal(state.target, lastSeenAtMs);
+        state.availableUntil = availableUntil;
+        if (state.expiry != null) state.expiry.cancel(false);
+        state.expiry = scheduler.schedule(() -> {
+            synchronized (this) {
+                if (states.get(state.target.terminalId) != state || state.availableUntil != availableUntil) return;
+                state.available = null;
+                onObservation.run();
+            }
+        }, availableUntil - now, TimeUnit.MILLISECONDS);
+        onObservation.run();
     }
 
     private void remove(State state) {
         states.remove(state.target.terminalId, state);
         if (state.scheduled != null) state.scheduled.cancel(false);
+        if (state.expiry != null) state.expiry.cancel(false);
     }
 
     private void schedule(State state, long delayMs) {
@@ -130,38 +156,29 @@ final class PaymentTerminalReachability {
     }
 
     private void check(State state) {
-        boolean needsIdentity;
         synchronized (this) {
             if (states.get(state.target.terminalId) != state) return;
             if (state.attempts == 0) state.cycleStartedAt = elapsedTime.getAsLong();
-            needsIdentity = !state.identityVerified;
         }
-        boolean verified = !needsIdentity;
         boolean connected = false;
         try {
-            if (needsIdentity) verified = probe.verifyIdentity(state.target);
-            if (verified) connected = probe.connect(state.target);
+            connected = probe.connect(state.target);
         } catch (Exception error) {
             probe.onError(state.target, error);
         }
         synchronized (this) {
             // Configuration/network changes replace the state; old I/O must never restore availability.
             if (states.get(state.target.terminalId) != state) return;
-            state.identityVerified = connected;
             if (connected) {
-                state.available = new AvailableTerminal(state.target, wallTime.getAsLong());
+                observe(state, wallTime.getAsLong(), elapsedTime.getAsLong());
                 state.attempts = 0;
                 schedule(state, Math.max(0, state.cycleStartedAt + CHECK_INTERVAL_MS - elapsedTime.getAsLong()));
-                onObservation.run();
             } else if (++state.attempts < MAX_ATTEMPTS) {
-                // Keep the last successful availability while the retry sequence is pending.
-                // Every failed TCP check invalidates identity before the next attempt.
+                // Failures never override recent UDP/TCP evidence; its five-minute timer owns expiry.
                 schedule(state, RETRY_DELAY_MS);
             } else {
-                state.available = null;
                 state.attempts = 0;
                 schedule(state, CHECK_INTERVAL_MS);
-                onObservation.run();
             }
         }
     }
