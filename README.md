@@ -32,7 +32,7 @@ npm run android:device
 
 ## Android background forwarding
 
-Payment terminals stay available for five minutes after either a local UDP broadcast or a successful independent TCP check, with checks every minute and bounded retries; see [payment-terminal monitoring](docs/payment-terminals.md).
+App 1.4.7 is based on 1.4.5. Terminal TCP checks and forwarded HTTP calls use Android’s normal network routing, with no Wi-Fi requirement. UDP discovery listens on all local interfaces. All configured terminals are monitored without `canVerifyIdentity`; payment authentication remains server-owned. Payment terminals stay available for five minutes after either a local UDP broadcast or a successful independent TCP check, with checks every minute and bounded retries; see [payment-terminal monitoring](docs/payment-terminals.md).
 
 USB access supports Android's **Always use** choice so the system can restore printer access after a reconnect or reboot. Existing installations need the updated APK and one new approval with this option; see [USB setup and implementation](docs/usb-access.md).
 
@@ -69,4 +69,4 @@ npm run tag:apk -- full
 
 Tags `apk-x.y.z` / `apk-x.y.z-pre` trigger `.github/workflows/release-apk.yml`, which validates the version/release metadata, builds a signed APK, and publishes it to the release repository. See [app version protocol, rollout, and validation](docs/app-versions.md).
 
-App 1.4.4 introduces TCP payment-terminal monitoring. Current source fixes availability to accept either UDP or TCP evidence within five minutes; installing a newly built APK is required. See [payment-terminal discovery and availability](docs/payment-terminals.md).
+App 1.4.4 introduces TCP payment-terminal monitoring. App 1.4.5 fixes availability to accept either UDP or TCP evidence within five minutes; installing a newly built APK is required. See [payment-terminal discovery and availability](docs/payment-terminals.md).

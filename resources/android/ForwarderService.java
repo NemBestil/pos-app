@@ -25,8 +25,6 @@ import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -210,9 +208,7 @@ public class ForwarderService extends Service {
                 Log.w(TAG, "Payment terminal monitor failed terminal=" + target.terminalId, error);
             }
             public boolean connect(PaymentTerminalReachability.Target target) {
-                Network network = currentNetwork;
-                if (network == null) return false;
-                try (Socket socket = network.getSocketFactory().createSocket()) {
+                try (Socket socket = new Socket()) {
                     socket.connect(
                         new InetSocketAddress(target.ipAddress, PaymentTerminalReachability.TCP_PORT),
                         PaymentTerminalReachability.TCP_TIMEOUT_MS
@@ -262,7 +258,7 @@ public class ForwarderService extends Service {
     private volatile DatagramSocket discoverySocket;
     private WifiManager.MulticastLock multicastLock;
     private volatile ConnectivityManager.NetworkCallback networkCallback;
-    private volatile Network currentNetwork;
+    private volatile Network discoveryNetwork;
     private final Object networkLocationCallbackLock = new Object();
     private volatile ConnectivityManager.NetworkCallback networkLocationCallback;
     private volatile Network networkLocationNetwork;
@@ -1286,7 +1282,6 @@ public class ForwarderService extends Service {
         synchronized (deviceConfigurationLock) {
             List<PaymentTerminalReachability.Target> targets = new ArrayList<>();
             for (ConfiguredTerminal terminal : configuredPaymentTerminals) {
-                if (!terminal.hasCredentials) continue;
                 targets.add(getTerminalCandidate(terminal.terminalId));
             }
             terminalReachability.updateTargets(targets);
@@ -1833,7 +1828,7 @@ public class ForwarderService extends Service {
             }
             if (terminal == null) {
                 throw new IOException(
-                    "Payment terminal " + paymentTerminalId + " is not reachable on the current Wi-Fi network."
+                    "Payment terminal " + paymentTerminalId + " is not reachable on the current network."
                 );
             }
             URL url = new URL("http", terminal.ipAddress, terminal.port, path);
@@ -1842,9 +1837,7 @@ public class ForwarderService extends Service {
                 "dispatch terminal request jobId=" + jobId + " terminal=" + paymentTerminalId
                     + " " + method + " " + url
             );
-            Network network = currentNetwork;
-            if (network == null) throw new IOException("The Wi-Fi network is unavailable.");
-            conn = (HttpURLConnection) network.openConnection(url);
+            conn = (HttpURLConnection) url.openConnection();
             execution.setConnection(conn);
             if (execution.isCancellationRequested()) {
                 throw new IOException("Forwarded terminal request was cancelled before dispatch.");
@@ -2678,7 +2671,6 @@ public class ForwarderService extends Service {
         long lastSeenAtMs;
         String protocolType;
         String protocolVersion;
-        boolean hasCredentials;
 
         static ConfiguredTerminal fromJson(JSONObject value) {
             String terminalId = value.optString("terminalId", "");
@@ -2696,7 +2688,6 @@ public class ForwarderService extends Service {
             terminal.lastSeenAtMs = parseIsoTimestamp(value.optString("lastSeenAt", ""));
             terminal.protocolType = value.optString("protocolType", null);
             terminal.protocolVersion = value.optString("protocolVersion", null);
-            terminal.hasCredentials = value.optBoolean("canVerifyIdentity", false);
             return terminal;
         }
     }
@@ -2755,7 +2746,7 @@ public class ForwarderService extends Service {
         return discoveredTerminals.size();
     }
 
-        /** Snapshot of terminals announced on the current Wi-Fi network. */
+    /** Snapshot of terminals announced on the local network. */
     public static List<DiscoveredTerminal> getDiscoveredTerminals() {
         List<DiscoveredTerminal> snapshot = new ArrayList<>(discoveredTerminals.values());
         snapshot.sort(Comparator.comparing(t -> t.terminalId));
@@ -2838,30 +2829,27 @@ public class ForwarderService extends Service {
                 if (cm == null) {
                     return;
                 }
-                NetworkRequest request = new NetworkRequest.Builder()
-                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                    .build();
                 ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {
                     @Override
                     public void onAvailable(Network network) {
-                        Network previous = currentNetwork;
-                        currentNetwork = network;
+                        Network previous = discoveryNetwork;
+                        discoveryNetwork = network;
                         if (previous == null) {
-                            resetDiscoveryForNetworkChange("Wi-Fi network became available");
+                            resetDiscoveryForNetworkChange("Default network became available");
                         } else if (!previous.equals(network)) {
-                            resetDiscoveryForNetworkChange("Wi-Fi network changed");
+                            resetDiscoveryForNetworkChange("Default network changed");
                         }
                     }
 
                     @Override
                     public void onLost(Network network) {
-                        if (network.equals(currentNetwork)) {
-                            currentNetwork = null;
-                            resetDiscoveryForNetworkChange("Wi-Fi network was lost");
+                        if (network.equals(discoveryNetwork)) {
+                            discoveryNetwork = null;
+                            resetDiscoveryForNetworkChange("Default network was lost");
                         }
                     }
                 };
-                cm.registerNetworkCallback(request, callback);
+                cm.registerDefaultNetworkCallback(callback);
                 networkCallback = callback;
             } catch (Exception e) {
                 Log.w(TAG, "Failed to register network callback", e);
@@ -2874,7 +2862,7 @@ public class ForwarderService extends Service {
         synchronized (networkCallbackLock) {
             ConnectivityManager.NetworkCallback callback = networkCallback;
             networkCallback = null;
-            currentNetwork = null;
+            discoveryNetwork = null;
             if (callback == null) {
                 return;
             }
@@ -3123,15 +3111,11 @@ public class ForwarderService extends Service {
                     socket = new DatagramSocket(null);
                     socket.setReuseAddress(true);
                     socket.setBroadcast(true);
-                    Network wifiNetwork = currentNetwork;
-                    if (wifiNetwork != null) {
-                        wifiNetwork.bindSocket(socket);
-                    }
                     socket.bind(new InetSocketAddress(DISCOVERY_PORT));
                     discoverySocket = socket;
                     Log.i(
                         TAG,
-                        "Worldline discovery listening on Wi-Fi at 0.0.0.0:" + DISCOVERY_PORT
+                        "Worldline discovery listening at 0.0.0.0:" + DISCOVERY_PORT
                     );
 
                     byte[] buffer = new byte[DISCOVERY_BUFFER_SIZE];
