@@ -15,7 +15,6 @@ final class PaymentTerminalReachability {
     static final long CHECK_INTERVAL_MS = 60_000;
     static final long AVAILABILITY_WINDOW_MS = 5 * 60_000;
     static final long RETRY_DELAY_MS = 10_000;
-    static final int TCP_PORT = 8080;
     static final int TCP_TIMEOUT_MS = 10_000;
     private static final int MAX_ATTEMPTS = 4;
 

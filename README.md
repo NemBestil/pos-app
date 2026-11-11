@@ -2,6 +2,8 @@
 
 A light Android shell for the NemBestil POS system. It provides a configuration wizard to link the device with one or more POS installations, then loads the full POS from a verified URL and uses Capacitor to bridge native features.
 
+Published app 1.4.7 discovers and allows `*.nbpos.eu`, so registered POS 1.4 installations need no APK update. POS 1.4 retains the verified legacy whoami signing key, allowing the original native service's public IP/location reports alongside the hosted browser's same-origin whoami. See [backend compatibility](docs/backend-compatibility.md) for discovery, signing and native contracts.
+
 ## Tech Stack
 
 - **Framework:** Nuxt 4 (SPA)
@@ -23,6 +25,24 @@ npm run android:phone
 npm run android:device
 ```
 
+For profiling on a connected device, use the release-based `profile` variant with
+JDK 21. It keeps Android `debuggable` disabled, enables shell profiling and WebView
+inspection, and uses the local debug signing key:
+
+```bash
+npm run generate
+npx cap sync android
+./scripts/android-patch.sh
+cd android
+./gradlew :app:assembleProfile
+adb install -r app/build/outputs/apk/profile/app-profile.apk
+adb shell am start -n com.nembestil.pos3.app/.MainActivity
+```
+
+Inspect the WebView through Chrome's `chrome://inspect/#devices` or attach Android
+Studio's low-overhead profiler. Profiling and WebView inspection are enabled only
+for this variant; normal release builds keep their existing settings.
+
 ## Features & Conventions
 
 - **Multi-tenant:** Manage and switch between multiple POS installations.
@@ -31,6 +51,8 @@ npm run android:device
 - **Native:** Bridges printers, scanners, and other native features via Capacitor.
 
 ## Android background forwarding
+
+App 1.4.8 adds Samport REST v1 HTTPS with Worldline CA validation, v0/v1 UDP discovery, actual-port monitoring and automatic API detection from a manually entered IP. Existing v2 devices may stay on 1.4.7; v1 terminal forwarding and manual setup require 1.4.8. See [terminal setup and verification](docs/payment-terminals.md).
 
 App 1.4.7 is based on 1.4.5. Terminal TCP checks and forwarded HTTP calls use Android’s normal network routing, with no Wi-Fi requirement. UDP discovery listens on all local interfaces. All configured terminals are monitored without `canVerifyIdentity`; payment authentication remains server-owned. Payment terminals stay available for five minutes after either a local UDP broadcast or a successful independent TCP check, with checks every minute and bounded retries; see [payment-terminal monitoring](docs/payment-terminals.md).
 

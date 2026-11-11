@@ -1,5 +1,7 @@
 # Installation app versions
 
+Published app 1.4.7 already discovers POS 1.3 and Cloudflare 1.4 through `*.nbpos.eu`. The router selects registered POS 1.4 installations; the selected backend's exact app-version range remains authoritative. POS and Android app version numbers are independent: POS 1.4 keeps minimum Android app 1.4.7 and targets/inclusively permits 1.4.8; existing v2 devices may postpone the update. No new APK is needed for routing or native location reports: production POS 1.4 retains the POS 1.3/legacy-whoami signing key. See [backend compatibility](backend-compatibility.md) for the original APK's external whoami dependency and shared signing setup.
+
 The launcher owns POS Android updates. Read `app/composables/useAppReleaseUpdate.ts` for permission and update orchestration, `app/utils/app-version.ts` for version comparison/legacy requirements, and `app/app.vue` for installation lookup and the launch gate. Native download and system installation live in `resources/android/ApkUpdaterPlugin.java`.
 
 On every launcher startup, ask for Android package-install permission if missing, independently of whether an update is needed. Opening Android settings is not a grant: recheck `canRequestPackageInstalls()` after returning. Denying permission still permits a compatible app to open a POS; accepting an update requires the permission. Startup initialization settles before a launch is allowed.
@@ -31,3 +33,7 @@ App `1.4.4` checks configured payment terminals over TCP port 8080 every minute.
 App `1.4.5` corrects native terminal availability to a five-minute window renewed by either a local UDP broadcast or TCP success. Monitoring no longer requires a signed identity probe, and retry exhaustion cannot clear recent evidence. This correction does not change installation version requirements or the socket contract. See [payment-terminal monitoring](payment-terminals.md).
 
 App `1.4.7` is based on the `apk-1.4.5` source, removes Wi-Fi binding from terminal TCP/HTTP traffic and UDP discovery, and monitors all configured terminals without `canVerifyIdentity`. Its `versionCode` is `101048`, above the already-published `1.4.6` (`101047`), so that APK can update in place. Publish `apk-1.4.7` and confirm its APK asset before publishing the POS patch that requires exactly `1.4.7`. Socket protocol `4` and signed payment requests/responses remain unchanged.
+
+App `1.4.8` (versionCode `101049`) adds Samport v1 pinned TLS, v0/v1 UDP discovery, actual terminal-port checks and manual IPv4 detection. Its hosted target is 1.4.8 and minimum remains 1.4.7; the server routes v1 jobs only through 1.4.8+. Publish the signed release before deploying the new target. See [terminal monitoring and verification](payment-terminals.md#samport-v1-and-app-148).
+
+Release preparation for `1.4.8` on 2026-11-11 passed Nuxt generation, Capacitor sync, Android source/resource linking, release Java compilation and profile APK assembly with JDK 21. The public stable release must include `nembestil-pos3-app-1.4.8.apk`; verify its package version, versionCode and signing-certificate continuity with `1.4.7` after CI publishes it.

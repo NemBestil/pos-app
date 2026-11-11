@@ -74,6 +74,9 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
 ${REG_LINES}        super.onCreate(savedInstanceState);
+        if (BuildConfig.BUILD_TYPE.equals("profile")) {
+            android.webkit.WebView.setWebContentsDebuggingEnabled(true);
+        }
         setVolumeControlStream(AudioManager.STREAM_NOTIFICATION);
         WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);
@@ -92,10 +95,48 @@ EOF
 
 echo "🩹 Patched MainActivity.java (${#PLUGINS[@]} plugin(s) registered)"
 
+APP_BUILD_GRADLE="$ROOT/android/app/build.gradle"
+
+# Local profiling keeps release runtime behavior while allowing WebView inspection
+# and shell profiling. Debug signing is only for installation on test devices.
+if [ -f "$APP_BUILD_GRADLE" ]; then
+    python3 - "$APP_BUILD_GRADLE" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+anchor = "\nrepositories {"
+profile = '''
+android.buildTypes {
+    profile {
+        initWith release
+        debuggable false
+        signingConfig android.signingConfigs.debug
+        matchingFallbacks = ['release']
+    }
+}
+'''
+if anchor not in text:
+    raise SystemExit("Cannot find repositories block for profile build type")
+start = text.find('\nandroid.buildTypes {\n    profile {')
+if start >= 0:
+    end = text.index('\n}\n', start) + len('\n}\n')
+    text = text[:start] + profile + text[end:]
+else:
+    text = text.replace(anchor, profile + anchor, 1)
+path.write_text(text)
+PY
+    echo "🩹 Added release-based profile build type to android/app/build.gradle"
+fi
+
+mkdir -p "$ROOT/android/app/src/profile"
+ln -sfn "../../../../resources/android/profile/AndroidManifest.xml" \
+    "$ROOT/android/app/src/profile/AndroidManifest.xml"
+
 # BridgeReinjector uses androidx.webkit (WebViewCompat / WebViewFeature). Capacitor
 # declares it as `implementation`, so it isn't exposed to the app module — we must
 # add it explicitly. Idempotent: only inserted if missing.
-APP_BUILD_GRADLE="$ROOT/android/app/build.gradle"
 if [ -f "$APP_BUILD_GRADLE" ] && ! grep -q "androidx.webkit:webkit" "$APP_BUILD_GRADLE"; then
     # Insert after the capacitor-android project dependency line (a stable anchor
     # that cap sync re-emits). Use a literal newline in the sed `a\` block.
@@ -296,6 +337,18 @@ for src in "$RESOURCES_DIR/xml"/*.xml; do
     rel="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$src" "$ANDROID_RES_XML_DIR")"
     ln -sfn "$rel" "$target"
     echo "🔗 Linked: android/.../res/xml/$base -> $rel"
+done
+
+# Keep vendor CA certificates as ordinary packaged raw resources.
+ANDROID_RES_RAW_DIR="$ROOT/android/app/src/main/res/raw"
+mkdir -p "$ANDROID_RES_RAW_DIR"
+for src in "$RESOURCES_DIR/raw"/*.pem; do
+    [ -f "$src" ] || continue
+    base="$(basename "$src")"
+    target="$ANDROID_RES_RAW_DIR/$base"
+    rel="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$src" "$ANDROID_RES_RAW_DIR")"
+    ln -sfn "$rel" "$target"
+    echo "🔗 Linked: android/.../res/raw/$base -> $rel"
 done
 
 # Symlink density-bucketed drawable resources (e.g. the notification small icon)

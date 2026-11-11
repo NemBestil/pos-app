@@ -17,6 +17,9 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(SecondaryDisplayPlugin.class);
         registerPlugin(UsbPrinterPlugin.class);
         super.onCreate(savedInstanceState);
+        if (BuildConfig.BUILD_TYPE.equals("profile")) {
+            android.webkit.WebView.setWebContentsDebuggingEnabled(true);
+        }
         setVolumeControlStream(AudioManager.STREAM_NOTIFICATION);
         WebViewSentrySupport.install(bridge);
         BridgeReinjector.install(bridge);

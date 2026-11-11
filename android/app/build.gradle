@@ -10,8 +10,8 @@ android {
         applicationId "com.nembestil.pos3.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 101048
-        versionName "1.4.7"
+        versionCode 101049
+        versionName "1.4.8"
         buildConfigField "boolean", "APP_PRERELEASE", System.getenv("APP_PRERELEASE") ?: "false"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
@@ -40,6 +40,15 @@ android {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
+    }
+}
+
+android.buildTypes {
+    profile {
+        initWith release
+        debuggable false
+        signingConfig android.signingConfigs.debug
+        matchingFallbacks = ['release']
     }
 }
 

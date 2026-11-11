@@ -210,7 +210,7 @@ public class ForwarderService extends Service {
             public boolean connect(PaymentTerminalReachability.Target target) {
                 try (Socket socket = new Socket()) {
                     socket.connect(
-                        new InetSocketAddress(target.ipAddress, PaymentTerminalReachability.TCP_PORT),
+                        new InetSocketAddress(target.ipAddress, target.port),
                         PaymentTerminalReachability.TCP_TIMEOUT_MS
                     );
                     return true;
@@ -1822,7 +1822,7 @@ public class ForwarderService extends Service {
             }
             PaymentTerminalReachability.AvailableTerminal observation = terminalReachability.getAvailable(paymentTerminalId);
             PaymentTerminalReachability.Target terminal = observation == null ? null : observation.target;
-            if (terminal == null && "GET".equals(method) && "/api/v2/DeviceInformation".equals(path)) {
+            if (terminal == null && "GET".equals(method) && ("/api/v2/DeviceInformation".equals(path) || "/api/v1/DeviceInformation".equals(path))) {
                 // Allow the existing credential-setup probe before a terminal can pass monitoring.
                 terminal = getTerminalCandidate(paymentTerminalId);
             }
@@ -1831,13 +1831,12 @@ public class ForwarderService extends Service {
                     "Payment terminal " + paymentTerminalId + " is not reachable on the current network."
                 );
             }
-            URL url = new URL("http", terminal.ipAddress, terminal.port, path);
+            conn = SamportTerminalConnection.open(this, terminal.ipAddress, terminal.port, path);
             Log.i(
                 TAG,
                 "dispatch terminal request jobId=" + jobId + " terminal=" + paymentTerminalId
-                    + " " + method + " " + url
+                    + " " + method + " " + conn.getURL()
             );
-            conn = (HttpURLConnection) url.openConnection();
             execution.setConnection(conn);
             if (execution.isCancellationRequested()) {
                 throw new IOException("Forwarded terminal request was cancelled before dispatch.");
@@ -2742,6 +2741,18 @@ public class ForwarderService extends Service {
         return discoveryRunning.get();
     }
 
+    static DiscoveredTerminal rememberProbedTerminal(JSONObject device) throws Exception {
+        ForwarderService service = activeService.get();
+        if (service == null) throw new IOException("Enable traffic forwarding before adding a payment terminal.");
+        DiscoveredTerminal terminal = new DiscoveredTerminal(
+            device.getString("terminalId"), device.getString("identity"), device.getString("ipAddress"),
+            device.getInt("port"), device.getString("protocolType"), device.getString("protocolVersion"),
+            System.currentTimeMillis()
+        );
+        service.handleDiscoveredTerminal(terminal);
+        return terminal;
+    }
+
     public static int getDiscoveredTerminalCount() {
         return discoveredTerminals.size();
     }
@@ -3157,6 +3168,10 @@ public class ForwarderService extends Service {
         if (terminal == null) {
             return;
         }
+        handleDiscoveredTerminal(terminal);
+    }
+
+    private void handleDiscoveredTerminal(DiscoveredTerminal terminal) {
         DiscoveredTerminal previous = discoveredTerminals.get(terminal.terminalId);
         boolean isNew = previous == null;
         boolean endpointChanged = previous != null
@@ -3194,6 +3209,7 @@ public class ForwarderService extends Service {
                 return null;
             }
             JSONObject v1 = worldline.optJSONObject("v1");
+            if (v1 == null) v1 = worldline.optJSONObject("v0");
             if (v1 == null) {
                 return null;
             }

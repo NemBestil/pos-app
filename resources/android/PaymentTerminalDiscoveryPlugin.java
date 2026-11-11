@@ -7,6 +7,9 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import org.json.JSONArray;
+import org.json.JSONObject;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import java.util.List;
 
@@ -20,6 +23,7 @@ import java.util.List;
  */
 @CapacitorPlugin(name = "PaymentTerminalDiscovery")
 public class PaymentTerminalDiscoveryPlugin extends Plugin {
+    private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
 
     private final ForwarderService.DiscoveryListener listener = (terminal, isNew) -> {
         JSObject payload = new JSObject();
@@ -35,8 +39,30 @@ public class PaymentTerminalDiscoveryPlugin extends Plugin {
 
     @Override
     protected void handleOnDestroy() {
+        ioExecutor.shutdownNow();
         ForwarderService.unregisterDiscoveryListener(listener);
         super.handleOnDestroy();
+    }
+
+    @PluginMethod
+    public void probeIp(PluginCall call) {
+        String ipAddress = call.getString("ipAddress");
+        JSONArray probes = call.getArray("probes");
+        if (probes == null || probes.length() < 1 || probes.length() > 2) {
+            call.reject("Terminal discovery credentials are not available.");
+            return;
+        }
+        ioExecutor.execute(() -> {
+            try {
+                JSONObject device = SamportTerminalConnection.probeIp(getContext(), ipAddress, probes);
+                ForwarderService.DiscoveredTerminal terminal = ForwarderService.rememberProbedTerminal(device);
+                JSObject response = new JSObject();
+                response.put("terminal", terminalToJson(terminal));
+                call.resolve(response);
+            } catch (Exception error) {
+                call.reject(error.getMessage() == null ? "Could not contact the payment terminal." : error.getMessage());
+            }
+        });
     }
 
     @PluginMethod
