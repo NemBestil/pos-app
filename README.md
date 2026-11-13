@@ -92,3 +92,5 @@ npm run tag:apk -- full
 Tags `apk-x.y.z` / `apk-x.y.z-pre` trigger `.github/workflows/release-apk.yml`, which validates the version/release metadata, builds a signed APK, and publishes it to the release repository. See [app version protocol, rollout, and validation](docs/app-versions.md).
 
 App 1.4.4 introduces TCP payment-terminal monitoring. App 1.4.5 fixes availability to accept either UDP or TCP evidence within five minutes; installing a newly built APK is required. See [payment-terminal discovery and availability](docs/payment-terminals.md).
+
+App 1.4.9 adds direct local card checkout for a compatible hosted POS: pre-signed payment submission overlaps fiscal sale creation and successful-receipt preparation. Older apps and ordinary browsers retain server forwarding through another tablet. See [direct checkout and release ordering](docs/payment-terminals.md#direct-local-checkout-in-app-149).

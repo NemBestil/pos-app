@@ -100,6 +100,35 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class ForwarderService extends Service {
 
+    static ForwarderService directPaymentService() {
+        return activeService.get();
+    }
+
+    String directPaymentForwarderId() { return forwarderId; }
+    String directPaymentToken() { return authToken; }
+    String directPaymentBaseUrl() { return baseUrl; }
+
+    PaymentTerminalReachability.Target directPaymentTarget(String terminalId) {
+        PaymentTerminalReachability.AvailableTerminal available = terminalReachability.getAvailable(terminalId);
+        return available == null ? null : available.target;
+    }
+
+    java.util.List<String> directPaymentTerminalIds() {
+        java.util.List<String> result = new java.util.ArrayList<>();
+        for (PaymentTerminalReachability.AvailableTerminal available : terminalReachability.getAvailable()) {
+            result.add(available.target.terminalId);
+        }
+        return result;
+    }
+
+    void enqueueDirectPayment(String terminalId, Runnable operation) {
+        paymentTerminalExecutors.computeIfAbsent(terminalId, ignored -> Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "DirectCardPayment-" + terminalId);
+            thread.setDaemon(true);
+            return thread;
+        })).execute(operation);
+    }
+
     private static final String TAG = "ForwarderService";
     private static final String CHANNEL_ID = "nembestil_forwarder";
     private static final int NOTIFICATION_ID = 0x4E42; // "NB"
@@ -848,6 +877,10 @@ public class ForwarderService extends Service {
                 socketWorkExecutor.execute(() -> handleTerminalRequest(payload.toString()));
                 return;
             }
+            if ("terminal.direct-cancel".equals(type) && payload != null) {
+                DirectCardPayment.cancel(this, payload.getString("checkoutId"));
+                return;
+            }
             if ("terminal.cancel".equals(type) && payload != null) {
                 handleTerminalCancellation(payload);
                 return;
@@ -1214,6 +1247,7 @@ public class ForwarderService extends Service {
     }
 
     private void advertiseDevices(boolean force) throws Exception {
+        DirectCardPayment.recover(this);
         JSONArray devices = new JSONArray(availablePrinterDevices);
         Map<String, String> terminalNames = new java.util.HashMap<>();
         synchronized (deviceConfigurationLock) {

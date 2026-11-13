@@ -8,7 +8,7 @@ App 1.4.8 builds on the published `apk-1.4.7` source (`b0007f46d0a9dce08b9fe2e70
 
 `capacitor.config.ts` already allows `*.nbpos.eu`. `BridgeReinjector.java` uses that list for native bridge injection, so loading POS 1.4 at the same origin retains native plugin access. The hosted POS supplies its own origin to `ForwarderService.start`; native WebSocket/HTTP forwarding and customer-display URLs follow that installation.
 
-The selected installation's app-version gate still applies. POS 1.4 currently publishes minimum app version `1.4.7` and target/inclusive maximum `1.4.8`; the original APK remains supported for v2 terminals. POS release numbers and Android app release numbers are independent. Do not increase the app requirement merely because the backend moves to Cloudflare.
+The selected installation's app-version gate still applies. POS 1.4 source prepares minimum app version `1.4.7` and target/inclusive maximum `1.4.9` (publish that signed APK before production rollout); the original APK remains supported for v2 terminals. POS release numbers and Android app release numbers are independent. Do not increase the app requirement merely because the backend moves to Cloudflare.
 
 ## Native contracts
 
@@ -41,3 +41,7 @@ After rollback, compare application code, native sources, Capacitor configuratio
 Isolated runs of the POS repository's existing compiled-worker checks verified both outcomes: a report with a different signing key is rejected, and a current legacy-signed report with the shared key populates native device IP/location. Configuration, signed terminal identity/replay checks, native receipt delivery/ACKs and takeaway/booking notifications passed on protocols 3/4. POS resources and hardware were simulated locally; only the public legacy-whoami report was fetched from production. Live signatures from legacy-whoami, a POS 1.3 hostname and the POS 1.4 Koi endpoint were also verified with the same key after the private secret update. This does not replace testing a physical tablet's printer, terminal, notifications or secondary display.
 
 The original rollback did not publish an APK. App 1.4.8 now adds the terminal transport/setup changes documented in [terminal monitoring](payment-terminals.md#samport-v1-and-app-148); publish it before the hosted target changes.
+
+## Optional direct checkout in 1.4.9
+
+App 1.4.9 adds a feature-specific DirectCardPayment bridge and `terminal.direct-cancel` handling. Hosted POS must check both installed version >=1.4.9 and local bridge/reachability support before using it. POS 1.3 and older POS 1.4 implementations continue using the existing socket forwarding contract; protocols 3/4, discovery and native whoami are unchanged. Publish the signed 1.4.9 APK before raising an installation's target/inclusive maximum. POS source prepares target 1.4.9 and retains minimum 1.4.7; production requirements change only with their POS deployment. See [direct checkout](payment-terminals.md#direct-local-checkout-in-app-149).

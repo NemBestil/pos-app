@@ -56,3 +56,5 @@ Read `docs/app-versions.md` for installation version requirements, startup insta
 - `public/` – Static assets (icons, manifest)
 - `nuxt.config.ts` – Nuxt configuration
 - `package.json` – Dependencies and scripts
+
+Direct local card checkout is introduced in app 1.4.9. `DirectCardPayment.java` owns durable once-only submission and result-only retries; its plugin restricts calls to the active installation origin. Share ForwarderService's existing terminal executor/reachability and retain all old socket/forwarding behavior. Read [the direct-checkout contract](docs/payment-terminals.md#direct-local-checkout-in-app-149) before changing these paths.

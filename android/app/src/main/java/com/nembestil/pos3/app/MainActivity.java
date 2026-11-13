@@ -11,6 +11,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(AndroidFullscreenPlugin.class);
         registerPlugin(ApkUpdaterPlugin.class);
         registerPlugin(BluetoothPrinterPlugin.class);
+        registerPlugin(DirectCardPaymentPlugin.class);
         registerPlugin(ForwarderServicePlugin.class);
         registerPlugin(NetworkPrinterPlugin.class);
         registerPlugin(PaymentTerminalDiscoveryPlugin.class);
