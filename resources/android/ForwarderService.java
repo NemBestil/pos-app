@@ -25,6 +25,7 @@ import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
+import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -394,7 +395,7 @@ public class ForwarderService extends Service {
             return START_NOT_STICKY;
         }
 
-        String nextBaseUrl = stripTrailingSlash(requestedBaseUrl);
+        String nextBaseUrl = normalizeInstallationBaseUrl(requestedBaseUrl);
         boolean credentialsChanged = !nextBaseUrl.equals(baseUrl) || !requestedToken.equals(authToken);
         baseUrl = nextBaseUrl;
         authToken = requestedToken;
@@ -2659,8 +2660,13 @@ public class ForwarderService extends Service {
     }
 
     public static String getConfiguredBaseUrl(Context context) {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(PREFS_BASE_URL, null);
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String storedUrl = prefs.getString(PREFS_BASE_URL, null);
+        String baseUrl = normalizeInstallationBaseUrl(storedUrl);
+        if (baseUrl != null && !baseUrl.equals(storedUrl)) {
+            prefs.edit().putString(PREFS_BASE_URL, baseUrl).apply();
+        }
+        return baseUrl;
     }
 
     private static String readAll(InputStream stream) throws Exception {
@@ -2678,6 +2684,18 @@ public class ForwarderService extends Service {
             return null;
         }
         return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+    }
+
+    private static String normalizeInstallationBaseUrl(String url) {
+        if (url == null) return null;
+        String host = Uri.parse(url).getHost();
+        if (host != null) {
+            host = host.toLowerCase(Locale.US);
+            if (host.matches("[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.pos3\\.nemkasse\\.com")) {
+                return "https://" + host.substring(0, host.length() - ".pos3.nemkasse.com".length()) + ".nbpos.eu";
+            }
+        }
+        return stripTrailingSlash(url);
     }
 
     private void sleepQuietly(long millis) {
@@ -3301,9 +3319,10 @@ public class ForwarderService extends Service {
     // ========================================================================
 
     public static void requestStart(Context context, String baseUrl, String token) {
+        baseUrl = normalizeInstallationBaseUrl(baseUrl);
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putString(PREFS_BASE_URL, stripTrailingSlash(baseUrl))
+            .putString(PREFS_BASE_URL, baseUrl)
             .putString(PREFS_TOKEN, token)
             .apply();
         startService(context, baseUrl, token);
@@ -3311,7 +3330,7 @@ public class ForwarderService extends Service {
 
     public static void requestStartIfConfigured(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String baseUrl = prefs.getString(PREFS_BASE_URL, null);
+        String baseUrl = getConfiguredBaseUrl(context);
         String token = prefs.getString(PREFS_TOKEN, null);
         if (baseUrl == null || baseUrl.isEmpty() || token == null || token.isEmpty()) {
             return;

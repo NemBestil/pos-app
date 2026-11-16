@@ -43,9 +43,14 @@ Inspect the WebView through Chrome's `chrome://inspect/#devices` or attach Andro
 Studio's low-overhead profiler. Profiling and WebView inspection are enabled only
 for this variant; normal release builds keep their existing settings.
 
+Always regenerate and sync the web assets before rebuilding a changed launcher.
+Gradle alone reuses the previously copied UI, even when the APK version is current;
+see [local APK verification](docs/app-versions.md#local-apk-rebuilds).
+
 ## Features & Conventions
 
-- **Multi-tenant:** Manage and switch between multiple POS installations.
+- **Multi-tenant:** Manage and switch between multiple POS installations at `*.nbpos.eu`; saved legacy addresses migrate automatically.
+- **Launcher:** Tablet branding and controls use a centered 2/5–3/5 layout with adaptive logo sizes. The selected installation is checked on startup, selection and app return, with network troubleshooting and retry. Missing customer logos stay hidden. See [launcher behavior](docs/launcher.md).
 - **SPA Mode:** Always `ssr: false`.
 - **API:** All requests use `CapacitorHttp` to bypass CORS.
 - **Native:** Bridges printers, scanners, and other native features via Capacitor.

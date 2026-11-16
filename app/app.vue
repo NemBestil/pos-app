@@ -3,9 +3,11 @@ import { CapacitorHttp } from '@capacitor/core'
 import * as Sentry from '@sentry/capacitor'
 import packageJson from '../package.json'
 import type { InstallationAppVersions } from './utils/app-version'
+import { getInstallationBaseUrl, migrateInstallationLogoUrl } from './utils/installation-url'
 
 type Screen = 'launcher' | 'wizard-input' | 'wizard-review' | 'manage'
 type WizardMode = 'launch' | 'manage'
+type ConnectionStatus = 'checking' | 'available' | 'unavailable'
 
 interface InstallationOrganization {
   companyName: string
@@ -19,8 +21,8 @@ interface InstallationOrganization {
 }
 
 interface InstallationBranding {
-  logoFullUrl: string
-  logoSquareUrl: string
+  logoFullUrl: string | null
+  logoSquareUrl: string | null
   brandColor: string
 }
 
@@ -46,7 +48,6 @@ const manageInstallationsValue = '__manage_installations__'
 const appVersion = packageJson.version
 
 const hasLoaded = ref(false)
-const logoVisible = ref(false)
 const screen = ref<Screen>('wizard-input')
 const wizardMode = ref<WizardMode>('launch')
 const installationIdInput = ref('')
@@ -59,6 +60,9 @@ const launcherNotice = ref('')
 const selectedInstallationId = ref('')
 const installations = ref<SavedInstallation[]>([])
 const candidateInstallation = ref<SavedInstallation | null>(null)
+const connectionStatuses = ref<Record<string, ConnectionStatus>>({})
+const pendingConnectionChecks = new Map<string, Promise<Awaited<ReturnType<typeof resolveInstallation>> | null>>()
+const connectionHelp = 'Your device may have a network problem, or the POS may be unavailable. Check that Wi-Fi works or the LAN cable is plugged in. Open a website in Chrome or another browser to check internet access. If needed, restart the device and try again.'
 
 const hasInstallations = computed(() => installations.value.length > 0)
 const sanitizedInstallationId = computed(() => installationIdInput.value.trim())
@@ -136,9 +140,10 @@ useHead(() => ({
   }
 }))
 
-const showTopShellLogo = computed(() => screen.value !== 'launcher')
-
-const showLauncherBranding = computed(() => screen.value === 'launcher' && !!selectedInstallation.value)
+const brandingInstallation = computed(() => screen.value === 'wizard-review'
+  ? candidateInstallation.value
+  : screen.value === 'launcher' ? selectedInstallation.value : null)
+const selectedConnectionStatus = computed(() => connectionStatuses.value[selectedInstallationId.value] ?? 'checking')
 const {
   targetAppVersion,
   minAppVersion,
@@ -162,6 +167,7 @@ onMounted(() => {
     window.history.replaceState(null, '', '/')
   }
   installations.value = readInstallations()
+  persistInstallations()
 
   if (installations.value.length > 0) {
     screen.value = 'launcher'
@@ -170,14 +176,8 @@ onMounted(() => {
   }
 
   hasLoaded.value = true
-  window.setTimeout(() => {
-    logoVisible.value = true
-  }, 80)
-
-  if (installations.value.length > 0) {
-    void synchronizeInstallationMetadata()
-  }
-
+  document.addEventListener('visibilitychange', onLauncherVisibilityChange)
+  window.addEventListener('online', recheckLauncherConnection)
   void initializeUpdatePermissions()
 
   addSentryBreadcrumb('app.lifecycle', 'Shell loaded', {
@@ -187,11 +187,28 @@ onMounted(() => {
   })
 })
 
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', onLauncherVisibilityChange)
+  window.removeEventListener('online', recheckLauncherConnection)
+})
+
+function onLauncherVisibilityChange() {
+  if (document.visibilityState === 'visible') recheckLauncherConnection()
+}
+
+function recheckLauncherConnection() {
+  if (screen.value === 'launcher') void checkSelectedConnection()
+}
+
 watch(screen, (nextScreen, previousScreen) => {
   addSentryBreadcrumb('app.screen', 'Screen changed', {
     from: previousScreen,
     to: nextScreen
   })
+})
+
+watch([screen, selectedInstallationId], () => {
+  if (screen.value === 'launcher') void checkSelectedConnection()
 })
 
 watch(selectedInstallation, (installation) => {
@@ -231,7 +248,7 @@ async function verifyInstallation() {
   isFetchingInstallation.value = true
 
   const id = sanitizedInstallationId.value
-  const preferredBaseUrl = getPreferredInstallationBaseUrl(id)
+  const preferredBaseUrl = getInstallationBaseUrl(id)
 
   addSentryBreadcrumb('app.installation', 'Installation verification started', {
     installationId: id,
@@ -262,7 +279,7 @@ async function verifyInstallation() {
       baseUrl: preferredBaseUrl,
       error: getErrorMessage(error)
     }, 'warning')
-    fetchError.value = 'That installation could not be verified. Check the ID and try again.'
+    fetchError.value = `Could not connect to ${preferredBaseUrl}. Check the installation ID. ${connectionHelp}`
   } finally {
     isFetchingInstallation.value = false
   }
@@ -323,7 +340,7 @@ async function confirmInstallation() {
 
   if (wizardMode.value === 'manage') {
     candidateInstallation.value = null
-    screen.value = 'manage'
+    screen.value = 'launcher'
     return
   }
 
@@ -332,39 +349,25 @@ async function confirmInstallation() {
 }
 
 async function openSelectedInstallation() {
-  if (!selectedInstallation.value || isLaunchingInstallation.value || !isStartupReady.value) {
+  const installation = selectedInstallation.value
+  if (!installation || isLaunchingInstallation.value || !isStartupReady.value) {
     return
   }
 
   launcherError.value = ''
   isLaunchingInstallation.value = true
   addSentryBreadcrumb('app.launch', 'Selected installation launch started', {
-    installationId: selectedInstallation.value.id,
-    baseUrl: selectedInstallation.value.baseUrl
+    installationId: installation.id,
+    baseUrl: installation.baseUrl
   })
 
   try {
-    const { baseUrl, details } = await resolveInstallation(selectedInstallation.value.id)
-
-    installations.value = installations.value.map((installation) => {
-      if (installation.id !== selectedInstallation.value?.id) {
-        return installation
-      }
-
-      return {
-        ...installation,
-        baseUrl,
-        organization: details.organization,
-        branding: details.branding
-      }
-    })
-
-    persistInstallations()
-    await openInstallation(baseUrl, details)
+    const resolved = await checkInstallationConnection(installation.id)
+    if (resolved) await openInstallation(resolved.baseUrl, resolved.details)
   } catch (error) {
     addSentryBreadcrumb('app.launch', 'Selected installation launch failed', {
-      installationId: selectedInstallation.value.id,
-      baseUrl: selectedInstallation.value.baseUrl,
+      installationId: installation.id,
+      baseUrl: installation.baseUrl,
       error: getErrorMessage(error)
     }, 'warning')
     launcherError.value = getErrorMessage(error)
@@ -467,46 +470,12 @@ async function openInstallation(url: string, details: InstallationResponse) {
   window.location.assign(url)
 }
 
-function getPreferredInstallationBaseUrl(id: string) {
-  if (id === 'NGROK') {
-    return 'https://nbpos3.ngrok.dev'
-  }
-
-  return `https://${id}.nbpos.eu`
-}
-
-function getLegacyInstallationBaseUrl(id: string) {
-  if (id === 'NGROK') {
-    return 'https://nbpos3.ngrok.dev'
-  }
-
-  return `https://${id}.pos3.nemkasse.com`
-}
-
 async function resolveInstallation(id: string) {
-  const baseUrls = [...new Set([
-    getPreferredInstallationBaseUrl(id),
-    getLegacyInstallationBaseUrl(id)
-  ])]
-  let lastError: unknown
-
-  for (const baseUrl of baseUrls) {
-    try {
-      return {
-        baseUrl,
-        details: await fetchInstallationDetails(baseUrl)
-      }
-    } catch (error) {
-      lastError = error
-      addSentryBreadcrumb('app.installation', 'Installation domain unavailable', {
-        installationId: id,
-        baseUrl,
-        error: getErrorMessage(error)
-      }, 'warning')
-    }
+  const baseUrl = getInstallationBaseUrl(id)
+  return {
+    baseUrl,
+    details: await fetchInstallationDetails(baseUrl)
   }
-
-  throw lastError
 }
 
 async function fetchInstallationDetails(baseUrl: string) {
@@ -515,7 +484,10 @@ async function fetchInstallationDetails(baseUrl: string) {
   })
 
   const response = await CapacitorHttp.get({
-    url: `${baseUrl}/api/public/installation`
+    url: `${baseUrl}/api/public/installation`,
+    headers: { 'Cache-Control': 'no-cache' },
+    connectTimeout: 5_000,
+    readTimeout: 5_000
   })
 
   addSentryBreadcrumb('app.api', 'Installation details response received', {
@@ -533,68 +505,48 @@ async function fetchInstallationDetails(baseUrl: string) {
     throw new Error('Installation response is incomplete')
   }
 
-  return data as unknown as InstallationResponse
+  return {
+    ...data,
+    branding: normalizeInstallationBranding(data.branding as unknown as InstallationBranding)
+  } as unknown as InstallationResponse
 }
 
-async function synchronizeInstallationMetadata() {
-  const savedInstallations = installations.value
-  const results = await Promise.allSettled(
-    savedInstallations.map(async (installation) => ({
-      id: installation.id,
-      ...await resolveInstallation(installation.id)
-    }))
-  )
+function checkSelectedConnection() {
+  launcherError.value = ''
+  if (selectedInstallationId.value) return checkInstallationConnection(selectedInstallationId.value)
+}
 
-  const resolvedInstallations = new Map<string, {
-    baseUrl: string
-    details: InstallationResponse
-  }>()
-  let failedCount = 0
+function checkInstallationConnection(id: string) {
+  const pending = pendingConnectionChecks.get(id)
+  if (pending) return pending
 
-  results.forEach((result, index) => {
-    const installation = savedInstallations[index]!
-
-    if (result.status === 'fulfilled') {
-      resolvedInstallations.set(result.value.id, {
-        baseUrl: result.value.baseUrl,
-        details: result.value.details
-      })
-      return
-    }
-
-    failedCount += 1
-    addSentryBreadcrumb('app.installation', 'Installation metadata synchronization failed', {
-      installationId: installation.id,
-      baseUrl: installation.baseUrl,
-      error: getErrorMessage(result.reason)
+  connectionStatuses.value[id] = 'checking'
+  const request = resolveInstallation(id).then((resolved) => {
+    installations.value = installations.value.map((installation) => installation.id === id
+      ? {
+          ...installation,
+          baseUrl: resolved.baseUrl,
+          organization: resolved.details.organization,
+          branding: resolved.details.branding
+        }
+      : installation)
+    persistInstallations()
+    connectionStatuses.value[id] = 'available'
+    return resolved
+  }).catch((error: unknown) => {
+    connectionStatuses.value[id] = 'unavailable'
+    addSentryBreadcrumb('app.installation', 'Installation connection check failed', {
+      installationId: id,
+      baseUrl: getInstallationBaseUrl(id),
+      error: getErrorMessage(error)
     }, 'warning')
+    return null
+  }).finally(() => {
+    pendingConnectionChecks.delete(id)
   })
 
-  if (resolvedInstallations.size === 0) {
-    return
-  }
-
-  installations.value = installations.value.map((installation) => {
-    const resolvedInstallation = resolvedInstallations.get(installation.id)
-
-    if (!resolvedInstallation) {
-      return installation
-    }
-
-    return {
-      ...installation,
-      baseUrl: resolvedInstallation.baseUrl,
-      organization: resolvedInstallation.details.organization,
-      branding: resolvedInstallation.details.branding
-    }
-  })
-
-  persistInstallations()
-  setSentryInstallationContext(selectedInstallation.value)
-  addSentryBreadcrumb('app.installation', 'Installation metadata synchronized', {
-    synchronizedCount: resolvedInstallations.size,
-    failedCount
-  })
+  pendingConnectionChecks.set(id, request)
+  return request
 }
 
 function normalizeInstallationResponse(data: unknown) {
@@ -672,14 +624,22 @@ function normalizeSavedInstallations(savedInstallations: Partial<SavedInstallati
   return savedInstallations
     .map((installation) => ({
       id: installation.id ?? '',
-      baseUrl: installation.baseUrl ?? getPreferredInstallationBaseUrl(installation.id ?? ''),
+      baseUrl: getInstallationBaseUrl(installation.id ?? ''),
       addedAt: installation.addedAt ?? new Date().toISOString(),
       lastUsedAt: installation.lastUsedAt ?? null,
       isDefault: hasStoredDefault ? installation.isDefault === true : installation.id === fallbackDefaultId,
       organization: installation.organization as InstallationOrganization,
-      branding: installation.branding as InstallationBranding
+      branding: installation.branding ? normalizeInstallationBranding(installation.branding) : null
     }))
-    .filter((installation) => installation.id && installation.organization && installation.branding)
+    .filter((installation): installation is SavedInstallation => !!(installation.id && installation.organization && installation.branding))
+}
+
+function normalizeInstallationBranding(branding: InstallationBranding): InstallationBranding {
+  return {
+    ...branding,
+    logoFullUrl: migrateInstallationLogoUrl(branding.logoFullUrl),
+    logoSquareUrl: migrateInstallationLogoUrl(branding.logoSquareUrl)
+  }
 }
 
 function hexToRgba(hex: string, alpha: number) {
@@ -758,7 +718,7 @@ function getErrorMessage(error: unknown) {
     <NuxtRouteAnnouncer />
 
     <div
-      class="relative min-h-screen overflow-hidden font-['Avenir_Next',_'Segoe_UI',_sans-serif] text-slate-900 transition duration-500"
+      class="relative min-h-dvh overflow-x-clip font-['Avenir_Next',_'Segoe_UI',_sans-serif] text-slate-900 transition duration-500"
       :style="{ background: appBackground }"
     >
       <div class="pointer-events-none absolute inset-0">
@@ -767,8 +727,8 @@ function getErrorMessage(error: unknown) {
         <div class="absolute bottom-0 left-1/2 h-80 w-80 -translate-x-1/2 rounded-full bg-sky-300/20 blur-3xl" />
       </div>
 
-      <main class="relative flex min-h-screen items-center justify-center px-4 py-10 sm:px-6">
-        <div class="w-full max-w-5xl">
+      <main class="relative flex min-h-dvh items-center justify-center px-4 py-[clamp(0.75rem,3dvh,2rem)] sm:px-6">
+        <div class="w-full max-w-6xl">
           <UAlert
             v-if="launcherNotice"
             color="warning"
@@ -779,376 +739,348 @@ function getErrorMessage(error: unknown) {
             class="mb-6"
           />
           <UAlert v-if="startupError" color="error" :title="startupError" class="mb-6" />
-          <div v-if="showTopShellLogo" class="mb-10 flex flex-col items-center text-center">
-            <img
-              src="/logo-singleline.svg"
-              alt="NemBestil"
-              class="h-14 w-auto origin-center transition duration-500 ease-out sm:h-16"
-              :class="logoVisible ? 'translate-y-0 scale-100 opacity-100' : 'translate-y-4 scale-95 opacity-0'"
-            >
-            <p
-              class="mt-3 text-xs font-semibold uppercase tracking-[0.6em] text-slate-500 transition duration-500 ease-out delay-100"
-              :class="logoVisible ? 'translate-y-0 opacity-100' : 'translate-y-3 opacity-0'"
-            >
-              POS
-            </p>
-            <p
-              class="mt-2 text-xs font-semibold tracking-[0.08em] text-slate-400 transition duration-500 ease-out delay-150"
-              :class="logoVisible ? 'translate-y-0 opacity-100' : 'translate-y-3 opacity-0'"
-            >
-              App version {{ appVersion }}.
-            </p>
-          </div>
-
-          <Transition
-            mode="out-in"
-            enter-active-class="transform transition duration-400 ease-out"
-            enter-from-class="translate-y-4 opacity-0"
-            enter-to-class="translate-y-0 opacity-100"
-            leave-active-class="transform transition duration-300 ease-in"
-            leave-from-class="translate-y-0 opacity-100"
-            leave-to-class="-translate-y-2 opacity-0"
+          <div
+            class="grid items-center gap-[clamp(1rem,4dvh,3rem)]"
+            :class="screen !== 'manage' ? 'min-[600px]:grid-cols-[2fr_3fr]' : ''"
           >
-            <section
-              v-if="hasLoaded"
-              :key="screen"
-              class="mx-auto"
-              :class="screen === 'launcher'
-                ? 'max-w-3xl'
-                : 'rounded-[2rem] border border-white/70 bg-white/80 p-6 shadow-[0_24px_80px_rgba(15,23,42,0.12)] backdrop-blur xl:p-8'"
+            <aside
+              class="flex min-w-0 flex-col items-center justify-center gap-[clamp(0.5rem,3dvh,1.5rem)] text-center"
+              :class="screen === 'manage' ? 'flex-row gap-3' : ''"
             >
-              <div v-if="screen === 'wizard-input'" class="mx-auto max-w-2xl">
-                <div class="space-y-3 text-center">
-                  <p class="text-sm font-semibold uppercase tracking-[0.3em] text-emerald-700">Configuration</p>
-                  <h1 class="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">Welcome to POS</h1>
-                  <p class="text-balance text-base leading-7 text-slate-600">
-                    Enter the installation ID provided by NemBestil ApS. The ID may use A-Z, 0-9 and dashes, and it cannot start or end with a dash.
-                  </p>
-                </div>
-
-                <form class="mt-10 space-y-5" @submit.prevent="verifyInstallation">
-                  <label class="block space-y-2">
-                    <span class="text-sm font-medium text-slate-700">Installation ID</span>
-                    <input
-                      :value="installationIdInput"
-                      type="text"
-                      inputmode="text"
-                      autocomplete="off"
-                      spellcheck="false"
-                      placeholder="ABC-123"
-                      class="w-full rounded-2xl border border-slate-200 bg-white px-5 py-4 text-lg font-medium uppercase tracking-[0.18em] text-slate-950 outline-none transition duration-200 placeholder:text-slate-400 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-100"
-                      :class="validationMessage || fetchError ? 'border-rose-300 focus:border-rose-500 focus:ring-rose-100' : ''"
-                      @input="onInstallationIdInput"
-                      @blur="installationIdTouched = true"
-                    >
-                  </label>
-
-                  <p v-if="validationMessage" class="text-sm text-rose-600">
-                    {{ validationMessage }}
-                  </p>
-                  <p v-else-if="fetchError" class="text-sm text-rose-600">
-                    {{ fetchError }}
-                  </p>
-                  <p v-else class="text-sm text-slate-500">
-                    Example: <span class="font-medium text-slate-700">STORE-42</span>
-                  </p>
-
-                  <div class="flex flex-col gap-3 pt-3 sm:flex-row sm:justify-center">
-                    <button
-                      v-if="wizardMode === 'manage'"
-                      type="button"
-                      class="inline-flex min-h-13 items-center justify-center rounded-2xl border border-slate-200 px-6 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-50"
-                      @click="goBackFromWizard"
-                    >
-                      Back
-                    </button>
-                    <button
-                      type="submit"
-                      class="inline-flex min-h-13 items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
-                      :disabled="isFetchingInstallation"
-                    >
-                      {{ isFetchingInstallation ? 'Checking installation...' : submitLabel }}
-                    </button>
-                  </div>
-                </form>
+              <CustomerLogo
+                v-if="brandingInstallation"
+                :src="brandingInstallation.branding.logoFullUrl"
+                :alt="brandingInstallation.organization.companyName"
+                class="max-h-[16dvh] w-auto max-w-full object-contain min-[600px]:max-h-[min(30dvh,14rem)]"
+              />
+              <div class="flex flex-col items-center gap-[clamp(0.25rem,1dvh,0.75rem)]">
+                <img
+                  src="/logo-singleline.svg"
+                  alt="NemBestil"
+                  class="h-[clamp(1.5rem,6dvh,3.5rem)] max-w-full object-contain"
+                >
+                <p class="text-[11px] font-semibold uppercase tracking-[0.5em] text-slate-600">POS</p>
+                <p class="text-[11px] font-semibold tracking-wide text-slate-500">App version {{ appVersion }}</p>
               </div>
+            </aside>
 
-              <div v-else-if="screen === 'wizard-review' && candidateInstallation" class="mx-auto max-w-4xl space-y-8">
-                <div class="space-y-3 text-center">
-                  <p class="text-sm font-semibold uppercase tracking-[0.3em] text-emerald-700">Verify installation</p>
-                  <h1 class="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">
-                    Confirm the organization details
-                  </h1>
-                  <p class="text-base leading-7 text-slate-600">
-                    Make sure this matches the organization connected to <span class="font-semibold text-slate-800">{{ candidateInstallation.id }}</span>.
-                  </p>
+            <Transition
+              mode="out-in"
+              enter-active-class="transform transition duration-400 ease-out"
+              enter-from-class="translate-y-4 opacity-0"
+              enter-to-class="translate-y-0 opacity-100"
+              leave-active-class="transform transition duration-300 ease-in"
+              leave-from-class="translate-y-0 opacity-100"
+              leave-to-class="-translate-y-2 opacity-0"
+            >
+              <section
+                v-if="hasLoaded"
+                :key="screen"
+                class="mx-auto"
+                :class="screen === 'launcher'
+                  ? 'w-full min-w-0'
+                  : 'w-full min-w-0 rounded-[2rem] border border-white/70 bg-white/80 p-[clamp(1rem,3dvh,2rem)] shadow-[0_24px_80px_rgba(15,23,42,0.12)] backdrop-blur'"
+              >
+                <div v-if="screen === 'wizard-input'" class="mx-auto max-w-2xl">
+                  <div class="space-y-3 text-center">
+                    <p class="text-sm font-semibold uppercase tracking-[0.3em] text-emerald-700">Configuration</p>
+                    <h1 class="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">Welcome to POS</h1>
+                    <p class="text-balance text-base leading-7 text-slate-600">
+                      Enter the installation ID provided by NemBestil ApS. Use A-Z, 0-9 and dashes.
+                    </p>
+                  </div>
+
+                  <form class="mt-[clamp(1rem,4dvh,2rem)] space-y-4" @submit.prevent="verifyInstallation">
+                    <label class="block space-y-2">
+                      <span class="text-sm font-medium text-slate-700">Installation ID</span>
+                      <input
+                        :value="installationIdInput"
+                        type="text"
+                        inputmode="text"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="ABC-123"
+                        class="w-full rounded-2xl border border-slate-200 bg-white px-5 py-4 text-lg font-medium uppercase tracking-[0.18em] text-slate-950 outline-none transition duration-200 placeholder:text-slate-400 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-100"
+                        :class="validationMessage || fetchError ? 'border-rose-300 focus:border-rose-500 focus:ring-rose-100' : ''"
+                        @input="onInstallationIdInput"
+                        @blur="installationIdTouched = true"
+                      >
+                    </label>
+
+                    <p v-if="validationMessage" class="text-sm text-rose-600">
+                      {{ validationMessage }}
+                    </p>
+                    <p v-else-if="fetchError" class="text-sm text-rose-600">
+                      {{ fetchError }}
+                    </p>
+                    <p v-else class="text-sm text-slate-500">
+                      Example: <span class="font-medium text-slate-700">STORE-42</span>
+                    </p>
+
+                    <div class="flex flex-col gap-3 pt-3 sm:flex-row sm:justify-center">
+                      <button
+                        v-if="wizardMode === 'manage'"
+                        type="button"
+                        class="inline-flex min-h-13 items-center justify-center rounded-2xl border border-slate-200 px-6 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-50"
+                        @click="goBackFromWizard"
+                      >
+                        Back
+                      </button>
+                      <button
+                        type="submit"
+                        class="inline-flex min-h-13 items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                        :disabled="isFetchingInstallation"
+                      >
+                        {{ isFetchingInstallation ? 'Checking installation...' : submitLabel }}
+                      </button>
+                    </div>
+                  </form>
                 </div>
 
-                <div class="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
-                  <div class="overflow-hidden rounded-[1.75rem] border border-slate-200 bg-white shadow-sm">
-                    <div
-                      class="aspect-[3/1] border-b border-white/20 px-6 py-4"
-                      :style="{ backgroundColor: candidateInstallation.branding.brandColor }"
-                    >
-                      <img
-                        :src="candidateInstallation.branding.logoFullUrl"
-                        :alt="candidateInstallation.organization.companyName"
-                        class="h-full w-full object-contain"
-                      >
+                <div v-else-if="screen === 'wizard-review' && candidateInstallation" class="mx-auto max-w-4xl space-y-8">
+                  <div class="space-y-3 text-center">
+                    <p class="text-sm font-semibold uppercase tracking-[0.3em] text-emerald-700">Verify installation</p>
+                    <h1 class="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">
+                      Confirm the organization details
+                    </h1>
+                    <p class="text-base leading-7 text-slate-600">
+                      Make sure this matches the organization connected to <span class="font-semibold text-slate-800">{{ candidateInstallation.id }}</span>.
+                    </p>
+                  </div>
+
+                  <div class="grid gap-4 min-[1200px]:grid-cols-[1.15fr_0.85fr]">
+                    <div class="overflow-hidden rounded-[1.75rem] border border-slate-200 bg-white shadow-sm">
+                      <div class="space-y-5 p-6">
+                        <div>
+                          <p class="text-sm font-semibold uppercase tracking-[0.24em] text-slate-500">Organization</p>
+                          <h2 class="mt-2 text-2xl font-semibold text-slate-950">
+                            {{ candidateInstallation.organization.storeName }}
+                          </h2>
+                          <p class="mt-1 text-base text-slate-600">
+                            {{ candidateInstallation.organization.companyName }}
+                          </p>
+                        </div>
+
+                        <dl class="grid gap-4 sm:grid-cols-2">
+                          <div class="rounded-2xl bg-slate-50 p-4">
+                            <dt class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Address</dt>
+                            <dd class="mt-2 text-sm leading-6 text-slate-700">
+                              {{ candidateInstallation.organization.address }}<br>
+                              {{ candidateInstallation.organization.postal }} {{ candidateInstallation.organization.city }}<br>
+                              {{ candidateInstallation.organization.country }}
+                            </dd>
+                          </div>
+                          <div class="rounded-2xl bg-slate-50 p-4">
+                            <dt class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Business</dt>
+                            <dd class="mt-2 text-sm leading-6 text-slate-700">
+                              VAT {{ candidateInstallation.organization.vatNumber }}<br>
+                              Currency {{ candidateInstallation.organization.mainCurrency }}<br>
+                              ID {{ candidateInstallation.id }}
+                            </dd>
+                          </div>
+                        </dl>
+                      </div>
                     </div>
-                    <div class="space-y-5 p-6">
-                      <div>
-                        <p class="text-sm font-semibold uppercase tracking-[0.24em] text-slate-500">Organization</p>
-                        <h2 class="mt-2 text-2xl font-semibold text-slate-950">
-                          {{ candidateInstallation.organization.storeName }}
-                        </h2>
-                        <p class="mt-1 text-base text-slate-600">
-                          {{ candidateInstallation.organization.companyName }}
+
+                    <div class="flex flex-col justify-between gap-6 rounded-[1.75rem] border border-slate-200 bg-slate-50 p-6">
+                      <div class="space-y-4">
+                        <p class="text-sm font-semibold uppercase tracking-[0.24em] text-slate-500">What happens next</p>
+                        <p class="text-base leading-7 text-slate-700">
+                          {{
+                            wizardMode === 'manage'
+                              ? 'Confirm to save this installation to the device. You will return to the home screen with this installation selected.'
+                              : 'Confirm to open this installation and continue into the POS.'
+                          }}
                         </p>
                       </div>
 
-                      <dl class="grid gap-4 sm:grid-cols-2">
-                        <div class="rounded-2xl bg-slate-50 p-4">
-                          <dt class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Address</dt>
-                          <dd class="mt-2 text-sm leading-6 text-slate-700">
-                            {{ candidateInstallation.organization.address }}<br>
-                            {{ candidateInstallation.organization.postal }} {{ candidateInstallation.organization.city }}<br>
-                            {{ candidateInstallation.organization.country }}
-                          </dd>
-                        </div>
-                        <div class="rounded-2xl bg-slate-50 p-4">
-                          <dt class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Business</dt>
-                          <dd class="mt-2 text-sm leading-6 text-slate-700">
-                            VAT {{ candidateInstallation.organization.vatNumber }}<br>
-                            Currency {{ candidateInstallation.organization.mainCurrency }}<br>
-                            ID {{ candidateInstallation.id }}
-                          </dd>
-                        </div>
-                      </dl>
+                      <div class="flex flex-col gap-3">
+                        <button
+                          type="button"
+                          class="inline-flex min-h-13 items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-100"
+                          @click="goBackToInput"
+                        >
+                          Go back
+                        </button>
+                        <button
+                          type="button"
+                          class="inline-flex min-h-13 items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800"
+                          :disabled="!isStartupReady || isLaunchingInstallation"
+                          @click="confirmInstallation"
+                        >
+                          {{ reviewConfirmLabel }}
+                        </button>
+                      </div>
                     </div>
-                  </div>
-
-                  <div class="flex flex-col justify-between gap-6 rounded-[1.75rem] border border-slate-200 bg-slate-50 p-6">
-                    <div class="space-y-4">
-                      <p class="text-sm font-semibold uppercase tracking-[0.24em] text-slate-500">What happens next</p>
-                      <p class="text-base leading-7 text-slate-700">
-                        {{
-                          wizardMode === 'manage'
-                            ? 'Confirm to save this installation to the device. You will return to the installation list afterward.'
-                            : 'Confirm to open this installation and continue into the POS.'
-                        }}
-                      </p>
-                    </div>
-
-                    <div class="flex flex-col gap-3">
-                      <button
-                        type="button"
-                        class="inline-flex min-h-13 items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-100"
-                        @click="goBackToInput"
-                      >
-                        Go back
-                      </button>
-                      <button
-                        type="button"
-                        class="inline-flex min-h-13 items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800"
-                        :disabled="!isStartupReady || isLaunchingInstallation"
-                        @click="confirmInstallation"
-                      >
-                        {{ reviewConfirmLabel }}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div v-else-if="screen === 'launcher'" class="mx-auto max-w-3xl space-y-6">
-                <div v-if="showLauncherBranding" class="flex justify-center">
-                  <div
-                    class="flex aspect-[3/1] w-full max-w-xl items-center justify-center px-8 py-6"
-                  >
-                    <img
-                      :src="selectedInstallation?.branding.logoFullUrl"
-                      :alt="selectedInstallation?.organization.companyName"
-                      class="h-full w-full object-contain"
-                    >
                   </div>
                 </div>
 
                 <div
-                  v-if="selectedInstallation"
-                  class="space-y-6 rounded-[2rem] border border-white/70 bg-white/80 p-6 shadow-[0_24px_80px_rgba(15,23,42,0.12)] backdrop-blur xl:p-8"
+                  v-else-if="screen === 'launcher' && selectedInstallation"
+                  class="space-y-[clamp(0.75rem,2dvh,1.25rem)] rounded-[2rem] border border-white/70 bg-white/80 p-[clamp(1rem,3dvh,2rem)] shadow-[0_24px_80px_rgba(15,23,42,0.12)] backdrop-blur"
                 >
-                  <div class="space-y-6">
-                    <div>
-                      <USelect
-                        v-model="launcherSelectionValue"
-                        :disabled="isLaunchingInstallation"
-                        :items="installationOptions"
-                        size="xl"
-                        color="neutral"
-                        variant="none"
-                        class="w-full"
-                        :ui="{
-                          base: 'min-h-0 px-0 py-0 text-left shadow-none ring-0',
-                          value: 'text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl',
-                          trailing: 'pe-0',
-                          trailingIcon: 'size-6 text-slate-500',
-                          content: 'rounded-2xl'
-                        }"
-                      />
-                    </div>
+                  <USelect
+                    v-model="launcherSelectionValue"
+                    aria-label="Select installation or manage installations"
+                    :disabled="isLaunchingInstallation"
+                    :items="installationOptions"
+                    size="xl"
+                    color="neutral"
+                    variant="none"
+                    class="w-full"
+                    :ui="{
+                      base: 'min-h-11 px-0 py-0 text-left shadow-none ring-0',
+                      value: 'text-xl font-semibold tracking-tight text-slate-950 sm:text-2xl',
+                      trailing: 'pe-0',
+                      trailingIcon: 'size-6 text-slate-500',
+                      content: 'rounded-2xl'
+                    }"
+                  />
 
-                    <div class="space-y-4">
-                      <p class="text-sm text-slate-600">
-                        {{ getInstallationSubtitle(selectedInstallation) }}
+                  <div class="space-y-1 text-sm text-slate-600">
+                    <p>{{ getInstallationSubtitle(selectedInstallation) }}</p>
+                    <p v-if="selectedInstallation.organization.storeName !== selectedInstallation.organization.companyName">
+                      {{ selectedInstallation.organization.companyName }}
+                    </p>
+                    <p class="break-all font-medium text-slate-800">{{ selectedInstallation.baseUrl }}</p>
+                    <p class="text-xs">
+                      VAT {{ selectedInstallation.organization.vatNumber }} · {{ selectedInstallation.organization.mainCurrency }}
+                    </p>
+                  </div>
+
+                  <div
+                    v-if="selectedConnectionStatus === 'unavailable'"
+                    role="alert"
+                    class="rounded-2xl bg-rose-50 px-4 pt-3 text-sm text-rose-950 ring-1 ring-rose-200"
+                  >
+                    <p class="font-semibold">Cannot connect to your POS</p>
+                    <p class="mt-1 leading-5">{{ connectionHelp }}</p>
+                    <button
+                      type="button"
+                      class="inline-flex min-h-11 items-center gap-2 font-semibold underline underline-offset-4"
+                      @click="checkSelectedConnection"
+                    >
+                      <Icon name="lucide:refresh-cw" class="size-4" />
+                      Try again
+                    </button>
+                  </div>
+                  <p v-else role="status" class="flex items-center gap-2 text-sm text-slate-600">
+                    <Icon
+                      :name="selectedConnectionStatus === 'checking' ? 'lucide:loader-circle' : 'lucide:circle-check'"
+                      class="size-5 shrink-0"
+                      :class="selectedConnectionStatus === 'checking' ? 'animate-spin' : 'text-success'"
+                    />
+                    {{ selectedConnectionStatus === 'checking' ? 'Checking connection to your POS…' : 'Connected to your POS' }}
+                  </p>
+
+                  <p v-if="launcherError" role="alert" class="text-sm text-rose-600">{{ launcherError }}</p>
+
+                  <button
+                    type="button"
+                    class="inline-flex min-h-13 w-full items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    :disabled="isLaunchingInstallation || !isStartupReady || selectedConnectionStatus !== 'available'"
+                    @click="openSelectedInstallation"
+                  >
+                    {{ isLaunchingInstallation ? 'Checking installation...' : 'Open POS' }}
+                  </button>
+                </div>
+
+                <div v-else-if="screen === 'manage'" class="mx-auto max-w-5xl space-y-8">
+                  <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+                    <div class="space-y-2">
+                      <p class="text-sm font-semibold uppercase tracking-[0.3em] text-emerald-700">Manage installations</p>
+                      <h1 class="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">Saved installations</h1>
+                      <p class="text-base leading-7 text-slate-600">
+                        Add a new installation or remove one from this device.
                       </p>
-                      <div class="space-y-1 text-sm text-slate-600">
-                        <p>{{ selectedInstallation.organization.companyName }}</p>
-                        <p>
-                          {{ selectedInstallation.organization.postal }}
-                          {{ selectedInstallation.organization.city }},
-                          {{ selectedInstallation.organization.country }}
-                        </p>
-                        <p>VAT {{ selectedInstallation.organization.vatNumber }}</p>
-                        <p>Currency {{ selectedInstallation.organization.mainCurrency }}</p>
-                      </div>
                     </div>
 
-                    <p v-if="launcherError" class="text-sm text-rose-600">
-                      {{ launcherError }}
-                    </p>
-
-                    <button
-                      type="button"
-                      class="inline-flex min-h-13 w-full items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
-                      :disabled="isLaunchingInstallation || !isStartupReady"
-                      @click="openSelectedInstallation"
-                    >
-                      {{ isLaunchingInstallation ? 'Checking installation...' : 'Open POS' }}
-                    </button>
-                  </div>
-                </div>
-
-                <div class="flex flex-col items-center gap-3 pt-2 text-center">
-                  <img
-                    src="/logo-singleline.svg"
-                    alt="NemBestil"
-                    class="h-10 w-auto origin-center transition duration-500 ease-out sm:h-12"
-                    :class="logoVisible ? 'translate-y-0 scale-100 opacity-100' : 'translate-y-4 scale-95 opacity-0'"
-                  >
-                  <p
-                    class="text-[11px] font-semibold uppercase tracking-[0.52em] text-slate-600 transition duration-500 ease-out delay-100"
-                    :class="logoVisible ? 'translate-y-0 opacity-100' : 'translate-y-3 opacity-0'"
-                  >
-                    POS
-                  </p>
-                  <p
-                    class="text-[11px] font-semibold tracking-[0.08em] text-slate-400 transition duration-500 ease-out delay-150"
-                    :class="logoVisible ? 'translate-y-0 opacity-100' : 'translate-y-3 opacity-0'"
-                  >
-                    App version {{ appVersion }}.
-                  </p>
-                </div>
-              </div>
-
-              <div v-else-if="screen === 'manage'" class="mx-auto max-w-5xl space-y-8">
-                <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-                  <div class="space-y-2">
-                    <p class="text-sm font-semibold uppercase tracking-[0.3em] text-emerald-700">Manage installations</p>
-                    <h1 class="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">Saved installations</h1>
-                    <p class="text-base leading-7 text-slate-600">
-                      Add a new installation or remove one from this device.
-                    </p>
+                    <div class="flex flex-col gap-3 sm:flex-row">
+                      <button
+                        v-if="hasInstallations"
+                        type="button"
+                        class="inline-flex min-h-13 items-center justify-center rounded-2xl border border-slate-200 px-6 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-50"
+                        @click="leaveManageScreen"
+                      >
+                        Back
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-flex min-h-13 items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800"
+                        @click="startWizard('manage')"
+                      >
+                        Add installation
+                      </button>
+                    </div>
                   </div>
 
-                  <div class="flex flex-col gap-3 sm:flex-row">
-                    <button
-                      v-if="hasInstallations"
-                      type="button"
-                      class="inline-flex min-h-13 items-center justify-center rounded-2xl border border-slate-200 px-6 text-sm font-semibold text-slate-700 transition duration-200 hover:border-slate-300 hover:bg-slate-50"
-                      @click="leaveManageScreen"
-                    >
-                      Back
-                    </button>
-                    <button
-                      type="button"
-                      class="inline-flex min-h-13 items-center justify-center rounded-2xl bg-slate-950 px-6 text-sm font-semibold text-white transition duration-200 hover:bg-slate-800"
-                      @click="startWizard('manage')"
-                    >
-                      Add installation
-                    </button>
-                  </div>
-                </div>
-
-                <div class="overflow-hidden rounded-[1.75rem] border border-slate-200 bg-white shadow-sm">
-                  <div v-if="installations.length > 0" class="overflow-x-auto">
-                    <table class="min-w-full divide-y divide-slate-200">
-                      <thead class="bg-slate-50">
-                        <tr class="text-left">
-                          <th class="px-6 py-4 text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Organization</th>
-                          <th class="px-6 py-4 text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody class="divide-y divide-slate-100">
-                        <tr
-                          v-for="installation in installations"
-                          :key="installation.id"
-                          class="align-top"
-                        >
-                          <td class="px-6 py-5">
-                            <div class="flex items-start gap-4">
-                              <div
-                                class="flex h-14 w-20 shrink-0 items-center justify-center rounded-2xl px-3"
-                                :style="{ backgroundColor: installation.branding.brandColor }"
-                              >
-                                <img
+                  <div class="overflow-hidden rounded-[1.75rem] border border-slate-200 bg-white shadow-sm">
+                    <div v-if="installations.length > 0" class="overflow-x-auto">
+                      <table class="min-w-full divide-y divide-slate-200">
+                        <thead class="bg-slate-50">
+                          <tr class="text-left">
+                            <th class="px-6 py-4 text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Organization</th>
+                            <th class="px-6 py-4 text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-100">
+                          <tr
+                            v-for="installation in installations"
+                            :key="installation.id"
+                            class="align-top"
+                          >
+                            <td class="px-6 py-5">
+                              <div class="flex items-start gap-4">
+                                <CustomerLogo
                                   :src="installation.branding.logoFullUrl"
                                   :alt="installation.organization.companyName"
-                                  class="max-h-8 w-full object-contain"
+                                  :style="{ backgroundColor: installation.branding.brandColor }"
+                                  class="max-h-14 w-20 shrink-0 rounded-2xl px-3 py-2 object-contain"
+                                />
+                                <div>
+                                  <p class="font-semibold text-slate-900">
+                                    {{ getInstallationLabel(installation) }}
+                                  </p>
+                                  <p class="mt-1 text-sm text-slate-600">{{ getInstallationSubtitle(installation) }}</p>
+                                  <p class="mt-1 break-all text-sm font-medium text-slate-700">{{ installation.baseUrl }}</p>
+                                </div>
+                              </div>
+                            </td>
+                            <td class="px-6 py-5">
+                              <div class="flex flex-wrap gap-3">
+                                <button
+                                  type="button"
+                                  class="inline-flex min-h-11 items-center justify-center rounded-2xl border px-4 text-sm font-semibold transition duration-200"
+                                  :class="installation.isDefault ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-700 hover:border-slate-300 hover:bg-slate-50'"
+                                  @click="setDefaultInstallation(installation.id)"
                                 >
+                                  {{ installation.isDefault ? 'Default' : 'Set as default' }}
+                                </button>
+                                <button
+                                  type="button"
+                                  class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-rose-200 px-4 text-sm font-semibold text-rose-700 transition duration-200 hover:bg-rose-50"
+                                  @click="removeInstallation(installation.id)"
+                                >
+                                  Remove
+                                </button>
                               </div>
-                              <div>
-                                <p class="font-semibold text-slate-900">
-                                  {{ getInstallationLabel(installation) }}
-                                </p>
-                                <p class="mt-1 text-sm text-slate-600">{{ getInstallationSubtitle(installation) }}</p>
-                              </div>
-                            </div>
-                          </td>
-                          <td class="px-6 py-5">
-                            <div class="flex flex-wrap gap-3">
-                              <button
-                                type="button"
-                                class="inline-flex min-h-11 items-center justify-center rounded-2xl border px-4 text-sm font-semibold transition duration-200"
-                                :class="installation.isDefault ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-700 hover:border-slate-300 hover:bg-slate-50'"
-                                @click="setDefaultInstallation(installation.id)"
-                              >
-                                {{ installation.isDefault ? 'Default' : 'Set as default' }}
-                              </button>
-                              <button
-                                type="button"
-                                class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-rose-200 px-4 text-sm font-semibold text-rose-700 transition duration-200 hover:bg-rose-50"
-                                @click="removeInstallation(installation.id)"
-                              >
-                                Remove
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
 
-                  <div v-else class="space-y-3 px-6 py-12 text-center">
-                    <p class="text-lg font-semibold text-slate-900">No installations saved yet</p>
-                    <p class="text-sm leading-6 text-slate-600">
-                      Add an installation to make this device ready for POS.
-                    </p>
+                    <div v-else class="space-y-3 px-6 py-12 text-center">
+                      <p class="text-lg font-semibold text-slate-900">No installations saved yet</p>
+                      <p class="text-sm leading-6 text-slate-600">
+                        Add an installation to make this device ready for POS.
+                      </p>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </section>
-          </Transition>
+              </section>
+            </Transition>
+          </div>
         </div>
       </main>
     </div>

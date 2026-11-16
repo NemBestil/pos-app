@@ -6,7 +6,7 @@ Light app shell for the POS system, responsible for making the POS available on 
 
 ## Coding Style
 
-- Prioritize Nuxt 4 and Nuxt UI v4 patterns. Preserve compatibility with both POS 1.3 and Cloudflare 1.4 backends, including legacy installation domains and Android socket contracts.
+- Prioritize Nuxt 4 and Nuxt UI v4 patterns. Preserve compatibility with both POS 1.3 and Cloudflare 1.4 backends, including Android socket contracts. Installation discovery/navigation uses only `*.nbpos.eu` (plus the explicit NGROK development alias); never restore a legacy-domain fallback.
 - Limit defensive coding: Keep the codebase clean and maintainable.
 - Future implementation: Use TODO comments for planned methods/features and remove them once implemented.
 
@@ -24,7 +24,8 @@ Light app shell for the POS system, responsible for making the POS available on 
 - Composables: Shared logic in `app/composables`.
 - Platform Bridging: Use Capacitor for native features (printers, scanners, etc.).
 - Flow: Login Screen -> Webview/URL Load -> Capacitor Interop.
-- Backend compatibility: Read `docs/backend-compatibility.md` before changing installation discovery, allowed navigation, native bridge origins or backend-specific service configuration. Published app 1.4.7 already uses nbpos.eu; the service-router selects registered POS 1.4 installations. Keep the original discovery and native service behavior. The APK's whoami URL is fixed; it does not consume `configuration.snapshot.networkAttestationUrl`. Production POS 1.4 must retain the POS 1.3/legacy-whoami key server-side so native location reports remain valid. Coordinate key changes on the POS side; the APK never receives the signing key.
+- Launcher: Read `docs/launcher.md` before changing login layout, connection checks, saved installations or customer logos. Keep tablet branding in the left 2/5 column, controls in the right 3/5, and logos bounded by viewport height.
+- Backend compatibility: Read `docs/backend-compatibility.md` before changing installation discovery, allowed navigation, native bridge origins or backend-specific service configuration. Published app 1.4.7 already uses nbpos.eu; the service-router selects registered POS 1.4 installations. Keep native service contracts; migrate saved legacy installation origins to `nbpos.eu` without a fallback. The external native whoami URL remains independent of installation navigation. The APK's whoami URL is fixed; it does not consume `configuration.snapshot.networkAttestationUrl`. Production POS 1.4 must retain the POS 1.3/legacy-whoami key server-side so native location reports remain valid. Coordinate key changes on the POS side; the APK never receives the signing key.
 - android/ is ephemeral: Place new Android source files in resources/, symlink it into android/... and apply changes to other android/-files using scripts/android-patch.sh.
 - Receipt printing: Read `docs/receipt-printing.md` before changing direct print delivery, printer queues, byte transfers or cuts. `ForwarderService` owns per-printer FIFO/ACKs and `PrinterJobWriter` owns queued ESC/POS completion checks, body/feed/CUT order and Bluetooth pacing.
 - LAN printer setup: Read `docs/network-printers.md` before changing network scanning or Xprinter recovery. Keep UDP-only identities separate from ordinary scan results, capability-gate hosted opt-in, require MAC confirmation, and verify the exact MAC/TCP connection before promotion. Automatic IP acquisition does not prove persistent DHCP.

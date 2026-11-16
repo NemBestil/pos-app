@@ -9,8 +9,6 @@ const config: CapacitorConfig = {
   server: {
     allowNavigation: [
       '*.nbpos.eu',
-      '*.pos3.nemkasse.com',
-      '*.nemkasse.com',
       'nbpos3.ngrok.dev',
     ]
   },
