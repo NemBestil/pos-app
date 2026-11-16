@@ -58,6 +58,8 @@ App 1.4.7 is based on 1.4.5. Terminal TCP checks and forwarded HTTP calls use An
 
 USB access supports Android's **Always use** choice so the system can restore printer access after a reconnect or reboot. Existing installations need the updated APK and one new approval with this option; see [USB setup and implementation](docs/usb-access.md).
 
+LAN printer setup optionally discovers Xprinter interfaces with incorrect IPs and requests a correct automatic IP after MAC confirmation. The hosted POS and APK can roll out independently; existing scanning remains the fallback. See [network discovery and recovery](docs/network-printers.md) for the bridge contract and outstanding hardware acceptance.
+
 Direct receipts use app-owned feed/CUT and a 1,000 ms pause between documents/jobs from app 1.4.2. ESC/POS receipts over Bluetooth, LAN and USB use queued completion status when available. App 1.4.3 caps recovery at 15 seconds per receipt, including the final 1-second pause, and proceeds without a status reply; see [receipt printing and native transfer ownership](docs/receipt-printing.md). Native cuts require app 1.4.1 or newer and the matching POS socket protocol 4.
 
 ### Service lifecycle

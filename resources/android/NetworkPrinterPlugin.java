@@ -1,6 +1,8 @@
 package com.nembestil.pos3.app;
 
 import android.util.Base64;
+import android.net.Network;
+import android.os.SystemClock;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -23,6 +25,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.UUID;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -64,6 +69,31 @@ public class NetworkPrinterPlugin extends Plugin {
 
     private final AtomicBoolean scanning = new AtomicBoolean(false);
     private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
+    private final AtomicBoolean repairing = new AtomicBoolean(false);
+    private final AtomicBoolean repairCancelRequested = new AtomicBoolean(false);
+    private final Map<String, UdpCandidate> repairCandidates = new LinkedHashMap<>();
+    private volatile XprinterDiscovery scanDiscovery;
+    private volatile XprinterDiscovery repairDiscovery;
+
+    private static final class UdpCandidate {
+        final XprinterDiscovery.Printer printer;
+        final Network network;
+        UdpCandidate(XprinterDiscovery.Printer printer, Network network) {
+            this.printer = printer;
+            this.network = network;
+        }
+    }
+
+    private static final class ScanState {
+        final String id;
+        final boolean includeUdp;
+        final Map<String, FoundPrinter> normal = new LinkedHashMap<>();
+        final Map<String, UdpCandidate> udp = new LinkedHashMap<>();
+        final AtomicBoolean udpFinished = new AtomicBoolean(true);
+        volatile boolean udpUnavailable;
+        XprinterDiscovery discovery;
+        ScanState(String id, boolean includeUdp) { this.id = id; this.includeUdp = includeUdp; }
+    }
 
     // Capacitor invokes @PluginMethod on a single background HandlerThread, so a
     // long print would block other plugin calls. Offload print/ping onto a cached
@@ -76,12 +106,15 @@ public class NetworkPrinterPlugin extends Plugin {
 
     @PluginMethod
     public void scan(PluginCall call) {
-        if (!scanning.compareAndSet(false, true)) {
+        if (repairing.get() || !scanning.compareAndSet(false, true)) {
             call.reject("A scan is already running");
             return;
         }
         cancelRequested.set(false);
-        Thread scanThread = new Thread(this::runScan, "NetworkPrinterScanner");
+        // Explicit opt-in preserves the exact legacy scan for older hosted POS.
+        ScanState state = new ScanState(call.getString("scanId", UUID.randomUUID().toString()),
+            call.getBoolean("includeXprinterDiscovery", false));
+        Thread scanThread = new Thread(() -> runScan(state), "NetworkPrinterScanner");
         scanThread.setDaemon(true);
         scanThread.start();
         call.resolve();
@@ -90,6 +123,11 @@ public class NetworkPrinterPlugin extends Plugin {
     @PluginMethod
     public void cancel(PluginCall call) {
         cancelRequested.set(true);
+        repairCancelRequested.set(true);
+        XprinterDiscovery scan = scanDiscovery;
+        if (scan != null) scan.close();
+        XprinterDiscovery repair = repairDiscovery;
+        if (repair != null) repair.close();
         call.resolve();
     }
 
@@ -98,6 +136,7 @@ public class NetworkPrinterPlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("scanning", scanning.get());
         ret.put("supportsManualSetup", true);
+        ret.put("supportsXprinterRepair", true);
         call.resolve(ret);
     }
 
@@ -199,97 +238,217 @@ public class NetworkPrinterPlugin extends Plugin {
         return (statusByte & 0x93) == 0x12;
     }
 
-    private void runScan() {
-        List<FoundPrinter> printers = new ArrayList<>();
+    private void runScan(ScanState state) {
+        ExecutorService pool = Executors.newFixedThreadPool(MAX_CONCURRENT);
+        AtomicInteger scanned = new AtomicInteger();
         int total = 0;
+        JSObject complete = null;
+        JSObject failure = null;
         try {
+            synchronized (repairCandidates) { repairCandidates.clear(); }
+            if (state.includeUdp) startUdpDiscovery(state);
             List<String> ips = enumerateIps();
             total = ips.size();
-
-            if (total == 0) {
-                emitProgress(0, 0, 0);
-                emitComplete(printers, 0, 0);
-                return;
-            }
-
-            ExecutorService pool = Executors.newFixedThreadPool(MAX_CONCURRENT);
-            AtomicInteger scanned = new AtomicInteger(0);
-
             for (final String ip : ips) {
                 pool.submit(() -> {
-                    if (!cancelRequested.get()) {
-                        FoundPrinter found = probe(ip);
-                        if (found != null) {
-                            synchronized (printers) {
-                                printers.add(found);
+                    try {
+                        if (!cancelRequested.get()) {
+                            FoundPrinter found = probe(ip);
+                            if (found != null && !cancelRequested.get()) {
+                                synchronized (state) { state.normal.put(XprinterDiscovery.normalizeMac(found.mac), found); }
+                            }
+                        }
+                    } finally { scanned.incrementAndGet(); }
+                });
+            }
+            pool.shutdown();
+            long nextProgress = 0;
+            while (!pool.isTerminated() || !state.udpFinished.get()) {
+                if (cancelRequested.get()) { pool.shutdownNow(); break; }
+                if (SystemClock.elapsedRealtime() >= nextProgress) {
+                    emitScanProgress(state, scanned.get(), total);
+                    nextProgress = SystemClock.elapsedRealtime() + PROGRESS_INTERVAL_MS;
+                }
+                pool.awaitTermination(200, TimeUnit.MILLISECONDS);
+                if (pool.isTerminated() && !state.udpFinished.get()) Thread.sleep(100);
+            }
+            if (cancelRequested.get()) {
+                synchronized (state) { state.udp.clear(); }
+            } else {
+                synchronized (state) {
+                    synchronized (repairCandidates) {
+                        for (Map.Entry<String, UdpCandidate> entry : state.udp.entrySet()) {
+                            if (!state.normal.containsKey(entry.getKey())) repairCandidates.put(entry.getKey(), entry.getValue());
+                        }
+                    }
+                }
+            }
+            emitScanProgress(state, scanned.get(), total);
+            complete = scanResults(state);
+            complete.put("scanned", scanned.get());
+            complete.put("total", total);
+            complete.put("cancelled", cancelRequested.get());
+        } catch (Exception error) {
+            failure = new JSObject();
+            failure.put("scanId", state.id);
+            failure.put("message", error.getMessage() == null ? "Scan failed" : error.getMessage());
+        } finally {
+            pool.shutdownNow();
+            if (state.discovery != null) state.discovery.close();
+            if (scanDiscovery == state.discovery) scanDiscovery = null;
+            scanning.set(false);
+        }
+        if (complete != null) notifyListeners("scanComplete", complete);
+        else if (failure != null) notifyListeners("scanError", failure);
+    }
+
+    private void startUdpDiscovery(ScanState state) {
+        try {
+            Network network = XprinterDiscovery.findLanNetwork(getContext());
+            XprinterDiscovery discovery = new XprinterDiscovery(getContext(), network);
+            state.discovery = discovery;
+            scanDiscovery = discovery;
+            discovery.find(); // Broadcast before starting the ordinary IP sweep.
+            state.udpFinished.set(false);
+            ioExecutor.submit(() -> {
+                long deadline = SystemClock.elapsedRealtime() + 5000;
+                long nextSend = SystemClock.elapsedRealtime() + 1000;
+                try {
+                    while (!cancelRequested.get() && SystemClock.elapsedRealtime() < deadline) {
+                        if (SystemClock.elapsedRealtime() >= nextSend) {
+                            discovery.find();
+                            nextSend = SystemClock.elapsedRealtime() + 1000;
+                        }
+                        XprinterDiscovery.Printer printer = discovery.receive();
+                        if (printer != null) {
+                            synchronized (state) {
+                                if (!cancelRequested.get()) state.udp.put(printer.mac, new UdpCandidate(printer, network));
                             }
                         }
                     }
-                    scanned.incrementAndGet();
-                });
-            }
+                } catch (Exception error) {
+                    if (!cancelRequested.get()) state.udpUnavailable = true;
+                } finally {
+                    discovery.close();
+                    state.udpFinished.set(true);
+                }
+            });
+        } catch (Exception error) {
+            // UDP failure must never break the existing network scan.
+            state.udpUnavailable = true;
+        }
+    }
 
-            pool.shutdown();
-            while (!pool.isTerminated()) {
-                if (cancelRequested.get()) {
-                    pool.shutdownNow();
-                    break;
-                }
-                int foundCount;
-                synchronized (printers) {
-                    foundCount = printers.size();
-                }
-                emitProgress(scanned.get(), total, foundCount);
-                try {
-                    if (pool.awaitTermination(PROGRESS_INTERVAL_MS, TimeUnit.MILLISECONDS)) {
-                        break;
+    private JSObject scanResults(ScanState state) {
+        JSObject result = new JSObject();
+        JSONArray normal = new JSONArray();
+        JSONArray udp = new JSONArray();
+        synchronized (state) {
+            for (FoundPrinter printer : state.normal.values()) normal.put(printerJson(printer.ip, printer.mac));
+            for (Map.Entry<String, UdpCandidate> entry : state.udp.entrySet()) {
+                if (state.normal.containsKey(entry.getKey())) continue;
+                XprinterDiscovery.Printer printer = entry.getValue().printer;
+                JSObject candidate = printerJson(printer.ip, printer.mac);
+                candidate.put("printPort", printer.port);
+                candidate.put("reportedDhcp", printer.reportedDhcp);
+                udp.put(candidate);
+            }
+        }
+        result.put("scanId", state.id);
+        result.put("printers", normal); // Legacy contract: reachable ordinary results only.
+        result.put("udpPrinters", udp);
+        result.put("udpUnavailable", state.udpUnavailable);
+        return result;
+    }
+
+    private static JSObject printerJson(String ip, String mac) {
+        JSObject printer = new JSObject();
+        printer.put("ip", ip);
+        printer.put("mac", mac);
+        return printer;
+    }
+
+    private void emitScanProgress(ScanState state, int scanned, int total) {
+        JSObject results = scanResults(state);
+        JSObject progress = new JSObject();
+        progress.put("scanId", state.id);
+        progress.put("scanned", scanned);
+        progress.put("total", total);
+        progress.put("percent", total > 0 ? (int) ((scanned * 100L) / total) : 0);
+        progress.put("found", results.optJSONArray("printers").length() + results.optJSONArray("udpPrinters").length());
+        notifyListeners("scanProgress", progress);
+        if (state.includeUdp) notifyListeners("scanResults", results);
+    }
+
+    @PluginMethod
+    public void repairXprinter(PluginCall call) {
+        String mac = XprinterDiscovery.normalizeMac(call.getString("mac"));
+        if (!call.getBoolean("macConfirmed", false)) {
+            call.reject("Confirm the printer MAC address first", "MAC_NOT_CONFIRMED");
+            return;
+        }
+        UdpCandidate candidate;
+        synchronized (repairCandidates) { candidate = repairCandidates.get(mac); }
+        if (candidate == null) {
+            call.reject("Scan again to find this printer", "XPRINTER_NOT_FOUND");
+            return;
+        }
+        if (scanning.get() || !repairing.compareAndSet(false, true)) {
+            call.reject("Another scan or repair is running", "XPRINTER_BUSY");
+            return;
+        }
+        repairCancelRequested.set(false);
+        // Consume this scan's candidate. A failed/uncertain repair needs a new
+        // full scan, rather than another write from the same cached result.
+        synchronized (repairCandidates) { repairCandidates.remove(mac); }
+        ioExecutor.submit(() -> {
+            try (XprinterDiscovery discovery = new XprinterDiscovery(getContext(), candidate.network)) {
+                repairDiscovery = discovery;
+                XprinterDiscovery.Printer fresh = discovery.findMac(mac, SystemClock.elapsedRealtime() + 4000);
+                if (fresh == null) throw new IllegalStateException("XPRINTER_NOT_FOUND");
+                boolean requested = false;
+                XprinterDiscovery.Printer verified = null;
+                if (!repairCancelRequested.get() && discovery.reachable(fresh)) {
+                    verified = fresh; // Already reachable: never reconfigure a healthy printer.
+                } else if (!repairCancelRequested.get()) {
+                    discovery.requestAutoIp(fresh); // Exactly one MAC-targeted SAVE, requesting DHCP.
+                    requested = true;
+                    long deadline = SystemClock.elapsedRealtime() + 90000;
+                    while (!repairCancelRequested.get() && SystemClock.elapsedRealtime() < deadline) {
+                        XprinterDiscovery.Printer reply = discovery.findMac(mac, Math.min(deadline, SystemClock.elapsedRealtime() + 2500));
+                        if (reply != null && discovery.reachable(reply)) { verified = reply; break; }
+                        SystemClock.sleep(500);
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    pool.shutdownNow();
-                    break;
                 }
+                if (repairCancelRequested.get()) throw new IllegalStateException("XPRINTER_CANCELLED");
+                if (verified == null) throw new IllegalStateException("XPRINTER_VERIFY_TIMEOUT");
+                JSObject result = printerJson(verified.ip, verified.mac);
+                result.put("success", true);
+                result.put("printPort", verified.port);
+                result.put("reportedDhcp", verified.reportedDhcp);
+                result.put("automaticIpRequested", requested);
+                result.put("persistentDhcpVerified", false);
+                synchronized (repairCandidates) { repairCandidates.remove(mac); }
+                call.resolve(result);
+            } catch (Exception error) {
+                String code = repairCancelRequested.get() ? "XPRINTER_CANCELLED" : error.getMessage();
+                if (!"XPRINTER_NOT_FOUND".equals(code) && !"XPRINTER_VERIFY_TIMEOUT".equals(code)
+                    && !"XPRINTER_CANCELLED".equals(code)) code = "XPRINTER_NETWORK_ERROR";
+                call.reject("The printer IP could not be verified; scan again before retrying", code);
+            } finally {
+                repairDiscovery = null;
+                repairing.set(false);
             }
-
-            int finalScanned = scanned.get();
-            List<FoundPrinter> snapshot;
-            synchronized (printers) {
-                snapshot = new ArrayList<>(printers);
-            }
-            emitProgress(finalScanned, total, snapshot.size());
-            emitComplete(snapshot, finalScanned, total);
-        } catch (Exception e) {
-            JSObject data = new JSObject();
-            data.put("message", e.getMessage() == null ? "Scan failed" : e.getMessage());
-            notifyListeners("scanError", data);
-        } finally {
-            scanning.set(false);
-            cancelRequested.set(false);
-        }
+        });
     }
 
-    private void emitProgress(int scanned, int total, int found) {
-        JSObject data = new JSObject();
-        data.put("scanned", scanned);
-        data.put("total", total);
-        data.put("percent", total > 0 ? (int) ((scanned * 100L) / total) : 0);
-        data.put("found", found);
-        notifyListeners("scanProgress", data);
-    }
-
-    private void emitComplete(List<FoundPrinter> printers, int scanned, int total) {
-        JSObject data = new JSObject();
-        JSONArray arr = new JSONArray();
-        for (FoundPrinter p : printers) {
-            JSObject o = new JSObject();
-            o.put("ip", p.ip);
-            o.put("mac", p.mac);
-            arr.put(o);
-        }
-        data.put("printers", arr);
-        data.put("scanned", scanned);
-        data.put("total", total);
-        notifyListeners("scanComplete", data);
+    @Override protected void handleOnDestroy() {
+        cancelRequested.set(true);
+        repairCancelRequested.set(true);
+        if (scanDiscovery != null) scanDiscovery.close();
+        if (repairDiscovery != null) repairDiscovery.close();
+        ioExecutor.shutdownNow();
+        super.handleOnDestroy();
     }
 
     private FoundPrinter probe(String ip) {

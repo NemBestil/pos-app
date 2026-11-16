@@ -45,3 +45,7 @@ The original rollback did not publish an APK. App 1.4.8 now adds the terminal tr
 ## Optional direct checkout in 1.4.9
 
 App 1.4.9 adds a feature-specific DirectCardPayment bridge and `terminal.direct-cancel` handling. Hosted POS must check both installed version >=1.4.9 and local bridge/reachability support before using it. POS 1.3 and older POS 1.4 implementations continue using the existing socket forwarding contract; protocols 3/4, discovery and native whoami are unchanged. Publish the signed 1.4.9 APK before raising an installation's target/inclusive maximum. POS source prepares target 1.4.9 and retains minimum 1.4.7; production requirements change only with their POS deployment. See [direct checkout](payment-terminals.md#direct-local-checkout-in-app-149).
+
+## Optional Xprinter setup
+
+Network-printer IP recovery is gated by `supportsXprinterRepair`, independently of APK version requirements. Updated POS explicitly opts into the extended scan; older POS receives the original ordinary-only `printers` array and needs no update to keep scanning/adding. Updated POS on an older APK retains ordinary scanning without repair calls. See [the additive discovery contract](network-printers.md).

@@ -223,6 +223,7 @@ if usb_action not in text:
     print("🩹 Registered MainActivity as an Android USB attachment handler")
 
 permissions = [
+    "android.permission.ACCESS_NETWORK_STATE",
     "android.permission.FOREGROUND_SERVICE",
     "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
     "android.permission.RECEIVE_BOOT_COMPLETED",
