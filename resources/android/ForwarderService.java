@@ -184,6 +184,10 @@ public class ForwarderService extends Service {
     private static final long SOCKET_RECONNECT_MAX_MS = 15_000;
     private static final long SOCKET_SERVER_PING_INTERVAL_MS = 5_000;
     private static final long SOCKET_SERVER_PING_TIMEOUT_MS = SOCKET_SERVER_PING_INTERVAL_MS * 2;
+    private static final long SOCKET_AUTO_PING_INTERVAL_MS = 30_000;
+    private static final long SOCKET_AUTO_PING_TIMEOUT_MS = 90_000;
+    private static final String SOCKET_AUTO_PING = "__nbpos_ping__";
+    private static final String SOCKET_AUTO_PONG = "__nbpos_pong__";
     private static final long SOCKET_WATCHDOG_INTERVAL_MS = 1_000;
     private static final String WHOAMI_URL = "https://whoami.nemkasse.com";
 
@@ -257,7 +261,9 @@ public class ForwarderService extends Service {
     private final OkHttpClient socketClient = new OkHttpClient.Builder()
         .callTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(5, TimeUnit.SECONDS)
+        // Application heartbeats also work with legacy servers. Protocol pings
+        // would add a second independent timer to the hibernating connection.
+        .pingInterval(0, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build();
     private final AtomicBoolean socketConnecting = new AtomicBoolean(false);
@@ -276,6 +282,8 @@ public class ForwarderService extends Service {
     private volatile WebSocket webSocket;
     private volatile long socketConnectStartedElapsedAt = 0;
     private volatile long lastServerPingElapsedAt = 0;
+    private volatile long lastClientPingElapsedAt = 0;
+    private volatile boolean socketHibernation = false;
     private volatile String lastAdvertisedDevices = "";
     private volatile String lastAdvertisedSnapshot = "";
     private volatile String availablePrinterDevices = "[]";
@@ -320,7 +328,11 @@ public class ForwarderService extends Service {
         }
         long lastPing = service.lastServerPingElapsedAt;
         return lastPing > 0
-            && SystemClock.elapsedRealtime() - lastPing < SOCKET_SERVER_PING_TIMEOUT_MS;
+            && SystemClock.elapsedRealtime() - lastPing < service.socketHeartbeatTimeoutMs();
+    }
+
+    private long socketHeartbeatTimeoutMs() {
+        return socketHibernation ? SOCKET_AUTO_PING_TIMEOUT_MS : SOCKET_SERVER_PING_TIMEOUT_MS;
     }
 
     public static String getActiveBaseUrl() {
@@ -509,6 +521,8 @@ public class ForwarderService extends Service {
         socketGeneration.incrementAndGet();
         socketConnectStartedElapsedAt = 0;
         lastServerPingElapsedAt = 0;
+        lastClientPingElapsedAt = 0;
+        socketHibernation = false;
         WebSocket socket = webSocket;
         webSocket = null;
         if (socket != null) {
@@ -586,6 +600,7 @@ public class ForwarderService extends Service {
             request = new Request.Builder()
                 .url(getSocketUrl())
                 .header("Authorization", "Bearer " + usedToken)
+                .header("X-Nembestil-Hibernation", "1")
                 .build();
         } catch (Exception e) {
             socketConnecting.set(false);
@@ -605,6 +620,8 @@ public class ForwarderService extends Service {
                     return;
                 }
                 webSocket = socket;
+                socketHibernation = false;
+                lastClientPingElapsedAt = 0;
                 socketConnectStartedElapsedAt = 0;
                 lastServerPingElapsedAt = SystemClock.elapsedRealtime();
                 socketConnecting.set(false);
@@ -675,6 +692,8 @@ public class ForwarderService extends Service {
         }
         socketConnectStartedElapsedAt = 0;
         lastServerPingElapsedAt = 0;
+        lastClientPingElapsedAt = 0;
+        socketHibernation = false;
         socketConnecting.set(false);
         setSocketRegistered(false);
         for (CompletableFuture<JSONObject> future : pendingSocketRequests.values()) {
@@ -709,6 +728,8 @@ public class ForwarderService extends Service {
         webSocket = null;
         socketConnectStartedElapsedAt = 0;
         lastServerPingElapsedAt = 0;
+        lastClientPingElapsedAt = 0;
+        socketHibernation = false;
         setSocketRegistered(false);
         socketConnecting.set(false);
         socketReconnectAttempt.set(0);
@@ -746,9 +767,15 @@ public class ForwarderService extends Service {
             }
 
             long silenceMs = now - lastPing;
-            if (silenceMs >= SOCKET_SERVER_PING_TIMEOUT_MS) {
-                Log.w(TAG, "No server WebSocket ping received for " + silenceMs + " ms; reconnecting");
+            if (silenceMs >= socketHeartbeatTimeoutMs()) {
+                Log.w(TAG, "No server WebSocket heartbeat received for " + silenceMs + " ms; reconnecting");
                 reconnectWebSocketNow();
+                return;
+            }
+            if (socketHibernation && socketRegistered.get()
+                && now - lastClientPingElapsedAt >= SOCKET_AUTO_PING_INTERVAL_MS) {
+                lastClientPingElapsedAt = now;
+                if (!socket.send(SOCKET_AUTO_PING)) reconnectWebSocketNow();
             }
         }, SOCKET_WATCHDOG_INTERVAL_MS, SOCKET_WATCHDOG_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
@@ -810,6 +837,7 @@ public class ForwarderService extends Service {
             payload.put("deviceName", (Build.MANUFACTURER + " " + Build.MODEL).trim());
             payload.put("appVersion", BuildConfig.VERSION_NAME);
             payload.put("protocolVersion", ANDROID_SOCKET_PROTOCOL);
+            payload.put("hibernation", true);
             payload.put("screenOn", screenOn.get());
             payload.put("appFocused", appFocused.get());
             payload.put("takeawayEnabled", takeawayEnabled.get());
@@ -834,6 +862,10 @@ public class ForwarderService extends Service {
     }
 
     private void handleSocketMessage(String text) {
+        if (socketHibernation && SOCKET_AUTO_PONG.equals(text)) {
+            lastServerPingElapsedAt = SystemClock.elapsedRealtime();
+            return;
+        }
         try {
             JSONObject envelope = new JSONObject(text);
             String requestId = envelope.optString("requestId", "");
@@ -853,7 +885,15 @@ public class ForwarderService extends Service {
                 return;
             }
             if ("connection.ready".equals(type)) {
+                socketHibernation = payload != null
+                    && "cloudflare-auto".equals(payload.optString("heartbeatMode"))
+                    && payload.optLong("heartbeatIntervalMs") == SOCKET_AUTO_PING_INTERVAL_MS
+                    && payload.optLong("heartbeatTimeoutMs") == SOCKET_AUTO_PING_TIMEOUT_MS;
+                lastServerPingElapsedAt = SystemClock.elapsedRealtime();
+                lastClientPingElapsedAt = 0;
                 setSocketRegistered(true);
+                Log.i(TAG, "Android WebSocket heartbeat mode="
+                    + (socketHibernation ? "cloudflare-auto" : "legacy"));
                 // Force one post-registration snapshot so changes discovered
                 // during the handshake cannot be lost behind the ready gate.
                 lastAdvertisedDevices = "";
@@ -1150,7 +1190,7 @@ public class ForwarderService extends Service {
         deviceMonitorThread.setDaemon(true);
         deviceMonitorThread.start();
         socketScheduler.scheduleAtFixedRate(
-            () -> socketWorkExecutor.execute(() -> reportDeviceSnapshot(true)),
+            () -> socketWorkExecutor.execute(() -> reportDeviceSnapshot(!socketHibernation)),
             PaymentTerminalReachability.CHECK_INTERVAL_MS,
             PaymentTerminalReachability.CHECK_INTERVAL_MS,
             TimeUnit.MILLISECONDS
@@ -1168,7 +1208,7 @@ public class ForwarderService extends Service {
             }
             boolean idle = availableDeviceCount.get() == 0;
             long now = SystemClock.elapsedRealtime();
-            if (!idle) {
+            if (!idle || socketHibernation) {
                 nextIdleConfigurationRequestElapsedAt = now + IDLE_DEVICE_REFRESH_INTERVAL_MS;
             } else if (now >= nextIdleConfigurationRequestElapsedAt) {
                 // Snapshots and hardware events wake this monitor immediately.
@@ -1279,12 +1319,33 @@ public class ForwarderService extends Service {
         payload.put("battery", readBatterySnapshot());
         payload.put("devices", devices);
         payload.put("terminalCandidates", buildTerminalCandidates());
-        String serializedSnapshot = payload.toString();
+        String serializedSnapshot = socketHibernation
+            ? stableDeviceSnapshot(payload, devices)
+            : payload.toString();
         boolean changed = !serializedSnapshot.equals(lastAdvertisedSnapshot);
-        lastAdvertisedSnapshot = serializedSnapshot;
         if ((changed || force || !socketRegistered.get()) && webSocket != null) {
-            sendSocketMessage("devices.snapshot", payload);
+            if (sendSocketMessage("devices.snapshot", payload)) {
+                lastAdvertisedSnapshot = serializedSnapshot;
+            }
         }
+    }
+
+    private String stableDeviceSnapshot(JSONObject payload, JSONArray devices) throws Exception {
+        // Reachability is still refreshed locally. Only availability/identity
+        // changes need to wake the server; refreshed timestamps and battery
+        // percentages accompany the next meaningful snapshot.
+        List<String> stableDevices = new ArrayList<>();
+        for (int index = 0; index < devices.length(); index++) {
+            JSONObject device = new JSONObject(devices.getJSONObject(index).toString());
+            device.remove("lastSeenAt");
+            stableDevices.add(device.toString());
+        }
+        stableDevices.sort(String::compareTo);
+        JSONObject stable = new JSONObject();
+        stable.put("screenOn", payload.getBoolean("screenOn"));
+        stable.put("devices", new JSONArray(stableDevices));
+        stable.put("terminalCandidates", payload.getJSONArray("terminalCandidates"));
+        return stable.toString();
     }
 
     private JSONObject readBatterySnapshot() throws Exception {

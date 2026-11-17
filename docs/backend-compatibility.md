@@ -8,7 +8,7 @@ App 1.4.8 builds on the published `apk-1.4.7` source (`b0007f46d0a9dce08b9fe2e70
 
 `capacitor.config.ts` allows only `*.nbpos.eu` and the NGROK development host; neither legacy installation wildcard remains in navigation or native bridge injection. The native external whoami request is independent of this allowlist. `BridgeReinjector.java` uses that list for native bridge injection, so loading POS 1.4 at the same origin retains native plugin access. The hosted POS supplies its own origin to `ForwarderService.start`; native WebSocket/HTTP forwarding and customer-display URLs follow that installation.
 
-The selected installation's app-version gate still applies. POS 1.4 source prepares minimum app version `1.4.7` and target/inclusive maximum `1.4.9` (publish that signed APK before production rollout); the original APK remains supported for v2 terminals. POS release numbers and Android app release numbers are independent. Do not increase the app requirement merely because the backend moves to Cloudflare.
+The selected installation's app-version gate still applies. POS 1.4 source prepares minimum app version `1.4.7` and target/inclusive maximum `1.4.11` (publish that signed APK before production rollout); the original APK remains supported for v2 terminals. POS release numbers and Android app release numbers are independent. Do not increase the app requirement merely because the backend moves to Cloudflare.
 
 ## Native contracts
 
@@ -25,6 +25,14 @@ Both POS generations retain these contracts, already supported by app 1.4.7:
 | Browser live updates               | `/api/query-invalidations`                                                                              |
 
 See [receipt delivery](receipt-printing.md), [terminal monitoring](payment-terminals.md) and [USB access](usb-access.md) for hardware behavior.
+
+## Hibernating sockets in app 1.4.11
+
+The WebSocket upgrade includes `X-Nembestil-Hibernation: 1`, and `connection.register` adds `hibernation: true` without changing protocol version 4. The header lets Cloudflare select the hibernating endpoint before upgrading; registration verifies the capability. An older server ignores both additions. Only `connection.ready` with `heartbeatMode: "cloudflare-auto"`, `heartbeatIntervalMs: 30000` and `heartbeatTimeoutMs: 90000` enables the new mode.
+
+In the negotiated mode, the APK sends the exact text `__nbpos_ping__` every 30 seconds and accepts `__nbpos_pong__`. Cloudflare answers it without running the Durable Object. The native watchdog and `getStatus().connected` use a 90-second response window; socket failure, network recovery and explicit reconnect still act immediately. Without that acknowledgement the existing five-second server JSON `connection.ping`/`connection.pong` contract and ten-second native watchdog remain in force. OkHttp protocol pings are disabled; application heartbeats own liveness in both modes. Mode selection resets on every new connection.
+
+The hibernating mode suppresses the minute's forced snapshot, last-seen/battery-only reports and the idle two-minute `configuration.request`. Genuine device availability/endpoint/name/candidate and screen changes still report immediately; registration sends current devices and one post-ready snapshot closes the handshake race. Local UDP/TCP/printer monitoring and durable result replay are unchanged. A live hibernating socket represents continuing device availability until a changed snapshot or disconnect; the server must not expire a device solely because its last reported observation timestamp stopped changing. Battery/last-seen values in admin tools can therefore be older than the current local observation. Configuration changes remain server-pushed, and explicit refreshes still request a snapshot.
 
 ## Whoami compatibility
 
