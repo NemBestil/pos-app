@@ -284,7 +284,7 @@ public class ForwarderService extends Service {
     private volatile long lastServerPingElapsedAt = 0;
     private volatile long lastClientPingElapsedAt = 0;
     private volatile boolean socketHibernation = false;
-    private volatile String lastAdvertisedDevices = "";
+    private volatile String registeredSnapshot = "";
     private volatile String lastAdvertisedSnapshot = "";
     private volatile String availablePrinterDevices = "[]";
 
@@ -850,10 +850,11 @@ public class ForwarderService extends Service {
                 payload.put("tableBookingCursor", tableBookingCursor);
             }
             payload.put("tableBookingStartedAt", tableBookingStartedAt);
-            payload.put("devices", lastAdvertisedDevices.isEmpty()
-                ? new JSONArray()
-                : new JSONArray(lastAdvertisedDevices));
+            JSONArray devices = availableDevices();
+            payload.put("devices", devices);
+            payload.put("battery", readBatterySnapshot());
             payload.put("terminalCandidates", buildTerminalCandidates());
+            registeredSnapshot = stableDeviceSnapshot(payload, devices);
             sendSocketMessage("connection.register", payload);
         } catch (Exception e) {
             Log.e(TAG, "Could not register Android WebSocket", e);
@@ -891,13 +892,14 @@ public class ForwarderService extends Service {
                     && payload.optLong("heartbeatTimeoutMs") == SOCKET_AUTO_PING_TIMEOUT_MS;
                 lastServerPingElapsedAt = SystemClock.elapsedRealtime();
                 lastClientPingElapsedAt = 0;
-                setSocketRegistered(true);
+                synchronized (deviceReportLock) {
+                    // Compare concurrent LAN observations with the snapshot this socket registered.
+                    lastAdvertisedSnapshot = socketHibernation && payload.optBoolean("registeredDeviceSnapshot")
+                        ? registeredSnapshot : "";
+                    setSocketRegistered(true);
+                }
                 Log.i(TAG, "Android WebSocket heartbeat mode="
                     + (socketHibernation ? "cloudflare-auto" : "legacy"));
-                // Force one post-registration snapshot so changes discovered
-                // during the handshake cannot be lost behind the ready gate.
-                lastAdvertisedDevices = "";
-                lastAdvertisedSnapshot = "";
                 requestDeviceReport();
                 socketWorkExecutor.execute(this::flushPendingSocketResults);
                 if (!sendNetworkLocation()) {
@@ -1287,8 +1289,7 @@ public class ForwarderService extends Service {
         }
     }
 
-    private void advertiseDevices(boolean force) throws Exception {
-        DirectCardPayment.recover(this);
+    private JSONArray availableDevices() throws Exception {
         JSONArray devices = new JSONArray(availablePrinterDevices);
         Map<String, String> terminalNames = new java.util.HashMap<>();
         synchronized (deviceConfigurationLock) {
@@ -1310,9 +1311,13 @@ public class ForwarderService extends Service {
             devices.put(device);
         }
 
+        return devices;
+    }
+
+    private void advertiseDevices(boolean force) throws Exception {
+        DirectCardPayment.recover(this);
+        JSONArray devices = availableDevices();
         availableDeviceCount.set(devices.length());
-        String serialized = devices.toString();
-        lastAdvertisedDevices = serialized;
 
         JSONObject payload = new JSONObject();
         payload.put("screenOn", screenOn.get());

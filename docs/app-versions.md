@@ -1,6 +1,6 @@
 # Installation app versions
 
-Published app 1.4.7 already discovers POS 1.3 and Cloudflare 1.4 through `*.nbpos.eu`. The router selects registered POS 1.4 installations; the selected backend's exact app-version range remains authoritative. POS and Android app version numbers are independent: POS 1.4 source keeps minimum Android app 1.4.7 and prepares target/inclusive maximum 1.4.11; existing devices may postpone the update. Publish the signed 1.4.11 APK before production rollout. No new APK is needed for routing or native location reports: production POS 1.4 retains the POS 1.3/legacy-whoami signing key. See [backend compatibility](backend-compatibility.md) for the original APK's external whoami dependency and shared signing setup.
+Published app 1.4.7 already discovers POS 1.3 and Cloudflare 1.4 through `*.nbpos.eu`. The router selects registered POS 1.4 installations, and each installation supplies its own app-version range. POS 1.4.70 targets Android 1.4.12 with 1.4.7 as the minimum. Compatible devices may postpone the update. Make the signed 1.4.12 APK available before deploying the new POS target. See [backend compatibility](backend-compatibility.md) for the shared signing setup.
 
 The launcher owns POS Android updates. Read `app/composables/useAppReleaseUpdate.ts` for permission and update orchestration, `app/utils/app-version.ts` for version comparison/legacy requirements, and `app/app.vue` for installation lookup and the launch gate. Native download and system installation live in `resources/android/ApkUpdaterPlugin.java`.
 
